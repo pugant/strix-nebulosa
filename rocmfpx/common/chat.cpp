@@ -2428,6 +2428,36 @@ common_chat_msg common_chat_peg_parse(const common_peg_arena &          src_pars
     }
     mapper->from_ast(ctx.ast, result);
 
+    // Order-free tagged grammar (05/09): the grammar accepts parameters in any
+    // order, so a tool call that OMITTED a required parameter parses fine —
+    // reject it here exactly like a grammar failure would (parity with the
+    // strict in-order sequence this leniency replaced). Keyed by the arena
+    // sidecar, which survives the save/load hop the server makes.
+    if (!is_partial && !parser.tool_required_args.empty()) {
+        for (const auto & tool_call : msg.tool_calls) {
+            const auto required_it = parser.tool_required_args.find(tool_call.name);
+            if (required_it == parser.tool_required_args.end()) {
+                continue;
+            }
+            json args = json::object();
+            if (!tool_call.arguments.empty()) {
+                try {
+                    args = json::parse(tool_call.arguments);
+                } catch (const std::exception &) {
+                    args = json::object();
+                }
+            }
+            for (const auto & required : required_it->second) {
+                if (!args.contains(required)) {
+                    LOG_WRN("%s: rejected: required param '%s' missing for tool '%s' (order-free leniency)\n", __func__,
+                            required.c_str(), tool_call.name.c_str());
+                    throw std::runtime_error(std::string("The model produced output that does not match the expected ") +
+                                             common_chat_format_name(params.format) + " format");
+                }
+            }
+        }
+    }
+
     if (ctx.is_debug()) {
         fprintf(stderr, "\nAST for %s parse:\n%s\n", is_partial ? "partial" : "full", ctx.ast.dump().c_str());
         fflush(stderr);

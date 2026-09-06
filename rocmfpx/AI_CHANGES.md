@@ -214,6 +214,79 @@ byte 2: v2[5:4] | v3[5:0]<<2
 | `test-chat-peg-parser` | 32 tests / 198 assertions / 0 failures |
 | Deploy smoke (production image) | pending at log time — image `qwen4exp-mtp-vk-optim3` in build; result recorded in the lab's deploy plan `2026-09-04-peg-lenient-dup-args-deploy-optim3.md` |
 
+## Session 004 — 2026-09-05
+
+**Scope:** peg-native tagged tool calls also failed when required parameters arrived out of schema order (05/09 task 190228: write emitted `content`, `path`); made the tagged grammar order-free and moved required-ness to a post-parse completeness check keyed by a serialized arena sidecar. Unknown parameter names still fail the grammar (05/09 task 181152: write with `<parameter=command>`).
+
+### `common/peg-parser.h`
+
+| Fix | Line(s) | Detail |
+|-----|---------|--------|
+| Arena sidecar | 310-316 | New public `tool_required_args` (tool name → required param names). The order-free grammar cannot express "each required at least once" (the PEG star is possessive), so required-ness travels with the parser arena instead. |
+
+### `common/peg-parser.cpp`
+
+| Fix | Line(s) | Detail |
+|-----|---------|--------|
+| Sidecar serialization | to_json/from_json | Optional `tool_required` field: emitted only when non-empty (arenas without it serialize byte-identical to before); read back if present (previously saved arenas stay loadable). Needed because the server ships the parser between threads as a string (`server-task.cpp` `parser.load(...)`). |
+
+### `common/chat-auto-parser-generator.cpp`
+
+| Fix | Line(s) | Detail |
+|-----|---------|--------|
+| Order-free grammar | 402-421 | The required-in-schema-order arg sequence is gone; args are a repeat of ANY parameter in any order/number. Required-ness is enforced post-parse instead (see chat.cpp). Unknown names still match no rule, so garbage params still fail the whole tool call. |
+| Sidecar population | build_parser | After building the arena, tools in TAG_WITH_TAGGED mode get their required params recorded on `arena.tool_required_args` (same gating as the tool grammar itself). |
+
+### `common/chat.cpp`
+
+| Fix | Line(s) | Detail |
+|-----|---------|--------|
+| Completeness check | common_chat_peg_parse | After mapping (non-partial only): a tool call missing a required param logs `common_chat_peg_parse: rejected: required param '<name>' missing for tool '<tool>' (order-free leniency)` and throws the same "does not match the expected ... format" error the strict grammar used to raise — behavior parity for genuinely incomplete calls. |
+
+### `tests/test-chat-auto-parser.cpp`
+
+| Fix | Line(s) | Detail |
+|-----|---------|--------|
+| Regression test | tagged_reordered_required_params | Reversed required order parses to the same args as the clean call; optional-before-required parses; reorder+duplicate resolves last-wins; missing required still rejected with the logged marker; sidecar survives save/load; autoparser populates the sidecar through the real Hy3 template (wiring verified RED with the population disabled). |
+
+### Validation
+
+| Check | Result |
+|-------|--------|
+| `test-chat-auto-parser` | 78 tests / 441 assertions / 0 failures (new test RED before the fix: 5 sub-tests failing) |
+| `test-chat-peg-parser` | 32 tests / 198 assertions / 0 failures |
+| Deploy | NOT deployed — prepared only; the joint π test is live on `qwen4exp-mtp-vk-optim3` and a restart would cost the running session a ~20 min cold re-prefill |
+
+## Session 005 — 2026-09-05
+
+**Scope:** the 04/09 duplicate leniency re-serialized last-wins by ERASING the earlier pair, which reordered the accumulated args string and broke the append-only invariant of the streaming diff (`string_diff`, chat.cpp) — every leniency turn died client-side with "Invalid diff" (pi_agent errata 05/09 09:06, verified: 7/7 cancel↔marker in the server log). Duplicates now append as-is (duplicate JSON key, parsers resolve last-wins at parse time).
+
+### `common/chat-peg-parser.h`
+
+| Fix | Line(s) | Detail |
+|-----|---------|--------|
+| Mapper state | 29 | `arg_pair_pos` offset bookkeeping replaced by a simple `seen_args` name set (only used to log the leniency marker). |
+
+### `common/chat-peg-parser.cpp`
+
+| Fix | Line(s) | Detail |
+|-----|---------|--------|
+| Append-only duplicates | is_arg_name | On a duplicate name the marker still logs, but the pair is simply APPENDED instead of erasing/re-emitting the earlier pair. The mapper is now append-only by construction, so partial-parse args always extend the previous snapshot and `compute_diffs`/`string_diff` never throws. Final semantics unchanged: duplicate keys resolve last-wins at JSON parse time (server-side completeness check included). |
+
+### `tests/test-chat-auto-parser.cpp`
+
+| Fix | Line(s) | Detail |
+|-----|---------|--------|
+| Streaming regression test | duplicate_streaming_append_only | Simulates the server streaming loop (partial parses on a growing input, production `common_chat_parse` + `common_chat_msg_diff::compute_diffs`) over the 04/09 duplicate shape (path, content, path): every step must diff cleanly; full parse still resolves last-wins per key. RED before the fix: failed exactly at the duplicate step ("Invalid diff"). |
+
+### Validation
+
+| Check | Result |
+|-------|--------|
+| `test-chat-auto-parser` | 79 tests / 609 assertions / 0 failures (04/09 duplicate test still green: marker + last-wins semantics preserved) |
+| `test-chat-peg-parser` | 32 tests / 198 assertions / 0 failures |
+| Deploy | NOT deployed — prepared only; joint π test live on `qwen4exp-mtp-vk-optim3` |
+
 <!-- TEMPLATE FOR FUTURE AI SESSIONS:
 
 ## Session NNN — YYYY-MM-DD

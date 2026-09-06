@@ -1,7 +1,7 @@
 # T8 Stadio 2 (concat MTP→DFlash) — experiment artifacts
 
 Archived 2026-08-22 from the lab workspace (`~/workspaces/rocmfpx-strix-lean`) as a
-safety net on the private mirror. These are verbatim copies of the working documents;
+safety net on the gitea mirror. These are verbatim copies of the working documents;
 internal paths refer to the lab workspace layout, not to this repo.
 
 Chain: spec → implementation plan → pre-registered gate experiment plan → gate report

@@ -100,6 +100,10 @@ static void test_tagged_args_with_embedded_quotes(testing & t);
 // TAG_WITH_TAGGED leniency: duplicated required parameter (04/09 task 29340)
 static void test_tagged_duplicate_required_param(testing & t);
 
+// TAG_WITH_TAGGED leniency: required parameters emitted out of schema order
+// (05/09 task 190228)
+static void test_tagged_reordered_required_params(testing & t);
+
 int main(int argc, char * argv[]) {
     testing t(std::cout);
     t.verbose = true;
@@ -127,6 +131,7 @@ int main(int argc, char * argv[]) {
     t.test("normalize_quotes_to_json", test_normalize_quotes_to_json);
     t.test("tagged_args_embedded_quotes", test_tagged_args_with_embedded_quotes);
     t.test("tagged_duplicate_required_param", test_tagged_duplicate_required_param);
+    t.test("tagged_reordered_required_params", test_tagged_reordered_required_params);
 
     return t.summary();
 }
@@ -2273,5 +2278,290 @@ static void test_tagged_duplicate_required_param(testing & t) {
         t.assert_true("duplicate tolerated for marker test", parsed);
         t.assert_true("leniency-hit marker logged", logged.find("leniency-hit") != std::string::npos);
         t.assert_true("duplicated param named in marker", logged.find("path") != std::string::npos);
+    });
+}
+
+// peg-native order-free leniency (05/09 task 190228): a tagged tool call whose
+// required parameters are emitted OUT OF SCHEMA ORDER must parse instead of
+// throwing "does not match the expected peg-native format" (04→05/09 night:
+// write emitted content, path at 21:17:56Z — turn lost + 109.7s re-prefill).
+// The PEG star is possessive, so "each required at least once, in any order"
+// cannot be expressed in the grammar: required-ness moves to a post-parse
+// completeness check in common_chat_peg_parse, keyed by an arena sidecar that
+// must survive save/load (the server ships the parser as a string).
+static void test_tagged_reordered_required_params(testing & t) {
+    json tools = json::array({
+        json{
+            {"type", "function"},
+            {"function", json{
+                {"name", "write"},
+                {"parameters", json{
+                    {"type", "object"},
+                    {"properties", json{
+                        {"path",    json{{"type", "string"}}},
+                        {"content", json{{"type", "string"}}},
+                    }},
+                    {"required", json::array({"path", "content"})},
+                }},
+            }},
+        },
+        json{
+            {"type", "function"},
+            {"function", json{
+                {"name", "read"},
+                {"parameters", json{
+                    {"type", "object"},
+                    {"properties", json{
+                        {"path",   json{{"type", "string"}}},
+                        {"offset", json{{"type", "integer"}}},
+                        {"limit",  json{{"type", "integer"}}},
+                    }},
+                    {"required", json::array({"path"})},
+                }},
+            }},
+        },
+    });
+
+    // Production grammar builder with the Qwen4exp-style tagged syntax
+    auto build_arena = [&]() {
+        return build_chat_peg_parser([&](common_chat_peg_builder & p) {
+            generation_params     inputs;
+            inputs.tools = tools;
+            parser_build_context ctx(p, inputs);
+
+            analyze_tools at;
+            at.format.mode            = tool_format::TAG_WITH_TAGGED;
+            at.format.per_call_start  = "<tool_call>";
+            at.format.per_call_end    = "</tool_call>";
+            at.function.name_prefix   = "<function=";
+            at.function.name_suffix   = ">";
+            at.function.close         = "</function>";
+            at.arguments.name_prefix  = "<parameter=";
+            at.arguments.name_suffix  = ">";
+            at.arguments.value_suffix = "</parameter>";
+            return at.build_parser(ctx);
+        });
+    };
+
+    auto parse_with = [&](const std::string & input, common_chat_msg & msg) {
+        auto                    arena = build_arena();
+        common_peg_parse_context ctx(input);
+        auto                    result = arena.parse(ctx);
+        if (result.fail()) {
+            return false;
+        }
+        auto mapper = common_chat_peg_mapper(msg);
+        mapper.from_ast(ctx.ast, result);
+        return true;
+    };
+
+    const std::string w_head     = "<tool_call>\n<function=write>\n";
+    const std::string w_tail     = "</function>\n</tool_call>";
+    const std::string w_path     = "<parameter=path>\n/workspace/A.ts\n</parameter>\n";
+    const std::string w_content1 = "<parameter=content>\n/** body v1 */\n</parameter>\n";
+    const std::string w_content2 = "<parameter=content>\n/** body v2 */\n</parameter>\n";
+
+    // json is ordered_json here: compare objects key-by-key (out-of-order
+    // emission changes key ORDER — irrelevant for tool arguments)
+    auto objects_equal = [](const json & a, const json & b) {
+        if (a.size() != b.size()) {
+            return false;
+        }
+        for (auto it = a.begin(); it != a.end(); ++it) {
+            if (!b.contains(it.key()) || b.at(it.key()) != it.value()) {
+                return false;
+            }
+        }
+        return true;
+    };
+
+    t.test("reordered_required", [&](testing & t) {
+        common_chat_msg clean, rev;
+        if (!t.assert_true("clean call parses (schema order)", parse_with(w_head + w_path + w_content1 + w_tail, clean))) {
+            return;
+        }
+        if (!t.assert_true("reversed required order tolerated (content, path — 05/09 task 190228)",
+                           parse_with(w_head + w_content1 + w_path + w_tail, rev))) {
+            return;
+        }
+        t.assert_equal("tool calls count", 1u, rev.tool_calls.size());
+        if (rev.tool_calls.empty() || clean.tool_calls.empty()) {
+            return;
+        }
+        try {
+            json args_rev   = json::parse(rev.tool_calls[0].arguments);
+            json args_clean = json::parse(clean.tool_calls[0].arguments);
+            t.assert_true("reordered args equal clean call (per key)", objects_equal(args_rev, args_clean));
+        } catch (const std::exception & e) {
+            t.assert_true(std::string("args must be valid JSON: ") + e.what(), false);
+        }
+    });
+
+    t.test("optional_before_required", [&](testing & t) {
+        const std::string r_head = "<tool_call>\n<function=read>\n";
+        const std::string r_tail = "</function>\n</tool_call>";
+        common_chat_msg   msg;
+        if (!t.assert_true("optional args before required tolerated (offset, path, limit)",
+                           parse_with(r_head + "<parameter=offset>10</parameter>\n<parameter=path>\n/a.ts\n</parameter>\n<parameter=limit>5</parameter>\n" + r_tail, msg))) {
+            return;
+        }
+        t.assert_equal("tool calls count", 1u, msg.tool_calls.size());
+        if (msg.tool_calls.empty()) {
+            return;
+        }
+        try {
+            json args = json::parse(msg.tool_calls[0].arguments);
+            // string values keep their surrounding newlines (until-based capture,
+            // pre-existing mapper behavior) — assert by containment, not equality
+            t.assert_true("path parsed", args.value("path", std::string()).find("/a.ts") != std::string::npos);
+            t.assert_true("offset parsed", args.value("offset", 0) == 10);
+            t.assert_true("limit parsed", args.value("limit", 0) == 5);
+        } catch (const std::exception & e) {
+            t.assert_true(std::string("args must be valid JSON: ") + e.what(), false);
+        }
+    });
+
+    t.test("reorder_plus_duplicate", [&](testing & t) {
+        common_chat_msg msg;
+        if (!t.assert_true("reorder with duplicate content tolerated (content, path, content)",
+                           parse_with(w_head + w_content1 + w_path + w_content2 + w_tail, msg))) {
+            return;
+        }
+        if (msg.tool_calls.empty()) {
+            return;
+        }
+        try {
+            json args = json::parse(msg.tool_calls[0].arguments);
+            t.assert_true("last content wins", args.value("content", std::string()).find("v2") != std::string::npos);
+            t.assert_true("path preserved", args.value("path", std::string()).find("/workspace/A.ts") != std::string::npos);
+        } catch (const std::exception & e) {
+            t.assert_true(std::string("args must be valid JSON: ") + e.what(), false);
+        }
+    });
+
+    t.test("duplicate_streaming_append_only", [&](testing & t) {
+        // 05/09 errata pi_agent: the last-wins ERASE reorders the accumulated
+        // args string, so the production streaming diff (compute_diffs ->
+        // string_diff, append-only invariant) threw "Invalid diff" and all 5
+        // overnight leniency turns died client-side anyway. Streaming contract:
+        // partial parses on a growing input must diff cleanly against the
+        // previous partial — the duplicate case too.
+        auto arena = build_arena();
+        common_chat_parser_params params;
+        params.format = COMMON_CHAT_FORMAT_PEG_NATIVE;
+        params.parser = arena;
+
+        const std::string full = w_head + w_path + w_content1 + w_path + w_tail;  // path, content, path (04/09 task 29340 class)
+
+        common_chat_msg prv;
+        bool            have_prv = false;
+        for (size_t len = 1; len <= full.size(); len++) {
+            common_chat_msg cur;
+            try {
+                cur = common_chat_parse(full.substr(0, len), true, params);
+            } catch (const std::exception &) {
+                continue;  // partial parses may legitimately fail mid-token
+            }
+            if (cur.tool_calls.empty()) {
+                continue;
+            }
+            if (have_prv) {
+                bool threw = false;
+                try {
+                    auto diffs = common_chat_msg_diff::compute_diffs(prv, cur);
+                    (void) diffs;
+                } catch (const std::exception &) {
+                    threw = true;
+                }
+                if (!t.assert_true("streaming diff stays append-only across the duplicate", !threw)) {
+                    return;
+                }
+            }
+            prv      = cur;
+            have_prv = true;
+        }
+
+        // full parse (non-partial): the duplicate still resolves last-wins per key
+        common_chat_msg fin;
+        if (!t.assert_true("full parse succeeds", parse_with(full, fin))) {
+            return;
+        }
+        if (fin.tool_calls.empty()) {
+            t.assert_true("tool call present", false);
+            return;
+        }
+        try {
+            json args = json::parse(fin.tool_calls[0].arguments);
+            t.assert_true("path resolved", args.value("path", std::string()).find("/workspace/A.ts") != std::string::npos);
+            t.assert_true("content preserved", args.value("content", std::string()).find("v1") != std::string::npos);
+        } catch (const std::exception & e) {
+            t.assert_true(std::string("args must be valid JSON: ") + e.what(), false);
+        }
+    });
+
+    t.test("missing_required_still_rejected", [&](testing & t) {
+        auto arena = build_arena();
+        arena.tool_required_args = {{"write", {"path", "content"}}, {"read", {"path"}}};
+
+        common_chat_parser_params params;
+        params.format = COMMON_CHAT_FORMAT_PEG_NATIVE;
+        params.parser = arena;
+
+        const std::string log_path = "/tmp/test-peg-missing-required.log";
+        std::remove(log_path.c_str());
+        common_log_set_file(common_log_main(), log_path.c_str());
+
+        bool threw = false;
+        try {
+            common_chat_peg_parse(arena, w_head + w_content1 + w_tail, false, params);
+        } catch (const std::exception &) {
+            threw = true;
+        }
+        common_log_flush(common_log_main());
+
+        std::ifstream f(log_path);
+        std::string   logged((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+        t.assert_true("missing required param still rejected", threw);
+        t.assert_true("rejection marker logged", logged.find("required param 'path' missing") != std::string::npos);
+    });
+
+    t.test("sidecar_survives_serialization", [&](testing & t) {
+        auto arena = build_arena();
+        arena.tool_required_args = {{"write", {"path", "content"}}};
+
+        common_peg_arena restored;
+        restored.load(arena.save());
+
+        t.assert_true("required sidecar survives save/load", restored.tool_required_args == arena.tool_required_args);
+    });
+
+    t.test("sidecar_populated_by_autoparser", [&](testing & t) {
+        // Production wiring: autoparser::build_parser must record each tool's
+        // required params on the arena it returns (a real TAG_WITH_TAGGED
+        // template — Hy3 shares the tagged builder with the Qwen-style syntax).
+        common_chat_template tmpl = load_template(t, "models/templates/tencent-Hy3.jinja");
+
+        struct autoparser analysis;
+        analysis.analyze_template(tmpl);
+        if (!t.assert_equal("tool mode tagged (precondition)", tool_format::TAG_WITH_TAGGED, analysis.tools.format.mode)) {
+            return;
+        }
+
+        ::autoparser::generation_params inputs;
+        inputs.tools            = tools;
+        inputs.tool_choice      = COMMON_CHAT_TOOL_CHOICE_AUTO;
+        inputs.reasoning_format = COMMON_REASONING_FORMAT_NONE;
+
+        auto parser = analysis.build_parser(inputs);
+        t.assert_true("write required recorded", parser.tool_required_args.count("write") == 1);
+        if (parser.tool_required_args.count("write") == 1) {
+            t.assert_true("write required = {path, content}",
+                          parser.tool_required_args.at("write") == std::set<std::string>({"path", "content"}));
+        }
+        t.assert_true("read required recorded", parser.tool_required_args.count("read") == 1);
+        if (parser.tool_required_args.count("read") == 1) {
+            t.assert_true("read required = {path}",
+                          parser.tool_required_args.at("read") == std::set<std::string>({"path"}));
+        }
     });
 }

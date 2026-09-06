@@ -98,7 +98,7 @@ common_peg_arena autoparser::build_parser(const generation_params & inputs) cons
     if (!analysis_complete) {
         throw std::invalid_argument("Cannot call build_parser on autoparser without performing analysis first, call analyze_template(...)");
     }
-    return build_chat_peg_parser([&](common_chat_peg_builder & p) {
+    common_peg_arena arena = build_chat_peg_parser([&](common_chat_peg_builder & p) {
         parser_build_context ctx(p, inputs);
         bool                 extract_reasoning = inputs.reasoning_format != COMMON_REASONING_FORMAT_NONE;
 
@@ -130,6 +130,25 @@ common_peg_arena autoparser::build_parser(const generation_params & inputs) cons
         }
         return pure_content ? p.prefix(inputs.generation_prompt, reasoning.start) + parser : p.prefix(inputs.generation_prompt, reasoning.start) << parser;
     });
+
+    // Order-free tagged grammar (05/09): record each tool's required params so
+    // common_chat_peg_parse can enforce them post-parse — the grammar accepts
+    // any order and cannot express "each required at least once" itself.
+    if (tools.format.mode == tool_format::TAG_WITH_TAGGED && inputs.tools.is_array() && !inputs.tools.empty() &&
+        inputs.tool_choice != COMMON_CHAT_TOOL_CHOICE_NONE && jinja_caps.supports_tool_calls) {
+        foreach_function(inputs.tools, [&](const json & tool) {
+            const auto & func   = tool.at("function");
+            const auto & params = func.contains("parameters") ? func.at("parameters") : json::object();
+            std::set<std::string> required;
+            if (params.contains("required")) {
+                params.at("required").get_to(required);
+            }
+            if (!required.empty()) {
+                arena.tool_required_args[func.at("name")] = std::move(required);
+            }
+        });
+    }
+    return arena;
 }
 
 common_peg_parser analyze_reasoning::build_parser(parser_build_context & ctx) const {
@@ -399,22 +418,16 @@ common_peg_parser analyze_tools::build_tool_parser_tag_tagged(parser_build_conte
             }
         }
 
-        // Build required arg sequence in definition order
+        // Order-free leniency (05/09 task 190228): accept parameters in ANY
+        // order and number — a model may emit required args out of schema order
+        // (04→05/09 night: write emitted content, path at 21:17:56Z; the old
+        // required-in-schema-order sequence rejected the whole tool call and
+        // the server threw the generation away). Duplicates resolve last-wins
+        // in the mapper (pi_agent ack 04/09).
+        // The PEG star is possessive, so "each required at least once" cannot
+        // be expressed grammatically: required-ness is enforced post-parse in
+        // common_chat_peg_parse, keyed by arena.tool_required_args.
         common_peg_parser args_seq = p.eps();
-        for (size_t i = 0; i < required_parsers.size(); i++) {
-            if (i > 0) {
-                args_seq = args_seq + p.space();
-            }
-            args_seq = args_seq + required_parsers[i];
-        }
-
-        // Leniency (pi_agent ack 04/09): after the required sequence, tolerate
-        // ANY arg repeated in any order — a model may re-emit a required
-        // parameter at the end of a long generation (04/09 task 29340: write
-        // emitted path, content, path). The mapper resolves duplicates
-        // last-wins and logs a marker; rejecting the whole tool call instead
-        // would throw away the generation ("does not match the expected
-        // peg-native format").
         if (!required_parsers.empty() || !optional_parsers.empty()) {
             common_peg_parser any_arg = p.choice();
             for (const auto & req : required_parsers) {

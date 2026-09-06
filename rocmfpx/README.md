@@ -1,4 +1,4 @@
-# ⚠️ You are on the `drafter-routing` branch — runtime code of [pugant/strix-nebulosa](https://github.com/pugant/strix-nebulosa)
+# ⚠️ You are on the `drafter-routing` branch — runtime code of [pugant/strix-halo-llamacpp-lab](https://github.com/pugant/strix-halo-llamacpp-lab)
 
 This branch is a community experiment on top of [charlie12345/ROCmFPX](https://github.com/charlie12345/ROCmFPX)
 (itself a fork of [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp)). It adds:
@@ -14,7 +14,7 @@ This branch is a community experiment on top of [charlie12345/ROCmFPX](https://g
 
 **Build & usage** — the complete, verified replication guide (containers, quantization pipeline,
 dual-drafter serve flags, benchmarks, patch index) lives in the lab repo:
-**https://github.com/pugant/strix-nebulosa** — start from its README.
+**https://github.com/pugant/strix-halo-llamacpp-lab** — start from its README.
 
 Quick serve (Vulkan build, both drafters — exact verified flags):
 

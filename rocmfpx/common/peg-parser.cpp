@@ -1927,11 +1927,20 @@ nlohmann::json common_peg_arena::to_json() const {
     for (const auto & parser : parsers_) {
         parsers.push_back(serialize_parser_variant(parser));
     }
-    return nlohmann::json{
+    auto j = nlohmann::json{
         {"parsers", parsers},
         {"rules", rules_},
         {"root", root_}
     };
+    // Optional so arenas without the sidecar serialize byte-identical to before
+    if (!tool_required_args.empty()) {
+        auto required = nlohmann::json::object();
+        for (const auto & [tool, params] : tool_required_args) {
+            required[tool] = params;
+        }
+        j["tool_required"] = required;
+    }
+    return j;
 }
 
 static common_peg_parser_variant deserialize_parser_variant(const nlohmann::json & j) {
@@ -2123,6 +2132,19 @@ common_peg_arena common_peg_arena::from_json(const nlohmann::json & j) {
     arena.root_ = j["root"].get<common_peg_parser_id>();
     if (arena.root_ != COMMON_PEG_INVALID_PARSER_ID && arena.root_ >= arena.parsers_.size()) {
         throw std::runtime_error("Root references invalid parser ID: " + std::to_string(arena.root_));
+    }
+
+    // Optional for backward compatibility with previously saved arenas
+    if (j.contains("tool_required") && j["tool_required"].is_object()) {
+        for (auto it = j["tool_required"].begin(); it != j["tool_required"].end(); ++it) {
+            std::set<std::string> params;
+            if (it.value().is_array()) {
+                for (const auto & name : it.value()) {
+                    params.insert(name.get<std::string>());
+                }
+            }
+            arena.tool_required_args[it.key()] = std::move(params);
+        }
     }
 
     return arena;

@@ -272,8 +272,8 @@ kernel); ncols > 16 (cap architetturale dmmv patchato; round > 16 col fuori scop
 ## 13. Vincoli di lavoro (memoria/CLAUDE.md, invariati)
 
 AGENTS.md del repo ROCmFPX prima di toccare codice; branch **`t8-concat` da creare da
-`t8-ngram`** (t8-ngram è sul mirror privato al tip e6baf9518; t8-concat nasce in questa sessione
-di impl e va pushato sul mirror privato a fine stadio, su conferma utente); patch durature
+`t8-ngram`** (t8-ngram è su gitea al tip e6baf9518; t8-concat nasce in questa sessione
+di impl e va pushato su gitea a fine stadio, su conferma utente); patch durature
 `patches/t8-concat/` una-patch-per-feature,
 format-patch --stdout nome esplicito; build SOLO pipeline staging validata in fase 0
 (variante sed toolboxes, vedi `logs/test-t8-ngram/build-notes.txt`); llm-service =

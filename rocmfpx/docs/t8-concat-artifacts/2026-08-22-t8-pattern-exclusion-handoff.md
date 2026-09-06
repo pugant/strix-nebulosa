@@ -8,7 +8,7 @@ file è l'input di contesto, non il design.
 ## 1. Cosa è successo (sintesi one-page)
 
 Lo Stadio 2 (concat MTP(k1)→DFlash) è stato **implementato e certificato per intero**
-(11 commit sul ramo `t8-concat`, pushato sul mirror privato; meccanismo verificato 41/41+20/20+14/14
+(11 commit sul ramo `t8-concat`, pushato su gitea; meccanismo verificato 41/41+20/20+14/14
 +7/7; a k1=0 è bit-identico al T7 di produzione) — ma al **gate fase A** il
 condizionamento DFlash-su-prefix-MTP ha dato:
 
@@ -82,7 +82,7 @@ retraining), ncols ≤ 16, prosa/reasoning MAI in concat, gate numerico finale �
 
 ## 5. Cosa riusare (tutto già nel workspace)
 
-- **Ramo `t8-concat` sul mirror privato** (tip ae6bad9cf, patch durature `patches/t8-concat/
+- **Ramo `t8-concat` su gitea** (tip ae6bad9cf, patch durature `patches/t8-concat/
   0001-0011`): meccanismo concat COMPLETO e inerte a k1=0 — qualsiasi variante
   pattern-exclusion parte da qui (il flag k1, il plumbing head, il dispatch accept, le
   metriche sono pronti e certificati).

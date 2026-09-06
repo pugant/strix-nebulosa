@@ -307,7 +307,7 @@ void common_chat_peg_mapper::map(const common_peg_ast_node & node) {
         current_tool          = &pending_tool_call.value();
         arg_count             = 0;
         args_buffer.clear();
-        arg_pair_pos.clear();
+        seen_args.clear();
         closing_quote_pending = false;
     }
 
@@ -357,32 +357,16 @@ void common_chat_peg_mapper::map(const common_peg_ast_node & node) {
             target = "{";
         }
 
-        for (auto it = arg_pair_pos.begin(); it != arg_pair_pos.end(); ++it) {
-            if (it->second == name) {
-                // Tolerated duplicate (grammar leniency, see analyze_tools):
-                // surgically remove the previous pair for this name so the LAST
-                // value wins, then re-emit. Keep this loud — a duplicated
-                // parameter is a model format slip worth observing.
-                LOG_WRN("peg-native: leniency-hit: duplicate param '%s' tolerated (last-wins)\n", name.c_str());
-                const auto   nit = std::next(it);
-                const size_t end = nit != arg_pair_pos.end() ? nit->first : target.size();
-                const size_t len = end - it->first;
-                target.erase(it->first, len);
-                for (auto jt = nit; jt != arg_pair_pos.end(); ++jt) {
-                    jt->first -= len;
-                }
-                arg_pair_pos.erase(it);
-                // erasing the FIRST pair leaves its successor's leading comma dangling
-                if (target.size() > 1 && target[1] == ',') {
-                    target.erase(1, 1);
-                    for (auto & pp : arg_pair_pos) {
-                        if (pp.first > 1) {
-                            pp.first -= 1;
-                        }
-                    }
-                }
-                break;
-            }
+        if (!seen_args.insert(name).second) {
+            // Tolerated duplicate (grammar leniency, see analyze_tools): keep
+            // APPENDING — JSON parsers resolve duplicate keys last-wins at parse
+            // time. Re-serializing last-wins in place would reorder the
+            // accumulated string and break the append-only invariant of the
+            // streaming diff (string_diff; 05/09 pi_agent errata: every
+            // leniency turn died client-side with "Invalid diff"). Keep this
+            // loud — a duplicated parameter is a model format slip worth
+            // observing.
+            LOG_WRN("peg-native: leniency-hit: duplicate param '%s' tolerated (last-wins)\n", name.c_str());
         }
 
         const size_t pair_start = target.size();
@@ -391,7 +375,6 @@ void common_chat_peg_mapper::map(const common_peg_ast_node & node) {
         }
         target += ordered_json(name).dump() + ":";
         ++arg_count;
-        arg_pair_pos.push_back({ pair_start, name });
     }
 
     if ((is_arg_value || is_arg_string_value) && current_tool) {

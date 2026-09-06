@@ -15,7 +15,7 @@
 - llm-service = produzione utente: MAI stop/start negli script (eccezione: esperimenti GPU pianificati con approvazione utente; restart a fine run + health via `docker ps`/IP container, MAI host :1234). Al 21/08 sera era FERMO dall'utente: verifica lo stato a inizio sessione e chiedi se serve riavviarlo o tenerlo fermo.
 - Modelli in `~/llmodels/` MAI toccati. Build SOLO con la pipeline staging validata in fase 0 (vedi Task 1).
 - Ogni esperimento GPU: piano .md PRIMA del run, marker TREATMENT, `--spec-draft-p-min 0.75`, temp 0, c 16384, ≥5 run mean±stddev (bench end-to-end) o ≥3 run (gate fase A, come da spec §7).
-- Commit col trailer `Co-Authored-By: GLM by z.ai <glm@z.ai>` MAI Claude/Anthropic. Branch `t8-concat` DA CREARE da `t8-ngram` (tip atteso `e6baf9518`, sul mirror privato). Patch durature `patches/t8-concat/`.
+- Commit col trailer `Co-Authored-By: GLM by z.ai <glm@z.ai>` MAI Claude/Anthropic. Branch `t8-concat` DA CREARE da `t8-ngram` (tip atteso `e6baf9518`, su gitea). Patch durature `patches/t8-concat/`.
 - Suite T7 (`scripts/test-drafter-routing-t*.sh`) runnate ORIGINALE mai modificate in-place; i test nuovi sono script NUOVI derivati (copiati).
 - Lezioni lab rigide: verify timestamp immagine DOPO build e PRIMA dei run; exit code veri (mai `cmd; echo $?` in wrapper); poll health con timeout esplicito (no sleep fissi lunghi); `docker logs` su stderr (`2>&1`); nessun carattere CJK nei testi italiani; numeri col punto decimale.
 - SPEC_VERIFY_LOG è una env il cui valore è un PATH file (non "=1").
@@ -162,7 +162,7 @@
 
 - [ ] **Step 1: Patch duratura (una-patch-per-feature, file per commit)**: `mkdir -p patches/t8-concat` POI `git format-patch t8-ngram..t8-concat -o patches/t8-concat/` (file numerati per commit, nomi espliciti generati da git — niente `ls -t|grep`, niente --stdout multi-commit in un solo file).
 - [ ] **Step 2: Gate PASS → proponi rollout produzione** (GATED utente: switch immagine + backup config + osservazione 24h, meccanica T7 Task 12). Gate FAIL → report causa + decisione (ritoccare k1 / chiudere stadio 2).
-- [ ] **Step 3: Push branch sul mirror privato** (`git push <mirror> t8-concat`) — SOLO su conferma utente.
+- [ ] **Step 3: Push branch su gitea** (`git -c credential.helper=store push gitea t8-concat`) — SOLO su conferma utente.
 - [ ] **Step 4: Update memoria** (`project-t8-sinergia-dual-drafter.md`: gate fase A e finale PASS/FAIL + decisioni) e spec se emendata in corsa.
 
 ---

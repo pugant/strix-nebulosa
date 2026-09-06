@@ -2,7 +2,9 @@
 
 #include <nlohmann/json_fwd.hpp>
 
+#include <map>
 #include <memory>
+#include <set>
 #include <unordered_map>
 #include <unordered_set>
 #include <string>
@@ -305,6 +307,14 @@ class common_peg_arena {
     common_peg_parser_id root_ = COMMON_PEG_INVALID_PARSER_ID;
 
   public:
+    // Required-arg sidecar for chat tool calls: the tagged grammar accepts
+    // parameters in any order, so required-ness cannot be expressed in the
+    // grammar itself — common_chat_peg_parse checks it post-parse, keyed by
+    // this map (tool name -> required param names). Serialized as an optional
+    // "tool_required" field so it survives save/load (the server ships the
+    // parser between threads as a string).
+    std::map<std::string, std::set<std::string>> tool_required_args;
+
     const common_peg_parser_variant & get(common_peg_parser_id id) const { return parsers_.at(id); }
     common_peg_parser_variant & get(common_peg_parser_id id) { return parsers_.at(id); }
 
