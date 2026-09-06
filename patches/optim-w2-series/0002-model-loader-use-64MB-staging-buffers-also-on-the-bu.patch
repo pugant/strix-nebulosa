@@ -1,0 +1,37 @@
+From 860ac33dc93d6a12464bbc994a919af209cec48b Mon Sep 17 00:00:00 2001
+From: pugant <pugant@localhost>
+Date: Sun, 6 Sep 2026 14:18:37 +0200
+Subject: [PATCH 2/3] model-loader: use 64MB staging buffers also on the
+ buffered read path
+
+The 1MB staging chunk without direct-IO made the per-cycle
+submit/sync/read overhead of the upload pipeline the second cost of a
+cold load (79.5k cycles for a 75.86 GiB model). Measured with root
+drop_caches on the FP2MIX v2 model (VK): 60.9s -> 58.3s (-4.3%, 3+3
+runs, stdev ~0.1s). Small but free: same bytes, same order, transfer
+only.
+
+Co-Authored-By: GLM by z.ai
+---
+ src/llama-model-loader.cpp | 5 +++--
+ 1 file changed, 3 insertions(+), 2 deletions(-)
+
+diff --git a/src/llama-model-loader.cpp b/src/llama-model-loader.cpp
+index afebbc088..981e78db8 100644
+--- a/src/llama-model-loader.cpp
++++ b/src/llama-model-loader.cpp
+@@ -1554,8 +1554,9 @@ bool llama_model_loader::load_all_data(
+     }
+ 
+     // Buffer size: balance between memory usage and I/O efficiency
+-    // 64MB works well for NVMe drives
+-    const size_t buffer_size = alignment != 1 ? 64 * 1024 * 1024 + 2 * alignment : 1 * 1024 * 1024;
++    // 64MB works well for NVMe drives (also without direct-IO: 1MB chunks make the
++    // read→stage→upload loop per-cycle overhead dominate on multi-GB models)
++    const size_t buffer_size = 64 * 1024 * 1024 + 2 * alignment;
+ 
+     std::vector<ggml_backend_buffer_t> host_buffers;
+     std::vector<ggml_backend_event_t> events;
+-- 
+2.53.0
+

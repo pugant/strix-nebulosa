@@ -1554,8 +1554,9 @@ bool llama_model_loader::load_all_data(
     }
 
     // Buffer size: balance between memory usage and I/O efficiency
-    // 64MB works well for NVMe drives
-    const size_t buffer_size = alignment != 1 ? 64 * 1024 * 1024 + 2 * alignment : 1 * 1024 * 1024;
+    // 64MB works well for NVMe drives (also without direct-IO: 1MB chunks make the
+    // read→stage→upload loop per-cycle overhead dominate on multi-GB models)
+    const size_t buffer_size = 64 * 1024 * 1024 + 2 * alignment;
 
     std::vector<ggml_backend_buffer_t> host_buffers;
     std::vector<ggml_backend_event_t> events;

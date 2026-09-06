@@ -9007,7 +9007,11 @@ static bool ggml_vk_should_use_mmvq(const vk_device& device, uint32_t m, uint32_
         }
     case VK_VENDOR_ID_AMD:
         if (k < 2048) {
-            return false;
+            // decode path (n == 1 is guaranteed by the early return above): allow the
+            // int-dot MMVQ — the quantize-y overhead is amortized by the cached
+            // prealloc_y per tensor-distinct, and the q8_1 pipeline beats the
+            // f32-dequant fallback at short k on RDNA (down/PLE/m2560k640 families)
+            return true;
         }
 
         switch (src0_type) {
@@ -10368,7 +10372,10 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
     }
 
     // Only use mask opt when the mask is fairly large. This hasn't been tuned extensively.
-    bool use_mask_opt = mask && nem1 >= 32 && nem0 * nem1 > 32768 && nem0 >= tuning_params.block_cols * 16;
+    // QSA decode (nem1 == 1): the top-k mask leaves most KV cells fully masked at long
+    // contexts — the mask-opt scan pass lets the shader skip whole masked blocks.
+    bool use_mask_opt = mask && ((nem1 >= 32 && nem0 * nem1 > 32768 && nem0 >= tuning_params.block_cols * 16) ||
+                                 (nem1 == 1 && nem0 >= 8192));
     vk_fa_pipeline_state fa_pipeline_state = get_fa_pipeline_state(ctx->device, tuning_params, HSK, HSV, aligned, f32acc,
                                                                    mask != nullptr, use_mask_opt, logit_softcap != 0, k_fa_type, v_fa_type);
 

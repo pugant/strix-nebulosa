@@ -1,0 +1,40 @@
+From 27c93938da290e11e28adfd28509abeaee93bb4e Mon Sep 17 00:00:00 2001
+From: pugant <pugant@localhost>
+Date: Sun, 6 Sep 2026 14:56:26 +0200
+Subject: [PATCH 3/3] vulkan: enable mask-opt for QSA decode (nem1 == 1) in
+ flash attention
+
+The use_mask_opt gate required nem1 >= 32, so the QSA decode path (single
+query row) never used the block-skip scan even at long contexts where the
+top-k mask leaves most KV cells fully masked. The coopmat2 shader already
+skips all-NEG-INF blocks when built with mask opt.
+
+Measured on gfx1151 (FP2MIX v2, KV q8_0): combined16k +8.2%
+(186.69 -> 202.04 t/s), combined32k +0.9%, tg512 unchanged; ppl identical
+to the 4th decimal (skip of fully-masked blocks is exact by construction);
+battery probe fidelity 12/12 PASS.
+
+Co-Authored-By: GLM by z.ai
+---
+ ggml/src/ggml-vulkan/ggml-vulkan.cpp | 5 ++++-
+ 1 file changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+index 782f2f626..56a296c56 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
++++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+@@ -10372,7 +10372,10 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
+     }
+ 
+     // Only use mask opt when the mask is fairly large. This hasn't been tuned extensively.
+-    bool use_mask_opt = mask && nem1 >= 32 && nem0 * nem1 > 32768 && nem0 >= tuning_params.block_cols * 16;
++    // QSA decode (nem1 == 1): the top-k mask leaves most KV cells fully masked at long
++    // contexts — the mask-opt scan pass lets the shader skip whole masked blocks.
++    bool use_mask_opt = mask && ((nem1 >= 32 && nem0 * nem1 > 32768 && nem0 >= tuning_params.block_cols * 16) ||
++                                 (nem1 == 1 && nem0 >= 8192));
+     vk_fa_pipeline_state fa_pipeline_state = get_fa_pipeline_state(ctx->device, tuning_params, HSK, HSV, aligned, f32acc,
+                                                                    mask != nullptr, use_mask_opt, logit_softcap != 0, k_fa_type, v_fa_type);
+ 
+-- 
+2.53.0
+
