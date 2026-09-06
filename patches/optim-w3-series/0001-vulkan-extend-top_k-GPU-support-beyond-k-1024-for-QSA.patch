@@ -1,0 +1,642 @@
+From 65084bd1ccafc3d06d40519ac1e44609f48cce2f Mon Sep 17 00:00:00 2001
+From: pugant <pugant@localhost>
+Date: Sun, 6 Sep 2026 22:18:31 +0200
+Subject: [PATCH] vulkan: extend top_k GPU support beyond k=1024 for QSA
+ (k=2051)
+
+Large-k top_k via single-workgroup n-ary search with global-memory
+bucket counting (mode first_pass==2 in topk_nary_search), gated on
+pipeline_topk_f32[10] n-ary capability. Path k<=1023 unchanged
+(byte-identical). Marker: W3-C22-TOPK in backend init log.
+Adds tools/c22-topk-equivalence.cpp (GPU-vs-CPU oracle, not in
+default build targets).
+
+Co-Authored-By: GLM by z.ai
+---
+ ggml/src/ggml-vulkan/ggml-vulkan.cpp          |  87 ++++-
+ .../vulkan-shaders/topk_nary_search.comp      | 167 ++++++++++
+ tools/c22-topk-equivalence.cpp                | 302 ++++++++++++++++++
+ 3 files changed, 554 insertions(+), 2 deletions(-)
+ create mode 100644 tools/c22-topk-equivalence.cpp
+
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+index 56a296c56..5e63c619f 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
++++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+@@ -3698,6 +3698,26 @@ struct CompileTask {
+     uint32_t required_subgroup_size;
+ };
+ 
++// W3-C22 TOPK-QSA-GPU: mirrors the pipeline creation conditions of the largest
++// top-k slot, i.e. whether pipeline_topk_f32[num_topk_pipelines-1] holds the
++// n-ary search variant (not the argsort fallback). Only then can the
++// single-workgroup whole-row path used for k > 2^10 run (topk mode 2).
++static bool ggml_vk_topk_nary_large_capable(const vk_device& device) {
++    const uint32_t i = num_topk_pipelines - 1;
++    if (i > device->max_workgroup_size_log2) {
++        return false;
++    }
++    const uint32_t BLOCK_SIZE = 1u << i;
++    const uint32_t nary_shmem = 2 * sizeof(int) * BLOCK_SIZE +
++                                sizeof(int) * device->subgroup_size +
++                                2 * sizeof(int) +
++                                2 * (BLOCK_SIZE / device->subgroup_size) * sizeof(int);
++    return device->subgroup_arithmetic && device->subgroup_require_full_support &&
++           device->subgroup_shuffle && device->subgroup_ballot &&
++           nary_shmem <= device->properties.limits.maxComputeSharedMemorySize &&
++           device->pipeline_topk_f32[i] != nullptr;
++}
++
+ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+     VK_LOG_DEBUG("ggml_vk_load_shaders(" << device->name << ")");
+ 
+@@ -6404,6 +6424,12 @@ static vk_device ggml_vk_get_device(size_t idx) {
+ 
+         ggml_vk_load_shaders(device);
+ 
++        // W3-C22-TOPK: build marker, printed once per device when the large-k
++        // top_k path is available.
++        if (ggml_vk_topk_nary_large_capable(device)) {
++            GGML_LOG_INFO("ggml_vulkan: W3-C22-TOPK large-k top_k enabled (k > 1024 on GPU)\n");
++        }
++
+         // Prefer a dedicated transfer queue on AMD dGPUs (non-GCN) when graphics queue use is disabled.
+         const bool prefers_transfer_queue =
+             device->vendor_id == VK_VENDOR_ID_AMD &&
+@@ -13029,11 +13055,58 @@ static void ggml_vk_argsort(ggml_backend_vk_context * ctx, vk_context& subctx, c
+     }
+ }
+ 
++// W3-C22 TOPK-QSA-GPU: k > 2^10 (e.g. k=2051 for the qwen4exp QSA indexer)
++// cannot use the multi-pass per-chunk reduction below. A pass that keeps k'
++// per workgroup can only preserve the top-k' (an element of the global top-k
++// may have a higher in-chunk rank), and a workgroup never holds more than 2^10
++// candidates, so with k > 2^10 the loop cannot converge. Instead dispatch the
++// n-ary search over the whole row from a single workgroup per row
++// (topk_nary_search mode 2): the bucket counting scans global memory, so the
++// row length and k are not bound by the workgroup size. The same workgroup
++// then emits the winners chunk by chunk with a running tie budget, so the
++// selection is deterministic run to run. One dispatch, no intermediates.
++static void ggml_vk_topk_large_k(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, ggml_tensor * dst) {
++    const uint32_t ncols = src0->ne[0];
++    const uint32_t nrows = ggml_nrows(src0);
++    const uint32_t k = dst->ne[0];
++
++    // supports_op only lets k > 2^10 through when the largest slot holds the
++    // n-ary search variant.
++    vk_pipeline pipeline = ctx->device->pipeline_topk_f32[num_topk_pipelines - 1];
++    GGML_ASSERT(pipeline != nullptr);
++    GGML_ASSERT(k <= ncols);
++
++    // first_pass == 2: whole-row n-ary search + direct emission into dst.
++    vk_op_topk_push_constants pc { ncols, ncols, k, k, nrows, 2, 1 };
++
++    std::array<uint32_t, 3> elements;
++    // Single workgroup per row.
++    elements[0] = pipeline->wg_denoms[0];
++    elements[1] = std::min(nrows, ctx->device->properties.limits.maxComputeWorkGroupCount[1]);
++    elements[2] = 1;
++
++    if (ctx->prealloc_x_need_sync) {
++        ggml_vk_sync_buffers(ctx, subctx);
++    }
++
++    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
++    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { ggml_vk_tensor_subbuffer(ctx, src0), ggml_vk_tensor_subbuffer(ctx, dst) }, pc, elements);
++}
++
+ static void ggml_vk_topk(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, ggml_tensor * dst) {
+     uint32_t ncols = src0->ne[0];
+     uint32_t nrows = ggml_nrows(src0);
+     uint32_t k = dst->ne[0];
+ 
++    // W3-C22: k > 2^10 goes to the single-workgroup whole-row path. Everything
++    // below (k <= 2^10 - 1) is unchanged.
++    if (k >= (1u << (num_topk_pipelines - 1))) {
++        // supports_op only routes k > 2^10 here on n-ary capable devices.
++        GGML_ASSERT(ggml_vk_topk_nary_large_capable(ctx->device));
++        ggml_vk_topk_large_k(ctx, subctx, src0, dst);
++        return;
++    }
++
+     vk_op_topk_push_constants pc { ncols, ncols, ncols, k, nrows, 0, 0 };
+ 
+     if (ctx->prealloc_x_need_sync) {
+@@ -17466,8 +17539,18 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
+                 // We could potentially support larger, using argsort to sort the
+                 // whole thing. Not clear if this is needed.
+                 uint32_t min_pipeline = (uint32_t)log2f(float(op->ne[0])) + 1;
+-                if (min_pipeline >= num_topk_pipelines ||
+-                    !device->pipeline_topk_f32[min_pipeline]) {
++                if (min_pipeline >= num_topk_pipelines) {
++                    // W3-C22 TOPK-QSA-GPU: k > 2^10 (k=2051 for the qwen4exp
++                    // QSA indexer) uses the single-workgroup whole-row n-ary
++                    // search on the largest pipeline slot. Requires the n-ary
++                    // variant (not the argsort fallback) and k <= ncols, like
++                    // the CPU reference (ggml_top_k asserts ne[0] >= k).
++                    return op->ne[0] <= op->src[0]->ne[0] &&
++                           (uint64_t)op->ne[0] * ggml_nrows(op) <= std::numeric_limits<uint32_t>::max() &&
++                           (uint64_t)op->src[0]->ne[0] * ggml_nrows(op->src[0]) <= std::numeric_limits<uint32_t>::max() &&
++                           ggml_vk_topk_nary_large_capable(device);
++                }
++                if (!device->pipeline_topk_f32[min_pipeline]) {
+                     return false;
+                 }
+             }
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/topk_nary_search.comp b/ggml/src/ggml-vulkan/vulkan-shaders/topk_nary_search.comp
+index 0b757f38e..efda06e3e 100644
+--- a/ggml/src/ggml-vulkan/vulkan-shaders/topk_nary_search.comp
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/topk_nary_search.comp
+@@ -40,6 +40,9 @@ shared uint sh_total;
+ shared uint offset_partials[BLOCK_SIZE / SUBGROUP_SIZE];
+ shared uint eq_min_partials[BLOCK_SIZE / SUBGROUP_SIZE];
+ 
++// W3-C22 TOPK-QSA-GPU: running output position of the whole-row path below.
++shared uint sh_written;
++
+ // Map float values to uint such that comparisons still work.
+ // Positive values set the high bit, negative values are inverted.
+ // +0.0 -> 0x80000000, -0.0 -> 0x7FFFFFFF are in the correct places.
+@@ -237,7 +240,171 @@ void topk(const uint row) {
+     }
+ }
+ 
++// W3-C22 TOPK-QSA-GPU: k > BLOCK_SIZE cannot use the multi-pass per-chunk
++// reduction of topk(): a pass that keeps k' per workgroup only preserves the
++// top-k', and a workgroup never holds more than BLOCK_SIZE candidates, so the
++// host-side loop cannot converge. Instead a single workgroup per row runs the
++// n-ary search over the whole row, scanning global memory directly, and then
++// emits the winners chunk by chunk. Values strictly above the threshold tau
++// always win; values equal to tau fill the remaining slots in index order, so
++// the selection is deterministic run to run. Selected via first_pass == 2
++// (input is the f32 source, output is the final k indices).
++void topk_large(const uint row) {
++    const uint tid = gl_LocalInvocationID.x;
++    const uint N = p.ncols_input;
++    const uint row_offset = row * N;
++
++    // N-ary search for the k-th largest value, as in topk(), but the bucket
++    // counting scans the input straight from global memory.
++    int shift = 32 - SUBGROUP_SIZE_LOG2;
++    uint mask = ((1 << SUBGROUP_SIZE_LOG2) - 1) << shift;
++
++    uint range_min = 0;
++    uint range_max = 0xFF800000;
++    uint total = 0;
++    const uint limit = min(p.k, N);
++
++    while (mask != 0) {
++        barrier();
++        // Initialize bucket counts to zero.
++        if (tid < SUBGROUP_SIZE) {
++            counts[tid] = 0;
++        }
++        barrier();
++        // Count how many values are in each bucket.
++        for (uint i = tid; i < N; i += BLOCK_SIZE) {
++            const uint fy = f2ui(data_a[row_offset + i]);
++            if (fy >= range_min && fy < range_max) {
++                atomicAdd(counts[(fy & mask) >> shift], 1);
++            }
++        }
++        barrier();
++
++        // On the first subgroup, do a scan to count (from the top down) how
++        // many elements are in the top N buckets. Find the index of the first
++        // that is over the limit. Copy it to the other invocations through
++        // shared memory.
++        if (tid < SUBGROUP_SIZE) {
++            uint partial_sum = subgroupInclusiveAdd(counts[SUBGROUP_SIZE - 1 - tid]) + total;
++            uint t = subgroupBallotFindLSB(subgroupBallot(partial_sum >= limit));
++            if (tid == t) {
++                sh_min_idx = int(SUBGROUP_SIZE - 1 - t);
++                sh_total = partial_sum;
++            }
++        }
++        barrier();
++        const int min_idx = sh_min_idx;
++        total = sh_total;
++
++        // Update the range, and break if we've found the K-th largest.
++        range_max = range_min + ((min_idx + 1) << shift);
++        range_min = range_min + (min_idx << shift);
++
++        if (total == p.k) {
++            break;
++        }
++        total -= counts[min_idx];
++        mask >>= SUBGROUP_SIZE_LOG2;
++        shift -= SUBGROUP_SIZE_LOG2;
++        if (shift < 0) {
++            shift = 0;
++        }
++    }
++
++    // f2ui of the k-th largest value.
++    const uint tau = range_min;
++
++    // Count how many values are strictly above tau. Ties may only fill the
++    // slots left over by ALL strict winners, regardless of chunk order.
++    barrier();
++    if (tid == 0) {
++        sh_total = 0;
++    }
++    barrier();
++    for (uint i = tid; i < N; i += BLOCK_SIZE) {
++        if (f2ui(data_a[row_offset + i]) > tau) {
++            atomicAdd(sh_total, 1);
++        }
++    }
++    barrier();
++    if (tid == 0) {
++        // Tie budget still available. The min() guards the pathological case
++        // of +inf inputs (excluded from the search, like in topk()).
++        sh_total = p.k - min(sh_total, p.k);
++        sh_written = 0;
++    }
++    barrier();
++
++    for (uint base = 0; base < N; base += BLOCK_SIZE) {
++        // Read the running state first; the barrier below separates the reads
++        // from the updates at the end of the iteration.
++        const uint ties_left = sh_total;
++        const uint written = sh_written;
++
++        const uint i = base + tid;
++        const ivec2 v = i < N ? ivec2(int(i), floatBitsToInt(data_a[row_offset + i]))
++                              : ivec2(int(p.orig_ncols), 0xFF800000);  // -inf
++        const uint fy = f2ui(intBitsToFloat(v.y));
++        const bool top = fy > tau;
++        const bool eq = fy == tau;
++
++        const uvec4 b_top = subgroupBallot(top);
++        const uvec4 b_eq = subgroupBallot(eq);
++        if ((tid % SUBGROUP_SIZE) == 0) {
++            offset_partials[tid / SUBGROUP_SIZE] = subgroupBallotBitCount(b_top);
++            eq_min_partials[tid / SUBGROUP_SIZE] = subgroupBallotBitCount(b_eq);
++        }
++        barrier();
++
++        // Prefix of the winners of earlier subgroups of this chunk.
++        uint top_base = 0;
++        uint eq_base = 0;
++        uint chunk_top = 0;
++        uint chunk_eq = 0;
++        [[unroll]] for (int s = 0; s < BLOCK_SIZE / SUBGROUP_SIZE; ++s) {
++            if (s < int(tid / SUBGROUP_SIZE)) {
++                top_base += offset_partials[s];
++                eq_base += eq_min_partials[s];
++            }
++            chunk_top += offset_partials[s];
++            chunk_eq += eq_min_partials[s];
++        }
++
++        // How many tau-ties this chunk may emit.
++        const uint budget = min(chunk_eq, ties_left);
++
++        const uint top_ex = subgroupBallotExclusiveBitCount(b_top);
++        const uint eq_ex = subgroupBallotExclusiveBitCount(b_eq);
++        // The < p.k bounds never trigger on finite input (tau is the k-th
++        // largest); they only keep pathological +inf inputs from writing past
++        // the end of the row.
++        const uint out_strict = written + top_base + top_ex;
++        if (top && out_strict < p.k) {
++            data_d[row * p.k + out_strict] = v.x;
++        }
++        const uint out_eq = written + chunk_top + eq_base + eq_ex;
++        if (eq && eq_base + eq_ex < budget && out_eq < p.k) {
++            data_d[row * p.k + out_eq] = v.x;
++        }
++
++        if (tid == 0) {
++            sh_total = ties_left - budget;
++            sh_written = written + chunk_top + budget;
++        }
++        barrier();
++    }
++}
++
+ void main() {
++    if (p.first_pass == 2) {
++        // W3-C22: whole-row mode, one workgroup per row.
++        uint row = gl_WorkGroupID.y;
++        while (row < p.nrows) {
++            topk_large(row);
++            row += gl_WorkGroupSize.y * gl_NumWorkGroups.y;
++        }
++        return;
++    }
+     uint row = gl_WorkGroupID.y;
+     while (row < p.nrows) {
+         topk(row);
+diff --git a/tools/c22-topk-equivalence.cpp b/tools/c22-topk-equivalence.cpp
+new file mode 100644
+index 000000000..05270a877
+--- /dev/null
++++ b/tools/c22-topk-equivalence.cpp
+@@ -0,0 +1,302 @@
++// W3-C22 TOPK-QSA-GPU: GPU-vs-CPU equivalence test for ggml_top_k with
++// k > 1024 (k=2051, the qwen4exp QSA indexer selection at 32k context).
++//
++// Standalone tool, intentionally NOT wired into any default build target.
++// Compile it inside the usual build container, e.g.:
++//
++//   g++ -std=c++17 -O2 -I ggml/include tools/c22-topk-equivalence.cpp \
++//       -o build/c22-topk-equivalence \
++//       -L <build>/bin -lggml -lggml-base -lggml-cpu
++//
++// (add -lggml-vulkan or set GGML_BACKEND_PATH if the Vulkan backend is built
++// as a shared module; with a static build it is already registered).
++//
++// PASS criteria (class D, as declared in the patch):
++//   - the top-k VALUE sequences of GPU and CPU reference match within 1e-6;
++//   - the index selections differ at most on exact ties: per distinct value
++//     the selected multiplicities must match, so any index difference is a
++//     swap inside a tie group of the input;
++//   - the GPU output is bit-identical across two identical runs (stability).
++//
++// Cases: [1x32768] k=2051 (the QSA shape), [2x32768] k=2051 (multi row),
++// [1x4096] k=2051 (multi chunk, short row), plus a tie-stress case on
++// [2x32768] with heavy value quantization.
++
++#include "ggml.h"
++#include "ggml-alloc.h"
++#include "ggml-backend.h"
++#include "ggml-cpp.h"
++
++#include <algorithm>
++#include <cmath>
++#include <cstdint>
++#include <cstdio>
++#include <cstring>
++#include <random>
++#include <string>
++#include <vector>
++
++struct test_case_t {
++    const char * name;
++    int nrows;
++    int ncols;
++    int k;
++    bool tie_stress;
++};
++
++static uint32_t f2u_key(float v) {
++    // group key: bit pattern, with -0.0 normalized to +0.0 (comparisons treat
++    // them as equal, so selections may swap them)
++    if (v == 0.0f) {
++        v = 0.0f;
++    }
++    uint32_t u;
++    std::memcpy(&u, &v, sizeof(u));
++    return u;
++}
++
++struct selection_t {
++    std::vector<float>    values;  // sorted descending, size k
++    std::vector<int32_t>  indices; // as produced by the reference
++    std::vector<uint32_t> keys;    // f2u_key(values[i])
++};
++
++static selection_t reference_top_k(const std::vector<float> & x, int k) {
++    selection_t sel;
++    const int ncols = (int)x.size();
++    sel.values.resize(k);
++    sel.indices.resize(k);
++    sel.keys.resize(k);
++
++    std::vector<int32_t> idx(ncols);
++    for (int i = 0; i < ncols; ++i) {
++        idx[i] = i;
++    }
++    const float * data = x.data();
++    std::partial_sort(idx.begin(), idx.begin() + k, idx.end(),
++                      [data](int32_t a, int32_t b) { return data[a] > data[b]; });
++    for (int i = 0; i < k; ++i) {
++        sel.indices[i] = idx[i];
++        sel.values[i]  = data[idx[i]];
++        sel.keys[i]    = f2u_key(data[idx[i]]);
++    }
++    return sel;
++}
++
++static bool check_row(const std::vector<float> & x, const selection_t & cpu,
++                      const int32_t * gpu_idx, int k, std::string & err) {
++    const int ncols = (int)x.size();
++
++    // indices in range and distinct
++    {
++        std::vector<int32_t> s(gpu_idx, gpu_idx + k);
++        for (int i = 0; i < k; ++i) {
++            if (s[i] < 0 || s[i] >= ncols) {
++                err = "index out of range: " + std::to_string(s[i]);
++                return false;
++            }
++        }
++        std::sort(s.begin(), s.end());
++        for (int i = 1; i < k; ++i) {
++            if (s[i] == s[i - 1]) {
++                err = "duplicated index " + std::to_string(s[i]);
++                return false;
++            }
++        }
++    }
++
++    // 1) value sequences (GPU values gathered by index, sorted descending)
++    std::vector<float> gpu_sorted(k);
++    for (int i = 0; i < k; ++i) {
++        gpu_sorted[i] = x[gpu_idx[i]];
++    }
++    std::sort(gpu_sorted.begin(), gpu_sorted.end(), std::greater<float>());
++    for (int i = 0; i < k; ++i) {
++        if (std::fabs(gpu_sorted[i] - cpu.values[i]) > 1e-6f) {
++            err = "value mismatch at " + std::to_string(i) + ": gpu " +
++                  std::to_string(gpu_sorted[i]) + " cpu " + std::to_string(cpu.values[i]);
++            return false;
++        }
++    }
++
++    // 2) per-value multiplicities (=> index diffs only inside exact ties)
++    std::vector<std::pair<uint32_t, int>> gpu_groups, cpu_groups;
++    {
++        std::vector<uint32_t> gk(k);
++        for (int i = 0; i < k; ++i) {
++            gk[i] = f2u_key(x[gpu_idx[i]]);
++        }
++        std::sort(gk.begin(), gk.end());
++        for (int i = 0; i < k;) {
++            int j = i;
++            while (j < k && gk[j] == gk[i]) {
++                ++j;
++            }
++            gpu_groups.push_back({gk[i], j - i});
++            i = j;
++        }
++    }
++    {
++        std::vector<uint32_t> ck = cpu.keys;
++        std::sort(ck.begin(), ck.end());
++        for (int i = 0; i < k;) {
++            int j = i;
++            while (j < k && ck[j] == ck[i]) {
++                ++j;
++            }
++            cpu_groups.push_back({ck[i], j - i});
++            i = j;
++        }
++    }
++    if (gpu_groups.size() != cpu_groups.size()) {
++        err = "distinct value count differs: gpu " + std::to_string(gpu_groups.size()) +
++              " cpu " + std::to_string(cpu_groups.size());
++        return false;
++    }
++    for (size_t i = 0; i < gpu_groups.size(); ++i) {
++        if (gpu_groups[i].first != cpu_groups[i].first ||
++            gpu_groups[i].second != cpu_groups[i].second) {
++            err = "value group mismatch at group " + std::to_string(i) +
++                  " (key gpu 0x" + std::to_string(gpu_groups[i].first) +
++                  " x" + std::to_string(gpu_groups[i].second) +
++                  ", cpu 0x" + std::to_string(cpu_groups[i].first) +
++                  " x" + std::to_string(cpu_groups[i].second) + ")";
++            return false;
++        }
++    }
++
++    return true;
++}
++
++static bool run_case(ggml_backend_t backend, const test_case_t & tc, std::mt19937 & rng, std::string & err) {
++    const int nrows = tc.nrows;
++    const int ncols = tc.ncols;
++    const int k     = tc.k;
++
++    // host input
++    std::vector<float> x((size_t)nrows * ncols);
++    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
++    for (auto & v : x) {
++        v = dist(rng);
++    }
++    if (tc.tie_stress) {
++        // quantize to a coarse grid -> many exact ties around the cut
++        for (auto & v : x) {
++            v = std::round(v * 8.0f) / 8.0f;
++        }
++    }
++
++    // build the graph: a [ncols, nrows] f32 -> top_k -> [k, nrows] i32
++    ggml_init_params ip = {};
++    ip.mem_size = ggml_tensor_overhead() * 4 + ggml_graph_overhead();
++    ip.no_alloc = true;
++    ggml_context_ptr ctx(ggml_init(ip));
++    GGML_ASSERT(ctx != nullptr);
++
++    ggml_tensor * a   = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, ncols, nrows);
++    ggml_tensor * out = ggml_top_k(ctx.get(), a, k);
++
++    // the gate must accept k > 1024 on this device
++    if (!ggml_backend_supports_op(backend, out)) {
++        err = "backend does not support TOP_K with k=" + std::to_string(k) +
++              " (gate rejected; is this the patched VK backend?)";
++        return false;
++    }
++
++    ggml_cgraph * gf = ggml_new_graph(ctx.get());
++    ggml_build_forward_expand(gf, out);
++
++    ggml_backend_buffer_ptr buf(ggml_backend_alloc_ctx_tensors(ctx.get(), backend));
++    if (buf == nullptr) {
++        err = "alloc failed";
++        return false;
++    }
++
++    ggml_backend_tensor_set(a, x.data(), 0, ggml_nbytes(a));
++
++    std::vector<int32_t> out_run1((size_t)k * nrows);
++    std::vector<int32_t> out_run2((size_t)k * nrows);
++    for (int run = 0; run < 2; ++run) {
++        if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS) {
++            err = "graph_compute failed (run " + std::to_string(run) + ")";
++            return false;
++        }
++        ggml_backend_synchronize(backend);
++        std::vector<int32_t> & dst = run == 0 ? out_run1 : out_run2;
++        ggml_backend_tensor_get(out, dst.data(), 0, ggml_nbytes(out));
++    }
++
++    // 3) run-to-run stability
++    if (std::memcmp(out_run1.data(), out_run2.data(), out_run1.size() * sizeof(int32_t)) != 0) {
++        err = "GPU output differs between identical runs (not stable)";
++        return false;
++    }
++
++    // reference + comparison, row by row
++    for (int r = 0; r < nrows; ++r) {
++        std::vector<float> row(x.begin() + (size_t)r * ncols, x.begin() + (size_t)(r + 1) * ncols);
++        selection_t cpu = reference_top_k(row, k);
++        std::string row_err;
++        if (!check_row(row, cpu, out_run1.data() + (size_t)r * k, k, row_err)) {
++            err = "row " + std::to_string(r) + ": " + row_err;
++            return false;
++        }
++    }
++
++    return true;
++}
++
++int main(int argc, char ** argv) {
++    GGML_UNUSED(argc);
++    GGML_UNUSED(argv);
++
++    ggml_backend_load_all();
++
++    ggml_backend_dev_t vk_dev = nullptr;
++    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
++        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
++        std::string name = ggml_backend_dev_name(dev);
++        if (name.find("Vulkan") != std::string::npos) {
++            vk_dev = dev;
++            break;
++        }
++    }
++    if (vk_dev == nullptr) {
++        fprintf(stderr, "c22-topk-equivalence: no Vulkan device found\n");
++        return 1;
++    }
++
++    ggml_backend_ptr backend(ggml_backend_dev_init(vk_dev, nullptr));
++    if (backend == nullptr) {
++        fprintf(stderr, "c22-topk-equivalence: Vulkan backend init failed\n");
++        return 1;
++    }
++
++    printf("c22-topk-equivalence: backend %s (%s)\n",
++           ggml_backend_name(backend.get()), ggml_backend_dev_description(vk_dev));
++
++    const std::vector<test_case_t> cases = {
++        { "1x32768 k=2051 (QSA shape)",   1, 32768, 2051, false },
++        { "2x32768 k=2051 (multi row)",   2, 32768, 2051, false },
++        { "1x4096  k=2051 (multi chunk)", 1,  4096, 2051, false },
++        { "2x32768 k=2051 (tie stress)",  2, 32768, 2051, true  },
++    };
++
++    int n_pass = 0;
++    int n_fail = 0;
++    for (const auto & tc : cases) {
++        std::mt19937 rng(20260906u);
++        std::string err;
++        const bool ok = run_case(backend.get(), tc, rng, err);
++        printf("  [%s] %s\n", ok ? "PASS" : "FAIL", tc.name);
++        if (!ok) {
++            printf("    -> %s\n", err.c_str());
++            ++n_fail;
++        } else {
++            ++n_pass;
++        }
++    }
++
++    printf("c22-topk-equivalence: %d passed, %d failed\n", n_pass, n_fail);
++    return n_fail == 0 ? 0 : 1;
++}
+-- 
+2.53.0
+

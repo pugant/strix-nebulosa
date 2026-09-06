@@ -3698,6 +3698,26 @@ struct CompileTask {
     uint32_t required_subgroup_size;
 };
 
+// W3-C22 TOPK-QSA-GPU: mirrors the pipeline creation conditions of the largest
+// top-k slot, i.e. whether pipeline_topk_f32[num_topk_pipelines-1] holds the
+// n-ary search variant (not the argsort fallback). Only then can the
+// single-workgroup whole-row path used for k > 2^10 run (topk mode 2).
+static bool ggml_vk_topk_nary_large_capable(const vk_device& device) {
+    const uint32_t i = num_topk_pipelines - 1;
+    if (i > device->max_workgroup_size_log2) {
+        return false;
+    }
+    const uint32_t BLOCK_SIZE = 1u << i;
+    const uint32_t nary_shmem = 2 * sizeof(int) * BLOCK_SIZE +
+                                sizeof(int) * device->subgroup_size +
+                                2 * sizeof(int) +
+                                2 * (BLOCK_SIZE / device->subgroup_size) * sizeof(int);
+    return device->subgroup_arithmetic && device->subgroup_require_full_support &&
+           device->subgroup_shuffle && device->subgroup_ballot &&
+           nary_shmem <= device->properties.limits.maxComputeSharedMemorySize &&
+           device->pipeline_topk_f32[i] != nullptr;
+}
+
 static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     VK_LOG_DEBUG("ggml_vk_load_shaders(" << device->name << ")");
 
@@ -6403,6 +6423,12 @@ static vk_device ggml_vk_get_device(size_t idx) {
         device->dsl = device->device.createDescriptorSetLayout(descriptor_set_layout_create_info);
 
         ggml_vk_load_shaders(device);
+
+        // W3-C22-TOPK: build marker, printed once per device when the large-k
+        // top_k path is available.
+        if (ggml_vk_topk_nary_large_capable(device)) {
+            GGML_LOG_INFO("ggml_vulkan: W3-C22-TOPK large-k top_k enabled (k > 1024 on GPU)\n");
+        }
 
         // Prefer a dedicated transfer queue on AMD dGPUs (non-GCN) when graphics queue use is disabled.
         const bool prefers_transfer_queue =
@@ -13029,10 +13055,57 @@ static void ggml_vk_argsort(ggml_backend_vk_context * ctx, vk_context& subctx, c
     }
 }
 
+// W3-C22 TOPK-QSA-GPU: k > 2^10 (e.g. k=2051 for the qwen4exp QSA indexer)
+// cannot use the multi-pass per-chunk reduction below. A pass that keeps k'
+// per workgroup can only preserve the top-k' (an element of the global top-k
+// may have a higher in-chunk rank), and a workgroup never holds more than 2^10
+// candidates, so with k > 2^10 the loop cannot converge. Instead dispatch the
+// n-ary search over the whole row from a single workgroup per row
+// (topk_nary_search mode 2): the bucket counting scans global memory, so the
+// row length and k are not bound by the workgroup size. The same workgroup
+// then emits the winners chunk by chunk with a running tie budget, so the
+// selection is deterministic run to run. One dispatch, no intermediates.
+static void ggml_vk_topk_large_k(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, ggml_tensor * dst) {
+    const uint32_t ncols = src0->ne[0];
+    const uint32_t nrows = ggml_nrows(src0);
+    const uint32_t k = dst->ne[0];
+
+    // supports_op only lets k > 2^10 through when the largest slot holds the
+    // n-ary search variant.
+    vk_pipeline pipeline = ctx->device->pipeline_topk_f32[num_topk_pipelines - 1];
+    GGML_ASSERT(pipeline != nullptr);
+    GGML_ASSERT(k <= ncols);
+
+    // first_pass == 2: whole-row n-ary search + direct emission into dst.
+    vk_op_topk_push_constants pc { ncols, ncols, k, k, nrows, 2, 1 };
+
+    std::array<uint32_t, 3> elements;
+    // Single workgroup per row.
+    elements[0] = pipeline->wg_denoms[0];
+    elements[1] = std::min(nrows, ctx->device->properties.limits.maxComputeWorkGroupCount[1]);
+    elements[2] = 1;
+
+    if (ctx->prealloc_x_need_sync) {
+        ggml_vk_sync_buffers(ctx, subctx);
+    }
+
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { ggml_vk_tensor_subbuffer(ctx, src0), ggml_vk_tensor_subbuffer(ctx, dst) }, pc, elements);
+}
+
 static void ggml_vk_topk(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, ggml_tensor * dst) {
     uint32_t ncols = src0->ne[0];
     uint32_t nrows = ggml_nrows(src0);
     uint32_t k = dst->ne[0];
+
+    // W3-C22: k > 2^10 goes to the single-workgroup whole-row path. Everything
+    // below (k <= 2^10 - 1) is unchanged.
+    if (k >= (1u << (num_topk_pipelines - 1))) {
+        // supports_op only routes k > 2^10 here on n-ary capable devices.
+        GGML_ASSERT(ggml_vk_topk_nary_large_capable(ctx->device));
+        ggml_vk_topk_large_k(ctx, subctx, src0, dst);
+        return;
+    }
 
     vk_op_topk_push_constants pc { ncols, ncols, ncols, k, nrows, 0, 0 };
 
@@ -17466,8 +17539,18 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                 // We could potentially support larger, using argsort to sort the
                 // whole thing. Not clear if this is needed.
                 uint32_t min_pipeline = (uint32_t)log2f(float(op->ne[0])) + 1;
-                if (min_pipeline >= num_topk_pipelines ||
-                    !device->pipeline_topk_f32[min_pipeline]) {
+                if (min_pipeline >= num_topk_pipelines) {
+                    // W3-C22 TOPK-QSA-GPU: k > 2^10 (k=2051 for the qwen4exp
+                    // QSA indexer) uses the single-workgroup whole-row n-ary
+                    // search on the largest pipeline slot. Requires the n-ary
+                    // variant (not the argsort fallback) and k <= ncols, like
+                    // the CPU reference (ggml_top_k asserts ne[0] >= k).
+                    return op->ne[0] <= op->src[0]->ne[0] &&
+                           (uint64_t)op->ne[0] * ggml_nrows(op) <= std::numeric_limits<uint32_t>::max() &&
+                           (uint64_t)op->src[0]->ne[0] * ggml_nrows(op->src[0]) <= std::numeric_limits<uint32_t>::max() &&
+                           ggml_vk_topk_nary_large_capable(device);
+                }
+                if (!device->pipeline_topk_f32[min_pipeline]) {
                     return false;
                 }
             }
