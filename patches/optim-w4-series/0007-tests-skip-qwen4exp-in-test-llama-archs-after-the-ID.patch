@@ -1,0 +1,47 @@
+From fd13cad6534b109e700a781b0cf473a45295741c Mon Sep 17 00:00:00 2001
+From: pugant <pugant@localhost>
+Date: Tue, 8 Sep 2026 18:34:20 +0200
+Subject: [PATCH 7/8] tests: skip qwen4exp in test-llama-archs after the
+ IDX-POOL revert
+
+The synthetic fixture that let test-llama-archs build a qwen4exp model
+(hyper-connection hparams, GDN state sizing, QSA metadata) shipped with
+the C2-3 IDX-POOL series, which is reverted from this branch: without
+it the loader aborts (required qwen4exp.hyper_connection.count) or
+divides by the derived expert/GDN dims. Skip the arch with a FIXME like
+DeepSeek V4 until the fixture is re-landed independently.
+
+Co-Authored-By: GLM by z.ai
+---
+ tests/test-llama-archs.cpp | 8 ++++++++
+ 1 file changed, 8 insertions(+)
+
+diff --git a/tests/test-llama-archs.cpp b/tests/test-llama-archs.cpp
+index ef83cbefb..c246d6e7f 100644
+--- a/tests/test-llama-archs.cpp
++++ b/tests/test-llama-archs.cpp
+@@ -488,6 +488,10 @@ static int save_models(const llm_arch target_arch, const size_t seed, const ggml
+         if (arch == LLM_ARCH_DEEPSEEK4) {
+             continue; // FIXME: DeepSeek V4 synthetic fixture needs production FP8/compressor metadata
+         }
++        if (arch == LLM_ARCH_QWEN4EXP) {
++            continue; // FIXME: qwen4exp synthetic fixture needs the hyper-connection/QSA/GDN
++                      // production metadata (the fixture shipped with the IDX-POOL series)
++        }
+         if (arch == LLM_ARCH_EAGLE3 || arch == LLM_ARCH_DFLASH) {
+             continue;
+         }
+@@ -578,6 +582,10 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const gg
+         if (arch == LLM_ARCH_DEEPSEEK4) {
+             continue; // FIXME: DeepSeek V4 synthetic fixture needs production FP8/compressor metadata
+         }
++        if (arch == LLM_ARCH_QWEN4EXP) {
++            continue; // FIXME: qwen4exp synthetic fixture needs the hyper-connection/QSA/GDN
++                      // production metadata (the fixture shipped with the IDX-POOL series)
++        }
+         if (arch == LLM_ARCH_EAGLE3 || arch == LLM_ARCH_DFLASH) {
+             continue;
+         }
+-- 
+2.53.0
+

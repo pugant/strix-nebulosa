@@ -1,0 +1,36 @@
+From 5bb661e1bd0dedc6b94b7e53da0ce87305b18cf4 Mon Sep 17 00:00:00 2001
+From: pugant <pugant@localhost>
+Date: Wed, 9 Sep 2026 00:59:37 +0200
+Subject: [PATCH 8/8] vulkan: enable small-m split-k by default (ceil mode)
+
+Promote the N1 MM-SMALLM-PP path to the default: mode 2 (ceil) measured
++3.95% pp8192 and +2.33% c32k prefill on gfx1151 (4/4 interleaved arm
+separation, ppl/battery clean, tg guard within 1 sigma). The old
+single-split behavior is now the opt-out: GGML_VK_MM_SMALLM_SPLITK
+0 = off, 1 = floor, unset = 2 = ceil.
+
+Co-Authored-By: GLM by z.ai
+---
+ ggml/src/ggml-vulkan/ggml-vulkan.cpp | 6 ++++--
+ 1 file changed, 4 insertions(+), 2 deletions(-)
+
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+index 3d925c6d1..9fb3a386f 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
++++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+@@ -8386,8 +8386,10 @@ static uint32_t ggml_vk_guess_split_k(ggml_backend_vk_context * ctx, uint32_t m,
+     // k/BK-iteration chain exposed. Allow k-parallelism for the small-m
+     // regime only, on the same tile pipeline and split_k_reduce path.
+     // GGML_VK_MM_SMALLM_SPLITK: 1 = floor(cores/n_tiles), 2 = ceil.
+-    // Default 0 = current behavior. To be removed before merge.
+-    static const int n1_mode = getenv("GGML_VK_MM_SMALLM_SPLITK") != nullptr ? atoi(getenv("GGML_VK_MM_SMALLM_SPLITK")) : 0;
++    // Default 2 = ceil: measured +3.95% pp8192 / +2.33% c32k prefill on
++    // gfx1151 (ppl and battery clean, decode untouched). Set 0 to restore
++    // the old single-split behavior, 1 for floor.
++    static const int n1_mode = getenv("GGML_VK_MM_SMALLM_SPLITK") != nullptr ? atoi(getenv("GGML_VK_MM_SMALLM_SPLITK")) : 2;
+     if (n1_mode != 0 && split_k == 1 && ctx->device->shader_core_count != 0 &&
+         m < pipeline->wg_denoms[0] && n >= pipeline->wg_denoms[1]) {
+         const uint32_t n_tiles = CEIL_DIV(n, pipeline->wg_denoms[1]);
+-- 
+2.53.0
+

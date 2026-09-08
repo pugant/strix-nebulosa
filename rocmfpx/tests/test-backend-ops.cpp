@@ -8531,6 +8531,51 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                 GGML_TYPE_Q2_0_ROCMFPX, GGML_TYPE_F32, 8, 2, false, 64, n, 2048));
     }
 
+    // MMID-PP-TILING: dense prod shapes (attention projections, k >= 2048, batch
+    // prefill) for the q8_1 MMQ path on ROCmFP4.
+    for (int64_t k : {512, 1024, 2048, 2560}) {
+        test_cases.emplace_back(new test_mul_mat(
+                GGML_TYPE_Q4_0_ROCMFP4_FAST, GGML_TYPE_F32, 2560, 512, k, {1, 1}, {1, 1}));
+    }
+    for (int64_t m : {512, 1280, 2560}) {
+        test_cases.emplace_back(new test_mul_mat(
+                GGML_TYPE_Q4_0_ROCMFP4_FAST, GGML_TYPE_F32, m, 512, 512, {1, 1}, {1, 1}));
+    }
+    for (int64_t n : {64, 128, 256, 512}) {
+        test_cases.emplace_back(new test_mul_mat(
+                GGML_TYPE_Q4_0_ROCMFP4_FAST, GGML_TYPE_F32, 512, n, 512, {1, 1}, {1, 1}));
+    }
+
+    // MMID-PP-TILING: routed MoE prod shapes (512 experts, top-10, batch 512)
+    // for the grouped f16 id path on ROCmFP4.
+    for (int bs : {32, 512}) {
+        test_cases.emplace_back(new test_mul_mat_id(
+                GGML_TYPE_Q4_0_ROCMFP4_FAST, GGML_TYPE_F32, 512, 10, false, 640, bs, 2560));
+        test_cases.emplace_back(new test_mul_mat_id(
+                GGML_TYPE_Q4_0_ROCMFP4_FAST, GGML_TYPE_F32, 512, 10, false, 2560, bs, 640));
+    }
+    for (int64_t n : {128, 512}) {
+        test_cases.emplace_back(new test_mul_mat(
+                GGML_TYPE_Q4_0_ROCMFP4_FAST, GGML_TYPE_F32, 2560, n, 2560, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(
+                GGML_TYPE_Q4_0_ROCMFP4,      GGML_TYPE_F32, 2560, n, 2560, {1, 1}, {1, 1}));
+    }
+
+    // N1 MM-SMALLM-PP: tall-skinny prefill prod shapes (hyper-connections
+    // inject/router, m < 32, large k) for the env-gated small-m split-k path
+    // on Vulkan. m=4 k=10240 (hc inject), m=48 k=2560 (hc mix), m=1 f32
+    // (router/score), plus a repeated-row variant of the inject shape.
+    test_cases.emplace_back(new test_mul_mat(
+            GGML_TYPE_Q4_0_ROCMFP4_FAST, GGML_TYPE_F32,  4, 512, 10240, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(
+            GGML_TYPE_Q4_0_ROCMFP4,      GGML_TYPE_F32,  4, 512, 10240, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(
+            GGML_TYPE_Q4_0_ROCMFP4_FAST, GGML_TYPE_F32, 48, 512,  2560, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(
+            GGML_TYPE_F32,               GGML_TYPE_F32,  1, 512,  2560, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(
+            GGML_TYPE_Q4_0_ROCMFP4_FAST, GGML_TYPE_F32,  4, 512, 10240, {1, 1}, {1, 2}));
+
     // HY3 exact routed-expert shapes for the native ROCmFPX low-bit kernels:
     // 192 experts, top-8, 4096 hidden, 1536 intermediate. Generic IQ/K types
     // use the standard correctness matrices below; their full tensors take

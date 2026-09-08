@@ -1,0 +1,94 @@
+From 04e6bcdbc4ff19e4ecb29a686ebe05ec36d0a2d2 Mon Sep 17 00:00:00 2001
+From: pugant <pugant@localhost>
+Date: Tue, 8 Sep 2026 16:51:01 +0200
+Subject: [PATCH 6/8] vulkan: env-gated split-k for tall-skinny prefill GEMMs
+ (N1 MM-SMALLM-PP)
+
+The split-k gate in ggml_vk_guess_split_k requires m >= wg_denoms[0],
+so tall-skinny prefill GEMMs (hyper-connection injects m=4 k=10240,
+m=48 k=2560, router m=1) run a single wave-row grid (n_tiles <= 16 WG
+on 40 CU) with the whole k chain serial in one workgroup. When
+GGML_VK_MM_SMALLM_SPLITK is set, allow k-parallelism for m <
+wg_denoms[0] only (k >= 2048, n_tiles <= cores/2, split capped at 8,
+same anti-empty-split rounding as the existing branch), on the same
+tile pipeline and split_k_reduce path already used by split GEMMs.
+1 = floor(cores/n_tiles), 2 = ceil. Default off = current behavior.
+Adds the prod-shape small-m regression cases to test-backend-ops.
+Split-k changes the k reduction order, so outputs are not bit-identical
+(gate = ppl + battery).
+
+Co-Authored-By: GLM by z.ai
+---
+ ggml/src/ggml-vulkan/ggml-vulkan.cpp | 29 ++++++++++++++++++++++++++++
+ tests/test-backend-ops.cpp           | 15 ++++++++++++++
+ 2 files changed, 44 insertions(+)
+
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+index 2423f34fa..3d925c6d1 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
++++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+@@ -8381,6 +8381,35 @@ static uint32_t ggml_vk_guess_split_k(ggml_backend_vk_context * ctx, uint32_t m,
+         }
+     }
+ 
++    // N1 MM-SMALLM-PP: tall-skinny GEMMs (m < wg_denoms[0]) never split k
++    // today (gate above), leaving n_tiles <= 16 WG on 40 CU with a serial
++    // k/BK-iteration chain exposed. Allow k-parallelism for the small-m
++    // regime only, on the same tile pipeline and split_k_reduce path.
++    // GGML_VK_MM_SMALLM_SPLITK: 1 = floor(cores/n_tiles), 2 = ceil.
++    // Default 0 = current behavior. To be removed before merge.
++    static const int n1_mode = getenv("GGML_VK_MM_SMALLM_SPLITK") != nullptr ? atoi(getenv("GGML_VK_MM_SMALLM_SPLITK")) : 0;
++    if (n1_mode != 0 && split_k == 1 && ctx->device->shader_core_count != 0 &&
++        m < pipeline->wg_denoms[0] && n >= pipeline->wg_denoms[1]) {
++        const uint32_t n_tiles = CEIL_DIV(n, pipeline->wg_denoms[1]);
++
++        if (k >= 2048 && n_tiles <= ctx->device->shader_core_count / 2) {
++            split_k = n1_mode >= 2 ? CEIL_DIV(ctx->device->shader_core_count, n_tiles)
++                                   : ctx->device->shader_core_count / n_tiles;
++            // Cap the split at 8x. Unless k is huge this is a lot of overhead.
++            split_k = std::min(split_k, 8u);
++
++            // Same anti-empty-split rounding guard as the branch above.
++            while (split_k > 1) {
++                uint32_t k_split = CEIL_DIV(k, split_k);
++                k_split = ROUNDUP_POW2(k_split, 256);
++                if (k_split * (split_k - 1) < k) {
++                    break;
++                }
++                split_k--;
++            }
++        }
++    }
++
+     return split_k;
+ }
+ 
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index b11fddd1e..3cfde5be9 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -8561,6 +8561,21 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+                 GGML_TYPE_Q4_0_ROCMFP4,      GGML_TYPE_F32, 2560, n, 2560, {1, 1}, {1, 1}));
+     }
+ 
++    // N1 MM-SMALLM-PP: tall-skinny prefill prod shapes (hyper-connections
++    // inject/router, m < 32, large k) for the env-gated small-m split-k path
++    // on Vulkan. m=4 k=10240 (hc inject), m=48 k=2560 (hc mix), m=1 f32
++    // (router/score), plus a repeated-row variant of the inject shape.
++    test_cases.emplace_back(new test_mul_mat(
++            GGML_TYPE_Q4_0_ROCMFP4_FAST, GGML_TYPE_F32,  4, 512, 10240, {1, 1}, {1, 1}));
++    test_cases.emplace_back(new test_mul_mat(
++            GGML_TYPE_Q4_0_ROCMFP4,      GGML_TYPE_F32,  4, 512, 10240, {1, 1}, {1, 1}));
++    test_cases.emplace_back(new test_mul_mat(
++            GGML_TYPE_Q4_0_ROCMFP4_FAST, GGML_TYPE_F32, 48, 512,  2560, {1, 1}, {1, 1}));
++    test_cases.emplace_back(new test_mul_mat(
++            GGML_TYPE_F32,               GGML_TYPE_F32,  1, 512,  2560, {1, 1}, {1, 1}));
++    test_cases.emplace_back(new test_mul_mat(
++            GGML_TYPE_Q4_0_ROCMFP4_FAST, GGML_TYPE_F32,  4, 512, 10240, {1, 1}, {1, 2}));
++
+     // HY3 exact routed-expert shapes for the native ROCmFPX low-bit kernels:
+     // 192 experts, top-8, 4096 hidden, 1536 intermediate. Generic IQ/K types
+     // use the standard correctness matrices below; their full tensors take
+-- 
+2.53.0
+

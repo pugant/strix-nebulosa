@@ -287,6 +287,42 @@ byte 2: v2[5:4] | v3[5:0]<<2
 | `test-chat-peg-parser` | 32 tests / 198 assertions / 0 failures |
 | Deploy | NOT deployed — prepared only; joint π test live on `qwen4exp-mtp-vk-optim3` |
 
+## Session 006 — 2026-09-09
+
+**Scope:** wave-4 optimization series (8 patches, branch `optim-w4` @`5bb661e1b`, deployed as `qwen4exp-mtp-vk-optim-w4`). One GO: split-k for tall-skinny prefill GEMMs (N1), promoted to default ceil mode. Four measured NO-GOs documented and dropped from the deploy branch (kept on `optim-w4-full` @`d284454f8`): pooled indexer keys (tap cost = gather saved), int-dot/tile MMQ variants (lose to f16-dequant on gfx1151; includes a latent warptile bug fix that stays), f16 FA accumulator on quantized KV (near-tie degenerate output), element-wise fusion batch (below the async-submit floor).
+
+### `ggml/src/ggml-vulkan/ggml-vulkan.cpp`
+
+| Change | Detail |
+|--------|--------|
+| Small-m split-k (N1, GO) | `ggml_vk_guess_split_k` gated k-parallelism on `m >= wg_denoms[0]`, so qwen4exp prefill GEMMs (m=4 k=10240, m=48 k=2560, m=1) ran one wave-row grid at 34 GF/s. New branch allows split-k (cap 8, k>=2048, n_tiles <= cores/2) for that regime on the existing tile pipeline + split_k_reduce path. Default = ceil mode (`GGML_VK_MM_SMALLM_SPLITK` 0/1/2 override). Measured interleaved: pp8192 +3.95%, c32k +2.33%, ppl improved, battery clean. |
+| Env-gated int-dot/tile diagnostics (N4) | `GGML_VK_MMID_INTDOT` / `GGML_VK_MMID_F16_TILE_L` / `GGML_VK_MMID_F16_MOE_TILE` / BK_STEP=4 variants, default OFF — instrumentation kept for reproducibility; measured all slower than the f16-dequant tile-m on gfx1151/RADV. |
+| Warptile fix (latent bug) | AMD-GCN branch resized `l_warptile_mmq_int` to BLOCK=256 against wg denominators {128,128,1} — dense MMQ l-tile garbage for m>32 (inf at m=2560). Explicit coherent warptile + 15 regression cases. |
+| Dropped experiments | SIGLU op + element-wise fusion batch (N2) and f16 FA accumulator on quantized KV (N3) were committed during the wave, measured NO-GO, and dropped from the deploy series via rebase (tree-verified). |
+
+### `tests/test-backend-ops.cpp`
+
+| Change | Detail |
+|--------|--------|
+| Regression cases | Prod-shape small-m MUL_MAT cases (m=4/k=10240, m=48/k=2560, m=1 f32, repeated-row variant) + MMQ tile regression battery (15 cases incl. m=2560). |
+
+### `tests/test-llama-archs.cpp`
+
+| Change | Detail |
+|--------|--------|
+| qwen4exp skip | Fixture skip-list (FIXME) after the IDX-POOL revert dropped the C2-3 test fixture the arch test depended on (same pattern as DEEPSEEK4); full fixture to be re-landed separately. |
+
+### Validation
+
+| Check | Result |
+|-------|--------|
+| `test-backend-ops` (Vulkan0) | MUL_MAT 4/4 off/sk1/sk2 · rocmfp4 sweep 150/150 on/off · FA prec 3/3 · GLU 145/145 |
+| `test-llama-archs` | rc=0 (137 lines, qwen4exp skipped) |
+| ppl | Dante 1,1215 / wikitext 3,4927 (gates ±0,5% PASS) |
+| Battery | card run 12/12; deploy re-check 11/12 with DANTE-2 at the near-tie boundary — seed-retry shows the same failure basin in the unpatched baseline (w3 seed 2026 fails with the same sha), verdict: sampling border, not systematic |
+| Interleaved A/B | c32k +2.33% (4/4 arm separation) · server timed-gen parity w3 vs w4 (24.02–24.08 tok/s) |
+| Deploy | LIVE on `qwen4exp-mtp-vk-optim-w4` (health OK, prod flags unchanged, no new flags) |
+
 <!-- TEMPLATE FOR FUTURE AI SESSIONS:
 
 ## Session NNN — YYYY-MM-DD

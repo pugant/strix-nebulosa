@@ -1,0 +1,82 @@
+From 1d1cb25905b1f53e2ad6ee826ca847043cf5b8c4 Mon Sep 17 00:00:00 2001
+From: pugant <pugant@localhost>
+Date: Tue, 8 Sep 2026 13:52:18 +0200
+Subject: [PATCH 3/8] vulkan: fix dense q8_1 MMQ tile for ROCmFP4 int-dot
+ enable (N4 round 2)
+
+The AMD-GCN tuning resizes l_warptile_mmq_int to BLOCK=256 while
+l_mmq_wg_denoms stays {128,128,1}; building the dense MMQ pipeline with
+that mix produces garbage for large m (s tile / m<=32 fine, l tile wrong:
+test-backend-ops m=2560 k=512..2560 err inf/~851, ppl 248320). Use an
+explicit tile consistent with the denoms, mirroring l_warptile_mmqid_int
+from the id path. Adds dense prod-shape regression cases to
+test-backend-ops (m=2560, k 512..2560, n sweep). After the fix ppl is
+back in gate (Dante 1.1217, wikitext 3.5009 vs pins 1.1215/3.4983).
+
+Co-Authored-By: GLM by z.ai
+---
+ ggml/src/ggml-vulkan/ggml-vulkan.cpp |  9 +++++++--
+ tests/test-backend-ops.cpp           | 21 +++++++++++++++++++++
+ 2 files changed, 28 insertions(+), 2 deletions(-)
+
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+index b06666e43..97cb68fd9 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
++++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+@@ -5020,14 +5020,19 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+         CREATE_MMQ_BK4(GGML_TYPE_Q4_0_ROCMFP4_FAST, matmul_id_subgroup_rocmfp4_fast_q8_1_bk4);
+     }
+     if (device->integer_dot_product && n4_intdot >= 2) {
++        // The AMD-GCN tuning above resizes l_warptile_mmq_int to BLOCK=256 while
++        // l_mmq_wg_denoms stays {128,128,1}; that mix produces garbage for large m
++        // on the dense MMQ path (s tile / small m is fine). Use a tile consistent
++        // with the denoms, mirroring l_warptile_mmqid_int which the id path uses.
++        const std::vector<uint32_t> n4_dense_l_warptile = { 128, 128, 128, 32, mul_mat_subgroup_size_8 * 2, 64, 2, 4, 4, 1, mul_mat_subgroup_size_8 };
+         if (device->mul_mat_l_int[GGML_TYPE_Q4_0_ROCMFP4]) {
+-            ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_mat_q8_1[GGML_TYPE_Q4_0_ROCMFP4].f32acc->l, "matmul_rocmfp4_q8_1_l", matmul_rocmfp4_q8_1_len, matmul_rocmfp4_q8_1_data, "main", 3, sizeof(vk_mat_mat_push_constants), l_mmq_wg_denoms, l_warptile_mmq_int, 1, false, false, 0);
++            ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_mat_q8_1[GGML_TYPE_Q4_0_ROCMFP4].f32acc->l, "matmul_rocmfp4_q8_1_l", matmul_rocmfp4_q8_1_len, matmul_rocmfp4_q8_1_data, "main", 3, sizeof(vk_mat_mat_push_constants), l_mmq_wg_denoms, n4_dense_l_warptile, 1, false, false, 0);
+         }
+         if (device->mul_mat_s_int[GGML_TYPE_Q4_0_ROCMFP4]) {
+             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_mat_q8_1[GGML_TYPE_Q4_0_ROCMFP4].f32acc->s, "matmul_rocmfp4_q8_1_s", matmul_rocmfp4_q8_1_len, matmul_rocmfp4_q8_1_data, "main", 3, sizeof(vk_mat_mat_push_constants), s_mmq_wg_denoms, s_warptile_mmq_int, 1, false, false, 0);
+         }
+         if (device->mul_mat_l_int[GGML_TYPE_Q4_0_ROCMFP4_FAST]) {
+-            ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_mat_q8_1[GGML_TYPE_Q4_0_ROCMFP4_FAST].f32acc->l, "matmul_rocmfp4_fast_q8_1_l", matmul_rocmfp4_fast_q8_1_len, matmul_rocmfp4_fast_q8_1_data, "main", 3, sizeof(vk_mat_mat_push_constants), l_mmq_wg_denoms, l_warptile_mmq_int, 1, false, false, 0);
++            ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_mat_q8_1[GGML_TYPE_Q4_0_ROCMFP4_FAST].f32acc->l, "matmul_rocmfp4_fast_q8_1_l", matmul_rocmfp4_fast_q8_1_len, matmul_rocmfp4_fast_q8_1_data, "main", 3, sizeof(vk_mat_mat_push_constants), l_mmq_wg_denoms, n4_dense_l_warptile, 1, false, false, 0);
+         }
+         if (device->mul_mat_s_int[GGML_TYPE_Q4_0_ROCMFP4_FAST]) {
+             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_mat_q8_1[GGML_TYPE_Q4_0_ROCMFP4_FAST].f32acc->s, "matmul_rocmfp4_fast_q8_1_s", matmul_rocmfp4_fast_q8_1_len, matmul_rocmfp4_fast_q8_1_data, "main", 3, sizeof(vk_mat_mat_push_constants), s_mmq_wg_denoms, s_warptile_mmq_int, 1, false, false, 0);
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index 454339f93..76089fde1 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -8531,6 +8531,27 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+                 GGML_TYPE_Q2_0_ROCMFPX, GGML_TYPE_F32, 8, 2, false, 64, n, 2048));
+     }
+ 
++    // MMID-PP-TILING: dense prod shapes (attention projections, k >= 2048, batch
++    // prefill) for the q8_1 MMQ path on ROCmFP4.
++    for (int64_t k : {512, 1024, 2048, 2560}) {
++        test_cases.emplace_back(new test_mul_mat(
++                GGML_TYPE_Q4_0_ROCMFP4_FAST, GGML_TYPE_F32, 2560, 512, k, {1, 1}, {1, 1}));
++    }
++    for (int64_t m : {512, 1280, 2560}) {
++        test_cases.emplace_back(new test_mul_mat(
++                GGML_TYPE_Q4_0_ROCMFP4_FAST, GGML_TYPE_F32, m, 512, 512, {1, 1}, {1, 1}));
++    }
++    for (int64_t n : {64, 128, 256, 512}) {
++        test_cases.emplace_back(new test_mul_mat(
++                GGML_TYPE_Q4_0_ROCMFP4_FAST, GGML_TYPE_F32, 512, n, 512, {1, 1}, {1, 1}));
++    }
++    for (int64_t n : {128, 512}) {
++        test_cases.emplace_back(new test_mul_mat(
++                GGML_TYPE_Q4_0_ROCMFP4_FAST, GGML_TYPE_F32, 2560, n, 2560, {1, 1}, {1, 1}));
++        test_cases.emplace_back(new test_mul_mat(
++                GGML_TYPE_Q4_0_ROCMFP4,      GGML_TYPE_F32, 2560, n, 2560, {1, 1}, {1, 1}));
++    }
++
+     // HY3 exact routed-expert shapes for the native ROCmFPX low-bit kernels:
+     // 192 experts, top-8, 4096 hidden, 1536 intermediate. Generic IQ/K types
+     // use the standard correctness matrices below; their full tensors take
+-- 
+2.53.0
+

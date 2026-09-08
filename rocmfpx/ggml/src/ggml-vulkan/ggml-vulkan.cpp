@@ -773,6 +773,8 @@ struct vk_device_struct {
 
     vk_matmul_pipeline2 pipeline_dequant_mul_mat_mat_id[GGML_TYPE_COUNT];
     vk_matmul_pipeline2 pipeline_dequant_mul_mat_mat_id_q8_1[GGML_TYPE_COUNT];
+    // MMID-PP-TILING: BK_STEP=4 MUL_MAT_ID variants (f32acc only), runtime opt-in via GGML_VK_MMID_BK_STEP=4
+    vk_matmul_pipeline pipeline_dequant_mul_mat_mat_id_q8_1_bk4[GGML_TYPE_COUNT] {};
 
     vk_pipeline pipeline_matmul_split_k_reduce;
     vk_pipeline pipeline_quantize_q8_1_x4;
@@ -3496,7 +3498,7 @@ static bool ggml_vk_matmul_shmem_support(const vk_device& device, const std::vec
 // block_a_cache / block_b_cache layouts (see mul_mmq_shmem_types.glsl) rather
 // than the float load buffers checked by ggml_vk_matmul_shmem_support.
 // Sizes follow std430 rules. Returns false for types without a q8_1 pipeline.
-static bool ggml_vk_matmul_int_shmem_support(const vk_device& device, const std::vector<uint32_t>& warptile, bool mul_mat_id, ggml_type src0_type) {
+static bool ggml_vk_matmul_int_shmem_support(const vk_device& device, const std::vector<uint32_t>& warptile, bool mul_mat_id, ggml_type src0_type, uint32_t bk_step = 0) {
 
     // FLOAT_TYPE in the shader is float16_t with fp16 support, otherwise float.
     const uint32_t fp_size   = device->fp16 ? 2u : 4u;
@@ -3544,8 +3546,9 @@ static bool ggml_vk_matmul_int_shmem_support(const vk_device& device, const std:
 
     const uint32_t BM = warptile[1];
     const uint32_t BN = warptile[2];
-    // mul_mmq.comp: BK_STEP=1 for MUL_MAT_ID, 4 otherwise.
-    const uint32_t BK_STEP = mul_mat_id ? 1u : 4u;
+    // mul_mmq.comp: BK_STEP=1 for MUL_MAT_ID, 4 otherwise, unless overridden
+    // (BK_STEP=4 MUL_MAT_ID variants, see pipeline_dequant_mul_mat_mat_id_q8_1_bk4).
+    const uint32_t BK_STEP = bk_step != 0 ? bk_step : (mul_mat_id ? 1u : 4u);
 
     const uint32_t buf_a_size = BM * BK_STEP * block_a_size;
     const uint32_t buf_b_size = BN * BK_STEP * block_b_size;
@@ -4421,6 +4424,22 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             ggml_vk_create_pipeline(device, device-> PIPELINE_NAME .f32acc->s, #NAMELC        "_s", NAMELC ## _len,        NAMELC ##  _data,        "main", PARAMCOUNT, sizeof(PUSHCONST), s_ ## WG_DENOMS, s_ ## WARPTILE, 1, false, REQSUBGROUPSIZE > 0, REQSUBGROUPSIZE);   \
         } \
 
+        // MMID-PP-TILING: BK_STEP=4 variant of CREATE_MMQ for the id-int pipelines
+        // (same warptiles, larger shmem), runtime opt-in via GGML_VK_MMID_BK_STEP=4
+#define CREATE_MMQ_BK4(TYPE, NAMELC) \
+        if (device->pipeline_dequant_mul_mat_mat_id_q8_1_bk4[TYPE] == nullptr) { \
+            device->pipeline_dequant_mul_mat_mat_id_q8_1_bk4[TYPE] = std::make_shared<vk_matmul_pipeline_struct>(); \
+        } \
+        if (device->mul_mat_id_l_int[TYPE] && ggml_vk_matmul_int_shmem_support(device, l_warptile_mmqid_int, true, TYPE, 4)) { \
+            ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_mat_id_q8_1_bk4[TYPE]->l, #NAMELC "_l", NAMELC ## _len, NAMELC ## _data, "main", mul_mat_id_param_count, sizeof(vk_mat_mat_id_push_constants), l_mmq_wg_denoms, l_warptile_mmqid_int, 1, false, mul_mat_subgroup_size > 0, mul_mat_subgroup_size); \
+        } \
+        if (device->mul_mat_id_m_int[TYPE] && ggml_vk_matmul_int_shmem_support(device, m_warptile_mmqid_int, true, TYPE, 4)) { \
+            ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_mat_id_q8_1_bk4[TYPE]->m, #NAMELC "_m", NAMELC ## _len, NAMELC ## _data, "main", mul_mat_id_param_count, sizeof(vk_mat_mat_id_push_constants), m_mmq_wg_denoms, m_warptile_mmqid_int, 1, false, mul_mat_subgroup_size > 0, mul_mat_subgroup_size); \
+        } \
+        if (device->mul_mat_id_s_int[TYPE] && ggml_vk_matmul_int_shmem_support(device, s_warptile_mmqid_int, true, TYPE, 4)) { \
+            ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_mat_id_q8_1_bk4[TYPE]->s, #NAMELC "_s", NAMELC ## _len, NAMELC ## _data, "main", mul_mat_id_param_count, sizeof(vk_mat_mat_id_push_constants), s_mmq_wg_denoms, s_warptile_mmqid_int, 1, false, mul_mat_subgroup_size > 0, mul_mat_subgroup_size); \
+        } \
+
         // Create 2 variants, {f16,f32} accumulator
 #define CREATE_MM2(TYPE, PIPELINE_NAME, NAMELC, WG_DENOMS, WARPTILE, PUSHCONST, PARAMCOUNT, ID, REQSUBGROUPSIZE) \
         CREATE_MM(TYPE, PIPELINE_NAME . f16acc, NAMELC, _f16acc, WG_DENOMS, WARPTILE, PUSHCONST, PARAMCOUNT, ID, REQSUBGROUPSIZE) \
@@ -4971,6 +4990,56 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     GGML_UNUSED(rm_kq_int);
     GGML_UNUSED(rm_iq_int);
 #endif
+
+    // MMID-PP-TILING: q8_1 (integer dot) MMQ pipelines for ROCmFP4, built in the
+    // common tail of load_shaders. The per-arch sections above do not create these
+    // on all devices (on AMD the vendor case disables mul_mat_id_l and the reached
+    // section omits the ROCmFP4 q8_1 sets), which forces MUL_MAT_ID/MUL_MAT onto
+    // the f16 dequant path. Guarded by the availability flags (raised for these
+    // types via GGML_VK_MMID_INTDOT on AMD) so the default behavior is unchanged.
+    // Only the l and s tiles are created (see the flag note above re: the m tile).
+    // GGML_VK_MMID_INTDOT: 1 = id only, 2 = id + dense, 3 = dense only.
+#if defined(GGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT)
+    const int n4_intdot = getenv("GGML_VK_MMID_INTDOT") != nullptr ? atoi(getenv("GGML_VK_MMID_INTDOT")) : 0;
+    if (device->integer_dot_product && (n4_intdot == 1 || n4_intdot == 2)) {
+        if (device->mul_mat_id_l_int[GGML_TYPE_Q4_0_ROCMFP4]) {
+            ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_mat_id_q8_1[GGML_TYPE_Q4_0_ROCMFP4].f32acc->l, "matmul_id_subgroup_rocmfp4_q8_1_l", matmul_id_subgroup_rocmfp4_q8_1_len, matmul_id_subgroup_rocmfp4_q8_1_data, "main", mul_mat_id_param_count, sizeof(vk_mat_mat_id_push_constants), l_mmq_wg_denoms, l_warptile_mmqid_int, 1, false, mul_mat_subgroup_size > 0, mul_mat_subgroup_size);
+        }
+        if (device->mul_mat_id_s_int[GGML_TYPE_Q4_0_ROCMFP4]) {
+            ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_mat_id_q8_1[GGML_TYPE_Q4_0_ROCMFP4].f32acc->s, "matmul_id_subgroup_rocmfp4_q8_1_s", matmul_id_subgroup_rocmfp4_q8_1_len, matmul_id_subgroup_rocmfp4_q8_1_data, "main", mul_mat_id_param_count, sizeof(vk_mat_mat_id_push_constants), s_mmq_wg_denoms, s_warptile_mmqid_int, 1, false, mul_mat_subgroup_size > 0, mul_mat_subgroup_size);
+        }
+        if (device->mul_mat_id_l_int[GGML_TYPE_Q4_0_ROCMFP4_FAST]) {
+            ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_mat_id_q8_1[GGML_TYPE_Q4_0_ROCMFP4_FAST].f32acc->l, "matmul_id_subgroup_rocmfp4_fast_q8_1_l", matmul_id_subgroup_rocmfp4_fast_q8_1_len, matmul_id_subgroup_rocmfp4_fast_q8_1_data, "main", mul_mat_id_param_count, sizeof(vk_mat_mat_id_push_constants), l_mmq_wg_denoms, l_warptile_mmqid_int, 1, false, mul_mat_subgroup_size > 0, mul_mat_subgroup_size);
+        }
+        if (device->mul_mat_id_s_int[GGML_TYPE_Q4_0_ROCMFP4_FAST]) {
+            ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_mat_id_q8_1[GGML_TYPE_Q4_0_ROCMFP4_FAST].f32acc->s, "matmul_id_subgroup_rocmfp4_fast_q8_1_s", matmul_id_subgroup_rocmfp4_fast_q8_1_len, matmul_id_subgroup_rocmfp4_fast_q8_1_data, "main", mul_mat_id_param_count, sizeof(vk_mat_mat_id_push_constants), s_mmq_wg_denoms, s_warptile_mmqid_int, 1, false, mul_mat_subgroup_size > 0, mul_mat_subgroup_size);
+        }
+
+        // BK_STEP=4 id variants (see CREATE_MMQ_BK4 / GGML_VK_MMID_BK_STEP)
+        CREATE_MMQ_BK4(GGML_TYPE_Q4_0_ROCMFP4,      matmul_id_subgroup_rocmfp4_q8_1_bk4);
+        CREATE_MMQ_BK4(GGML_TYPE_Q4_0_ROCMFP4_FAST, matmul_id_subgroup_rocmfp4_fast_q8_1_bk4);
+    }
+    if (device->integer_dot_product && n4_intdot >= 2) {
+        // The AMD-GCN tuning above resizes l_warptile_mmq_int to BLOCK=256 while
+        // l_mmq_wg_denoms stays {128,128,1}; that mix produces garbage for large m
+        // on the dense MMQ path (s tile / small m is fine). Use a tile consistent
+        // with the denoms, mirroring l_warptile_mmqid_int which the id path uses.
+        const std::vector<uint32_t> n4_dense_l_warptile = { 128, 128, 128, 32, mul_mat_subgroup_size_8 * 2, 64, 2, 4, 4, 1, mul_mat_subgroup_size_8 };
+        if (device->mul_mat_l_int[GGML_TYPE_Q4_0_ROCMFP4]) {
+            ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_mat_q8_1[GGML_TYPE_Q4_0_ROCMFP4].f32acc->l, "matmul_rocmfp4_q8_1_l", matmul_rocmfp4_q8_1_len, matmul_rocmfp4_q8_1_data, "main", 3, sizeof(vk_mat_mat_push_constants), l_mmq_wg_denoms, n4_dense_l_warptile, 1, false, false, 0);
+        }
+        if (device->mul_mat_s_int[GGML_TYPE_Q4_0_ROCMFP4]) {
+            ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_mat_q8_1[GGML_TYPE_Q4_0_ROCMFP4].f32acc->s, "matmul_rocmfp4_q8_1_s", matmul_rocmfp4_q8_1_len, matmul_rocmfp4_q8_1_data, "main", 3, sizeof(vk_mat_mat_push_constants), s_mmq_wg_denoms, s_warptile_mmq_int, 1, false, false, 0);
+        }
+        if (device->mul_mat_l_int[GGML_TYPE_Q4_0_ROCMFP4_FAST]) {
+            ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_mat_q8_1[GGML_TYPE_Q4_0_ROCMFP4_FAST].f32acc->l, "matmul_rocmfp4_fast_q8_1_l", matmul_rocmfp4_fast_q8_1_len, matmul_rocmfp4_fast_q8_1_data, "main", 3, sizeof(vk_mat_mat_push_constants), l_mmq_wg_denoms, n4_dense_l_warptile, 1, false, false, 0);
+        }
+        if (device->mul_mat_s_int[GGML_TYPE_Q4_0_ROCMFP4_FAST]) {
+            ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_mat_q8_1[GGML_TYPE_Q4_0_ROCMFP4_FAST].f32acc->s, "matmul_rocmfp4_fast_q8_1_s", matmul_rocmfp4_fast_q8_1_len, matmul_rocmfp4_fast_q8_1_data, "main", 3, sizeof(vk_mat_mat_push_constants), s_mmq_wg_denoms, s_warptile_mmq_int, 1, false, false, 0);
+        }
+    }
+#endif // GGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT
+
 
     // dequant shaders
     ggml_vk_create_pipeline(device, device->pipeline_dequant[GGML_TYPE_F32 ], "f32_to_f16",   dequant_f32_len,  dequant_f32_data,  "main", 2, 5 * sizeof(uint32_t), {256 * 16, 1, 1}, {}, 1);
@@ -6406,6 +6475,43 @@ static vk_device ggml_vk_get_device(size_t idx) {
             device->mul_mat_id_s_int[i] = device->mul_mat_id_s[i];
         }
 
+        // MMID-PP-TILING: on AMD the vendor case above clears mul_mat_id_l (and with
+        // coopmat off, mul_mat_l), and the load_shaders section reached on this device
+        // does not create the q8_1 sets for ROCmFP4, so MUL_MAT_ID/MUL_MAT fall back
+        // to the f16 dequant pipelines. Raise the int flags for these two types only,
+        // behind an env switch, for a same-binary A/B of the int-dot path (default
+        // off = current behavior; the shmem checks in load_shaders still apply).
+        // GGML_VK_MMID_INTDOT: 1 = id only, 2 = id + dense, 3 = dense only.
+        // The m tile stays disabled: wg_denoms[0] != BM for it in some branches.
+        const int n4_intdot = getenv("GGML_VK_MMID_INTDOT") != nullptr ? atoi(getenv("GGML_VK_MMID_INTDOT")) : 0;
+        if (n4_intdot >= 1) {
+            const bool n4_enable_id = n4_intdot == 1 || n4_intdot == 2;
+            const bool n4_enable_dense = n4_intdot >= 2;
+            for (const ggml_type t : {GGML_TYPE_Q4_0_ROCMFP4, GGML_TYPE_Q4_0_ROCMFP4_FAST}) {
+                if (n4_enable_dense) {
+                    device->mul_mat_l_int[t] = true;
+                    device->mul_mat_m_int[t] = false;
+                    device->mul_mat_s_int[t] = true;
+                }
+                if (n4_enable_id) {
+                    device->mul_mat_id_l_int[t] = true;
+                    device->mul_mat_id_m_int[t] = false;
+                    device->mul_mat_id_s_int[t] = true;
+                }
+            }
+        }
+
+        // MMID-PP-TILING: f16 dequant MUL_MAT_ID large tile for ROCmFP4. The vendor
+        // case above clears mul_mat_id_l on AMD, so prefill MoE runs on the m tile
+        // (BM=64/BN=64); with n_tokens=512 the N padding wastes half the tile. The
+        // l tile warptile in the reached branch is consistent with its wg_denoms
+        // ({128,128,128} vs {128,128,1}), so allow opting into it for an A/B.
+        if (getenv("GGML_VK_MMID_F16_TILE_L") != nullptr) {
+            for (const ggml_type t : {GGML_TYPE_Q4_0_ROCMFP4, GGML_TYPE_Q4_0_ROCMFP4_FAST}) {
+                device->mul_mat_id_l[t] = true;
+            }
+        }
+
 
         std::vector<vk::DescriptorSetLayoutBinding> dsl_binding;
         std::vector<vk::DescriptorBindingFlags> dsl_binding_flags;
@@ -6423,6 +6529,7 @@ static vk_device ggml_vk_get_device(size_t idx) {
         device->dsl = device->device.createDescriptorSetLayout(descriptor_set_layout_create_info);
 
         ggml_vk_load_shaders(device);
+
 
         // W3-C22-TOPK: build marker, printed once per device when the large-k
         // top_k path is available.
@@ -8274,6 +8381,37 @@ static uint32_t ggml_vk_guess_split_k(ggml_backend_vk_context * ctx, uint32_t m,
         }
     }
 
+    // N1 MM-SMALLM-PP: tall-skinny GEMMs (m < wg_denoms[0]) never split k
+    // today (gate above), leaving n_tiles <= 16 WG on 40 CU with a serial
+    // k/BK-iteration chain exposed. Allow k-parallelism for the small-m
+    // regime only, on the same tile pipeline and split_k_reduce path.
+    // GGML_VK_MM_SMALLM_SPLITK: 1 = floor(cores/n_tiles), 2 = ceil.
+    // Default 2 = ceil: measured +3.95% pp8192 / +2.33% c32k prefill on
+    // gfx1151 (ppl and battery clean, decode untouched). Set 0 to restore
+    // the old single-split behavior, 1 for floor.
+    static const int n1_mode = getenv("GGML_VK_MM_SMALLM_SPLITK") != nullptr ? atoi(getenv("GGML_VK_MM_SMALLM_SPLITK")) : 2;
+    if (n1_mode != 0 && split_k == 1 && ctx->device->shader_core_count != 0 &&
+        m < pipeline->wg_denoms[0] && n >= pipeline->wg_denoms[1]) {
+        const uint32_t n_tiles = CEIL_DIV(n, pipeline->wg_denoms[1]);
+
+        if (k >= 2048 && n_tiles <= ctx->device->shader_core_count / 2) {
+            split_k = n1_mode >= 2 ? CEIL_DIV(ctx->device->shader_core_count, n_tiles)
+                                   : ctx->device->shader_core_count / n_tiles;
+            // Cap the split at 8x. Unless k is huge this is a lot of overhead.
+            split_k = std::min(split_k, 8u);
+
+            // Same anti-empty-split rounding guard as the branch above.
+            while (split_k > 1) {
+                uint32_t k_split = CEIL_DIV(k, split_k);
+                k_split = ROUNDUP_POW2(k_split, 256);
+                if (k_split * (split_k - 1) < k) {
+                    break;
+                }
+                split_k--;
+            }
+        }
+    }
+
     return split_k;
 }
 
@@ -8383,9 +8521,25 @@ static vk_pipeline ggml_vk_guess_matmul_id_pipeline(ggml_backend_vk_context * ct
     // The q8_1 (integer dot) mmq path uses a different shader with its own
     // shared-memory layout, so use the int-specific availability flags.
     const bool is_q8_1 = (src1_type == GGML_TYPE_Q8_1);
-    const bool mm_l = is_q8_1 ? ctx->device->mul_mat_id_l_int[src0_type] : ctx->device->mul_mat_id_l[src0_type];
-    const bool mm_m = is_q8_1 ? ctx->device->mul_mat_id_m_int[src0_type] : ctx->device->mul_mat_id_m[src0_type];
-    const bool mm_s = is_q8_1 ? ctx->device->mul_mat_id_s_int[src0_type] : ctx->device->mul_mat_id_s[src0_type];
+    bool mm_l = is_q8_1 ? ctx->device->mul_mat_id_l_int[src0_type] : ctx->device->mul_mat_id_l[src0_type];
+    bool mm_m = is_q8_1 ? ctx->device->mul_mat_id_m_int[src0_type] : ctx->device->mul_mat_id_m[src0_type];
+    bool mm_s = is_q8_1 ? ctx->device->mul_mat_id_s_int[src0_type] : ctx->device->mul_mat_id_s[src0_type];
+
+    // MMID-PP-TILING: opt-in BK_STEP=4 MUL_MAT_ID variant for same-binary A/B
+    // (default off = current BK_STEP=1 behavior; to be removed before merge).
+    static const bool use_mmid_bk4 = []{
+        const char * env = getenv("GGML_VK_MMID_BK_STEP");
+        return env != nullptr && atoi(env) >= 4;
+    }();
+    if (is_q8_1 && use_mmid_bk4) {
+        const vk_matmul_pipeline alt = ctx->device->pipeline_dequant_mul_mat_mat_id_q8_1_bk4[src0_type];
+        if (alt != nullptr && (alt->l != nullptr || alt->m != nullptr || alt->s != nullptr)) {
+            mmp = alt;
+            mm_l = alt->l != nullptr;
+            mm_m = alt->m != nullptr;
+            mm_s = alt->s != nullptr;
+        }
+    }
 
     if (ctx->device->coopmat2) {
         // Use large shader when the N dimension is greater than the medium shader's tile size
@@ -9685,6 +9839,23 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
     const bool aligned = !quantize_y && ne10 == kpad && ne01 > 8 && nei1 > 8;
 
     vk_pipeline pipeline = ggml_vk_guess_matmul_id_pipeline(ctx, mmp, ne01, nei1, aligned, qx_needs_dequant ? f16_type : src0->type, effective_src1_type);
+
+    // MMID-PP-TILING: s tile (BN=32) for the grouped MoE regime — many experts
+    // with few tokens each make the m tile's BN=64 mostly padding (ncols_typical
+    // mirrors the HIP picker: total token slots / experts). The s tile is an
+    // existing, validated pipeline; opt in via GGML_VK_MMID_F16_MOE_TILE.
+    if (!quantize_y) {
+        static const bool n4_use_moe = getenv("GGML_VK_MMID_F16_MOE_TILE") != nullptr;
+        if (n4_use_moe) {
+            const uint32_t n4_ncols_typical = (uint32_t)((nei1 * nei0 + n_as - 1) / n_as);
+            if ((aligned ? mmp->a_s : mmp->s) != nullptr &&
+                    n_as >= 64 && n4_ncols_typical <= 32) {
+                pipeline = aligned ? mmp->a_s : mmp->s;
+            }
+        }
+    }
+
+
 
     if (ggml_nbytes(src0) > ctx->device->properties.limits.maxStorageBufferRange) {
         pipeline = ggml_vk_get_64b_indexing_pipeline(ctx, pipeline);

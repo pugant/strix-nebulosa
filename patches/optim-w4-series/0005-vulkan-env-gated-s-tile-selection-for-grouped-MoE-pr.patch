@@ -1,0 +1,79 @@
+From 9d34227734bc9cbbded97ee730461c242bf8ccfe Mon Sep 17 00:00:00 2001
+From: pugant <pugant@localhost>
+Date: Tue, 8 Sep 2026 15:55:51 +0200
+Subject: [PATCH 5/8] vulkan: env-gated s-tile selection for grouped MoE
+ prefill (N4 round 3, D-B)
+
+In the grouped regime (many experts, ~10-50 tokens each at batch 512)
+the f16 dequant id m tile's BN=64 is mostly N padding. When
+GGML_VK_MMID_F16_MOE_TILE is set, select the existing, validated s tile
+(BN=32) for MUL_MAT_ID nodes with n_as >= 64 and typical routed width
+<= 32 (ncols_typical mirrors the HIP picker). Default off = m tile.
+Adds routed MoE prod-shape regression cases (512 experts, top-10) to
+test-backend-ops. Tiling does not change the per-element reduction
+order: greedy output is char-exact identical; ops 219 OK incl. the
+prod shapes.
+
+Co-Authored-By: GLM by z.ai
+---
+ ggml/src/ggml-vulkan/ggml-vulkan.cpp | 16 ++++++++++++++++
+ tests/test-backend-ops.cpp           |  9 +++++++++
+ 2 files changed, 25 insertions(+)
+
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+index b1cd2faf5..2423f34fa 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
++++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+@@ -5040,6 +5040,7 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+     }
+ #endif // GGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT
+ 
++
+     // dequant shaders
+     ggml_vk_create_pipeline(device, device->pipeline_dequant[GGML_TYPE_F32 ], "f32_to_f16",   dequant_f32_len,  dequant_f32_data,  "main", 2, 5 * sizeof(uint32_t), {256 * 16, 1, 1}, {}, 1);
+     ggml_vk_create_pipeline(device, device->pipeline_dequant[GGML_TYPE_Q1_0], "dequant_q1_0", dequant_q1_0_len, dequant_q1_0_data, "main", 2, 5 * sizeof(uint32_t), {256 * 8, 1, 1}, {}, 1);
+@@ -9808,6 +9809,21 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context&
+ 
+     vk_pipeline pipeline = ggml_vk_guess_matmul_id_pipeline(ctx, mmp, ne01, nei1, aligned, qx_needs_dequant ? f16_type : src0->type, effective_src1_type);
+ 
++    // MMID-PP-TILING: s tile (BN=32) for the grouped MoE regime — many experts
++    // with few tokens each make the m tile's BN=64 mostly padding (ncols_typical
++    // mirrors the HIP picker: total token slots / experts). The s tile is an
++    // existing, validated pipeline; opt in via GGML_VK_MMID_F16_MOE_TILE.
++    if (!quantize_y) {
++        static const bool n4_use_moe = getenv("GGML_VK_MMID_F16_MOE_TILE") != nullptr;
++        if (n4_use_moe) {
++            const uint32_t n4_ncols_typical = (uint32_t)((nei1 * nei0 + n_as - 1) / n_as);
++            if ((aligned ? mmp->a_s : mmp->s) != nullptr &&
++                    n_as >= 64 && n4_ncols_typical <= 32) {
++                pipeline = aligned ? mmp->a_s : mmp->s;
++            }
++        }
++    }
++
+ 
+ 
+     if (ggml_nbytes(src0) > ctx->device->properties.limits.maxStorageBufferRange) {
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index 76089fde1..b11fddd1e 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -8545,6 +8545,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+         test_cases.emplace_back(new test_mul_mat(
+                 GGML_TYPE_Q4_0_ROCMFP4_FAST, GGML_TYPE_F32, 512, n, 512, {1, 1}, {1, 1}));
+     }
++
++    // MMID-PP-TILING: routed MoE prod shapes (512 experts, top-10, batch 512)
++    // for the grouped f16 id path on ROCmFP4.
++    for (int bs : {32, 512}) {
++        test_cases.emplace_back(new test_mul_mat_id(
++                GGML_TYPE_Q4_0_ROCMFP4_FAST, GGML_TYPE_F32, 512, 10, false, 640, bs, 2560));
++        test_cases.emplace_back(new test_mul_mat_id(
++                GGML_TYPE_Q4_0_ROCMFP4_FAST, GGML_TYPE_F32, 512, 10, false, 2560, bs, 640));
++    }
+     for (int64_t n : {128, 512}) {
+         test_cases.emplace_back(new test_mul_mat(
+                 GGML_TYPE_Q4_0_ROCMFP4_FAST, GGML_TYPE_F32, 2560, n, 2560, {1, 1}, {1, 1}));
+-- 
+2.53.0
+

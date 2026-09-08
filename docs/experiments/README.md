@@ -161,6 +161,7 @@ Timeline:
 - **Production switch to Vulkan + `--no-mmap`** — on Flash-Next prose Vulkan beats ROCm by ~+22%, but **mmap collapses Vulkan prompt processing ~3× (244 → 70 tok/s)**, so the production combo is Vulkan + `--no-mmap` + KV q8_0 (the KV quant here buys the RAM that no-mmap needs, at a cost the prose win pays for). Thread note: [vulkan-nommap-backend.md](vulkan-nommap-backend.md).
 - **Agent-latency decomposition** ([agent-latency.md](agent-latency.md)) — of the round-trip latency budget, the dominant residual is **client-side** (agent stalls, not GPU); the cold re-prefill quota traced back to a client-side cache-breaking timestamp and went to zero cold fallbacks with the client fix, while C4 fell 64.6% (the salvage that absorbed the aborts: [Infrastructure fixes](#infrastructure-fixes)).
 - **Measured 8060S facts** — tg is memory-bound (closed); attention is **44.8% of GPU time at 80k context** running at MFU 13% vs ~40% for plain matmul (time-crossover ~15–25k tokens, well before the FLOP crossover); GDN scan cost is 0.1–0.9% — not the ~44% sometimes claimed; clocks hold a 2220 MHz plateau with no thermal degradation across long runs.
+- `2026-09-08` **Wave-4 prefill GEMM campaign** — small-m split-k for the tall-skinny prefill GEMMs the qwen4exp hyper-connections inject, shipped **on by default**: combined32k **+2.33%**, pp8192 **+3.95%**, ppl improved, decode untouched. Four measured NO-GOs close their threads (pooled indexer keys — the tap costs what the gather saved; int-dot MMQ — never instantiated on RADV and slower when forced; f16 FA accumulator on quantized KV — near-tie degenerate output; element-wise fusion — under the async-submit floor), and two protocol lessons now rule every future card: bit-identity on Vulkan is structurally unreachable for graph-touching patches (fusion picks follow the node stream) and serial A/B arms drift ±26% with temperature — interleaved verdicts only; note: [2026-09-08-vulkan-optimization-wave4.md](2026-09-08-vulkan-optimization-wave4.md).
 
 ### Backend choice by model class: ROCm vs Vulkan
 
@@ -180,7 +181,7 @@ Practical rule we follow: dense → ROCm; MoE FP4 → Vulkan fork. (The speculat
 - temp 0, single stream, warm-up discarded, **2–5 runs, median, per note** — these are not statistical means; treat them as careful point measurements.
 - Full raw data, logs and per-experiment setup live in [`docs/experiments/`](.) — they are the raw working notes. This index is the summary and entry point.
 
-**What shipped:** the production serving config (Vulkan/RADV + `--no-mmap` + KV q8_0, cache-ram sized for the agent), and the closed levers (KV-quant, checkpoint/ring, hipCUB) documented so they stay closed.
+**What shipped:** the production serving config (Vulkan/RADV + `--no-mmap` + KV q8_0, cache-ram sized for the agent), and the closed levers (KV-quant, checkpoint/ring, hipCUB) documented so they stay closed. The optimization-campaign speedups (graph reuse + dense decode, waves 2-4 incl. the split-k default of `optim-w4`) are documented under [PATCHES.md](../../PATCHES.md) and the wave-4 note above.
 
 ## Infrastructure fixes
 

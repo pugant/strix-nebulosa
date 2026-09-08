@@ -84,7 +84,11 @@ layout (constant_id = 10) const uint WARP = 32;
 #include "mul_mmq_shmem_types.glsl"
 
 #ifdef MUL_MAT_ID
+#ifdef MMQ_ID_BK_STEP
+#define BK_STEP MMQ_ID_BK_STEP
+#else
 #define BK_STEP 1
+#endif
 #else
 #ifndef BK_STEP
 #define BK_STEP 4

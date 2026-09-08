@@ -488,6 +488,10 @@ static int save_models(const llm_arch target_arch, const size_t seed, const ggml
         if (arch == LLM_ARCH_DEEPSEEK4) {
             continue; // FIXME: DeepSeek V4 synthetic fixture needs production FP8/compressor metadata
         }
+        if (arch == LLM_ARCH_QWEN4EXP) {
+            continue; // FIXME: qwen4exp synthetic fixture needs the hyper-connection/QSA/GDN
+                      // production metadata (the fixture shipped with the IDX-POOL series)
+        }
         if (arch == LLM_ARCH_EAGLE3 || arch == LLM_ARCH_DFLASH) {
             continue;
         }
@@ -577,6 +581,10 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const gg
         }
         if (arch == LLM_ARCH_DEEPSEEK4) {
             continue; // FIXME: DeepSeek V4 synthetic fixture needs production FP8/compressor metadata
+        }
+        if (arch == LLM_ARCH_QWEN4EXP) {
+            continue; // FIXME: qwen4exp synthetic fixture needs the hyper-connection/QSA/GDN
+                      // production metadata (the fixture shipped with the IDX-POOL series)
         }
         if (arch == LLM_ARCH_EAGLE3 || arch == LLM_ARCH_DFLASH) {
             continue;

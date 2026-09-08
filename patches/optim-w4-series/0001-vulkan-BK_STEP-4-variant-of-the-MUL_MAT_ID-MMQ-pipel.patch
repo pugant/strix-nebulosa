@@ -1,0 +1,155 @@
+From 612fa39197e207df5bf62b6ec00800dc82b36f04 Mon Sep 17 00:00:00 2001
+From: pugant <pugant@localhost>
+Date: Tue, 8 Sep 2026 10:20:00 +0200
+Subject: [PATCH 1/8] vulkan: BK_STEP=4 variant of the MUL_MAT_ID MMQ pipelines
+ (N4 D-A)
+
+The id path of mul_mmq.comp hardcodes BK_STEP=1 (one 32-element K slab
+per iteration: 2 barriers and scattered 17B A-loads per row), while the
+dense path already uses BK_STEP=4. Instantiate parallel matmul_id_subgroup
+rocmfp4/rocmfp4_fast q8_1 pipelines compiled with MMQ_ID_BK_STEP=4 (68B
+contiguous per A row per outer iteration, 4x fewer barriers, more loads
+in flight) and select them at runtime with GGML_VK_MMID_BK_STEP>=4
+(default off = BK_STEP=1; env switch is for same-binary A/B and will be
+removed before merge).
+
+Co-Authored-By: GLM by z.ai
+---
+ ggml/src/ggml-vulkan/ggml-vulkan.cpp          | 51 ++++++++++++++++---
+ .../ggml-vulkan/vulkan-shaders/mul_mmq.comp   |  4 ++
+ .../vulkan-shaders/vulkan-shaders-gen.cpp     |  6 +++
+ 3 files changed, 55 insertions(+), 6 deletions(-)
+
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+index 5e63c619f..ffe637cd6 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
++++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+@@ -773,6 +773,8 @@ struct vk_device_struct {
+ 
+     vk_matmul_pipeline2 pipeline_dequant_mul_mat_mat_id[GGML_TYPE_COUNT];
+     vk_matmul_pipeline2 pipeline_dequant_mul_mat_mat_id_q8_1[GGML_TYPE_COUNT];
++    // MMID-PP-TILING: BK_STEP=4 MUL_MAT_ID variants (f32acc only), runtime opt-in via GGML_VK_MMID_BK_STEP=4
++    vk_matmul_pipeline pipeline_dequant_mul_mat_mat_id_q8_1_bk4[GGML_TYPE_COUNT] {};
+ 
+     vk_pipeline pipeline_matmul_split_k_reduce;
+     vk_pipeline pipeline_quantize_q8_1_x4;
+@@ -3496,7 +3498,7 @@ static bool ggml_vk_matmul_shmem_support(const vk_device& device, const std::vec
+ // block_a_cache / block_b_cache layouts (see mul_mmq_shmem_types.glsl) rather
+ // than the float load buffers checked by ggml_vk_matmul_shmem_support.
+ // Sizes follow std430 rules. Returns false for types without a q8_1 pipeline.
+-static bool ggml_vk_matmul_int_shmem_support(const vk_device& device, const std::vector<uint32_t>& warptile, bool mul_mat_id, ggml_type src0_type) {
++static bool ggml_vk_matmul_int_shmem_support(const vk_device& device, const std::vector<uint32_t>& warptile, bool mul_mat_id, ggml_type src0_type, uint32_t bk_step = 0) {
+ 
+     // FLOAT_TYPE in the shader is float16_t with fp16 support, otherwise float.
+     const uint32_t fp_size   = device->fp16 ? 2u : 4u;
+@@ -3544,8 +3546,9 @@ static bool ggml_vk_matmul_int_shmem_support(const vk_device& device, const std:
+ 
+     const uint32_t BM = warptile[1];
+     const uint32_t BN = warptile[2];
+-    // mul_mmq.comp: BK_STEP=1 for MUL_MAT_ID, 4 otherwise.
+-    const uint32_t BK_STEP = mul_mat_id ? 1u : 4u;
++    // mul_mmq.comp: BK_STEP=1 for MUL_MAT_ID, 4 otherwise, unless overridden
++    // (BK_STEP=4 MUL_MAT_ID variants, see pipeline_dequant_mul_mat_mat_id_q8_1_bk4).
++    const uint32_t BK_STEP = bk_step != 0 ? bk_step : (mul_mat_id ? 1u : 4u);
+ 
+     const uint32_t buf_a_size = BM * BK_STEP * block_a_size;
+     const uint32_t buf_b_size = BN * BK_STEP * block_b_size;
+@@ -4421,6 +4424,22 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+             ggml_vk_create_pipeline(device, device-> PIPELINE_NAME .f32acc->s, #NAMELC        "_s", NAMELC ## _len,        NAMELC ##  _data,        "main", PARAMCOUNT, sizeof(PUSHCONST), s_ ## WG_DENOMS, s_ ## WARPTILE, 1, false, REQSUBGROUPSIZE > 0, REQSUBGROUPSIZE);   \
+         } \
+ 
++        // MMID-PP-TILING: BK_STEP=4 variant of CREATE_MMQ for the id-int pipelines
++        // (same warptiles, larger shmem), runtime opt-in via GGML_VK_MMID_BK_STEP=4
++#define CREATE_MMQ_BK4(TYPE, NAMELC) \
++        if (device->pipeline_dequant_mul_mat_mat_id_q8_1_bk4[TYPE] == nullptr) { \
++            device->pipeline_dequant_mul_mat_mat_id_q8_1_bk4[TYPE] = std::make_shared<vk_matmul_pipeline_struct>(); \
++        } \
++        if (device->mul_mat_id_l_int[TYPE] && ggml_vk_matmul_int_shmem_support(device, l_warptile_mmqid_int, true, TYPE, 4)) { \
++            ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_mat_id_q8_1_bk4[TYPE]->l, #NAMELC "_l", NAMELC ## _len, NAMELC ## _data, "main", mul_mat_id_param_count, sizeof(vk_mat_mat_id_push_constants), l_mmq_wg_denoms, l_warptile_mmqid_int, 1, false, mul_mat_subgroup_size > 0, mul_mat_subgroup_size); \
++        } \
++        if (device->mul_mat_id_m_int[TYPE] && ggml_vk_matmul_int_shmem_support(device, m_warptile_mmqid_int, true, TYPE, 4)) { \
++            ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_mat_id_q8_1_bk4[TYPE]->m, #NAMELC "_m", NAMELC ## _len, NAMELC ## _data, "main", mul_mat_id_param_count, sizeof(vk_mat_mat_id_push_constants), m_mmq_wg_denoms, m_warptile_mmqid_int, 1, false, mul_mat_subgroup_size > 0, mul_mat_subgroup_size); \
++        } \
++        if (device->mul_mat_id_s_int[TYPE] && ggml_vk_matmul_int_shmem_support(device, s_warptile_mmqid_int, true, TYPE, 4)) { \
++            ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_mat_id_q8_1_bk4[TYPE]->s, #NAMELC "_s", NAMELC ## _len, NAMELC ## _data, "main", mul_mat_id_param_count, sizeof(vk_mat_mat_id_push_constants), s_mmq_wg_denoms, s_warptile_mmqid_int, 1, false, mul_mat_subgroup_size > 0, mul_mat_subgroup_size); \
++        } \
++
+         // Create 2 variants, {f16,f32} accumulator
+ #define CREATE_MM2(TYPE, PIPELINE_NAME, NAMELC, WG_DENOMS, WARPTILE, PUSHCONST, PARAMCOUNT, ID, REQSUBGROUPSIZE) \
+         CREATE_MM(TYPE, PIPELINE_NAME . f16acc, NAMELC, _f16acc, WG_DENOMS, WARPTILE, PUSHCONST, PARAMCOUNT, ID, REQSUBGROUPSIZE) \
+@@ -4528,6 +4547,10 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+                 CREATE_MMQ(GGML_TYPE_Q4_0_ROCMFP4, pipeline_dequant_mul_mat_mat_id_q8_1[GGML_TYPE_Q4_0_ROCMFP4], matmul_id_subgroup_rocmfp4_q8_1, mmq_wg_denoms, warptile_mmqid_int, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id, mul_mat_subgroup_size);
+                 CREATE_MMQ(GGML_TYPE_Q4_0_ROCMFP4_FAST, pipeline_dequant_mul_mat_mat_id_q8_1[GGML_TYPE_Q4_0_ROCMFP4_FAST], matmul_id_subgroup_rocmfp4_fast_q8_1, mmq_wg_denoms, warptile_mmqid_int, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id, mul_mat_subgroup_size);
+ 
++                // MMID-PP-TILING: BK_STEP=4 variants of the two pipelines above
++                CREATE_MMQ_BK4(GGML_TYPE_Q4_0_ROCMFP4,      matmul_id_subgroup_rocmfp4_q8_1_bk4);
++                CREATE_MMQ_BK4(GGML_TYPE_Q4_0_ROCMFP4_FAST, matmul_id_subgroup_rocmfp4_fast_q8_1_bk4);
++
+                 CREATE_MMQ(GGML_TYPE_Q2_K, pipeline_dequant_mul_mat_mat_id_q8_1[GGML_TYPE_Q2_K], matmul_id_subgroup_q2_k_q8_1, mmq_wg_denoms, warptile_mmqid_int_k, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id, mul_mat_subgroup_size_16);
+                 CREATE_MMQ(GGML_TYPE_Q3_K, pipeline_dequant_mul_mat_mat_id_q8_1[GGML_TYPE_Q3_K], matmul_id_subgroup_q3_k_q8_1, mmq_wg_denoms, warptile_mmqid_int_k, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id, mul_mat_subgroup_size_16);
+                 CREATE_MMQ(GGML_TYPE_Q4_K, pipeline_dequant_mul_mat_mat_id_q8_1[GGML_TYPE_Q4_K], matmul_id_subgroup_q4_k_q8_1, mmq_wg_denoms, warptile_mmqid_int_k, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id, mul_mat_subgroup_size_16);
+@@ -8383,9 +8406,25 @@ static vk_pipeline ggml_vk_guess_matmul_id_pipeline(ggml_backend_vk_context * ct
+     // The q8_1 (integer dot) mmq path uses a different shader with its own
+     // shared-memory layout, so use the int-specific availability flags.
+     const bool is_q8_1 = (src1_type == GGML_TYPE_Q8_1);
+-    const bool mm_l = is_q8_1 ? ctx->device->mul_mat_id_l_int[src0_type] : ctx->device->mul_mat_id_l[src0_type];
+-    const bool mm_m = is_q8_1 ? ctx->device->mul_mat_id_m_int[src0_type] : ctx->device->mul_mat_id_m[src0_type];
+-    const bool mm_s = is_q8_1 ? ctx->device->mul_mat_id_s_int[src0_type] : ctx->device->mul_mat_id_s[src0_type];
++    bool mm_l = is_q8_1 ? ctx->device->mul_mat_id_l_int[src0_type] : ctx->device->mul_mat_id_l[src0_type];
++    bool mm_m = is_q8_1 ? ctx->device->mul_mat_id_m_int[src0_type] : ctx->device->mul_mat_id_m[src0_type];
++    bool mm_s = is_q8_1 ? ctx->device->mul_mat_id_s_int[src0_type] : ctx->device->mul_mat_id_s[src0_type];
++
++    // MMID-PP-TILING: opt-in BK_STEP=4 MUL_MAT_ID variant for same-binary A/B
++    // (default off = current BK_STEP=1 behavior; to be removed before merge).
++    static const bool use_mmid_bk4 = []{
++        const char * env = getenv("GGML_VK_MMID_BK_STEP");
++        return env != nullptr && atoi(env) >= 4;
++    }();
++    if (is_q8_1 && use_mmid_bk4) {
++        const vk_matmul_pipeline alt = ctx->device->pipeline_dequant_mul_mat_mat_id_q8_1_bk4[src0_type];
++        if (alt != nullptr && (alt->l != nullptr || alt->m != nullptr || alt->s != nullptr)) {
++            mmp = alt;
++            mm_l = alt->l != nullptr;
++            mm_m = alt->m != nullptr;
++            mm_s = alt->s != nullptr;
++        }
++    }
+ 
+     if (ctx->device->coopmat2) {
+         // Use large shader when the N dimension is greater than the medium shader's tile size
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/mul_mmq.comp b/ggml/src/ggml-vulkan/vulkan-shaders/mul_mmq.comp
+index aae1c2e8a..2d3c78433 100644
+--- a/ggml/src/ggml-vulkan/vulkan-shaders/mul_mmq.comp
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/mul_mmq.comp
+@@ -84,7 +84,11 @@ layout (constant_id = 10) const uint WARP = 32;
+ #include "mul_mmq_shmem_types.glsl"
+ 
+ #ifdef MUL_MAT_ID
++#ifdef MMQ_ID_BK_STEP
++#define BK_STEP MMQ_ID_BK_STEP
++#else
+ #define BK_STEP 1
++#endif
+ #else
+ #ifndef BK_STEP
+ #define BK_STEP 4
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp b/ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp
+index 176a35098..a6bf81697 100644
+--- a/ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp
+@@ -623,6 +623,12 @@ void matmul_shaders(bool fp16, MatMulIdType matmul_id_type, bool coopmat, bool c
+         // Integer dot mmq performs better with f32 accumulators (different shader, skip for dot2)
+         if (!f16acc && !coopmat && !coopmat2 && !dot2 && (is_legacy_quant(tname) || is_k_quant(tname) || tname == "mxfp4" || tname == "rocmfp4" || tname == "rocmfp4_fast")) {
+             string_to_spv(shader_name + "_" + tname + "_q8_1", "mul_mmq.comp", merge_maps(merge_maps(base_dict, float_type_dict), {{data_a_key, "1"}, {"D_TYPE", "float"},}), fp16, coopmat, coopmat2, f16acc);
++
++            // MMID-PP-TILING: BK_STEP=4 MUL_MAT_ID variant for the MoE grouped prefill
++            // regime (runtime opt-in via GGML_VK_MMID_BK_STEP, see ggml-vulkan.cpp).
++            if (matmul_id_type == MatMulIdType::SUBGROUP && (tname == "rocmfp4" || tname == "rocmfp4_fast")) {
++                string_to_spv(shader_name + "_" + tname + "_q8_1_bk4", "mul_mmq.comp", merge_maps(merge_maps(base_dict, float_type_dict), {{data_a_key, "1"}, {"D_TYPE", "float"}, {"MMQ_ID_BK_STEP", "4"}}), fp16, coopmat, coopmat2, f16acc);
++            }
+         }
+ #endif
+     }
+-- 
+2.53.0
+

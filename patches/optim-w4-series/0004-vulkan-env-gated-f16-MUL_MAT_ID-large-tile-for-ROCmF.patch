@@ -1,0 +1,51 @@
+From 16f7f22a365f1102fcb0a2590c8ad6480f0a578f Mon Sep 17 00:00:00 2001
+From: pugant <pugant@localhost>
+Date: Tue, 8 Sep 2026 15:11:48 +0200
+Subject: [PATCH 4/8] vulkan: env-gated f16 MUL_MAT_ID large tile for ROCmFP4
+ (N4 round 3)
+
+The AMD vendor switch clears mul_mat_id_l, so prefill MoE runs on the
+m tile (BM=64/BN=64) and half of the N tile is padding at n_tokens=512.
+The l tile warptile in the reached branch (AMD + coopmat) is consistent
+with its wg_denoms, so allow opting into it via GGML_VK_MMID_F16_TILE_L
+(default off = current m tile) for an A/B. Tiling does not change the
+per-element reduction order: greedy output is char-exact identical.
+
+Co-Authored-By: GLM by z.ai
+---
+ ggml/src/ggml-vulkan/ggml-vulkan.cpp | 12 ++++++++++++
+ 1 file changed, 12 insertions(+)
+
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+index 97cb68fd9..b1cd2faf5 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
++++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+@@ -6500,6 +6500,17 @@ static vk_device ggml_vk_get_device(size_t idx) {
+             }
+         }
+ 
++        // MMID-PP-TILING: f16 dequant MUL_MAT_ID large tile for ROCmFP4. The vendor
++        // case above clears mul_mat_id_l on AMD, so prefill MoE runs on the m tile
++        // (BM=64/BN=64); with n_tokens=512 the N padding wastes half the tile. The
++        // l tile warptile in the reached branch is consistent with its wg_denoms
++        // ({128,128,128} vs {128,128,1}), so allow opting into it for an A/B.
++        if (getenv("GGML_VK_MMID_F16_TILE_L") != nullptr) {
++            for (const ggml_type t : {GGML_TYPE_Q4_0_ROCMFP4, GGML_TYPE_Q4_0_ROCMFP4_FAST}) {
++                device->mul_mat_id_l[t] = true;
++            }
++        }
++
+ 
+         std::vector<vk::DescriptorSetLayoutBinding> dsl_binding;
+         std::vector<vk::DescriptorBindingFlags> dsl_binding_flags;
+@@ -9798,6 +9809,7 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context&
+     vk_pipeline pipeline = ggml_vk_guess_matmul_id_pipeline(ctx, mmp, ne01, nei1, aligned, qx_needs_dequant ? f16_type : src0->type, effective_src1_type);
+ 
+ 
++
+     if (ggml_nbytes(src0) > ctx->device->properties.limits.maxStorageBufferRange) {
+         pipeline = ggml_vk_get_64b_indexing_pipeline(ctx, pipeline);
+     }
+-- 
+2.53.0
+
