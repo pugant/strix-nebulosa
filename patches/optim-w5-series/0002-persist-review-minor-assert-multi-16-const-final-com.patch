@@ -1,0 +1,58 @@
+From e8a4d8c5faf6497291ddcfe20d1517eaa7c3669a Mon Sep 17 00:00:00 2001
+From: pugant <pugant@localhost>
+Date: Wed, 9 Sep 2026 12:15:23 +0200
+Subject: [PATCH 2/2] =?UTF-8?q?persist:=20review=20minor=20=E2=80=94=20ass?=
+ =?UTF-8?q?ert=20multi-16,=20const&=20final,=20commenti=20(wave5=20t23-crc?=
+ =?UTF-8?q?)=20[wave5=20t23-crc-fix]?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Co-Authored-By: GLM by z.ai
+---
+ src/llama-persist-meta.cpp | 8 +++++---
+ 1 file changed, 5 insertions(+), 3 deletions(-)
+
+diff --git a/src/llama-persist-meta.cpp b/src/llama-persist-meta.cpp
+index 42e2a67d5..6679893d0 100644
+--- a/src/llama-persist-meta.cpp
++++ b/src/llama-persist-meta.cpp
+@@ -208,7 +208,8 @@ struct crc32_fold_state {
+ 
+ #if defined(__x86_64__)
+ // pclmulqdq folding path, bit-exact with the table path above (same poly,
+-// init, final xor - S0c bench, logs/optim-w5/s0c-crc-bench.c). The reflected
++// init, final xor - derivation validated against a reference harness in
++// the wave-5 experiment notes). The reflected
+ // table CRC is the byte-bit-reversed image of a CRC in the normal ring
+ // F = x^32 + 0x04C11DB7, where norm(init, M) = (init*x^8n + M(x)*x^32) mod F
+ // with M laid out MSB-first. The fold keeps T == prefix(x) (deg <= 94),
+@@ -275,7 +276,7 @@ static uint32_t crc32_bitrev32(uint32_t v) {
+ // folding constants x^e mod F, derived at first use (magic static, like the
+ // table) instead of transcribed literals - a typo in a magic constant would
+ // silently break bit-exactness; the assert re-derives one of them the slow
+-// way (96 squarings of x) as a one-off guard
++// way (96 successive multiplications by x) as a one-off guard
+ struct crc32_fold_k {
+     uint32_t k32;
+     uint32_t k96;
+@@ -304,6 +305,7 @@ static const crc32_fold_k & crc32_fold_constants() {
+ // owns the < 16 remainder), 16 B per iteration
+ __attribute__((target("pclmul,ssse3")))
+ static void crc32_fold_update(crc32_fold_state & st, const uint8_t * data, size_t size) {
++    assert((size & 15) == 0);
+     const crc32_fold_k & k = crc32_fold_constants();
+     const __m128i k128 = _mm_set_epi64x(0, (int64_t) k.k128);
+     const __m128i k192 = _mm_set_epi64x(0, (int64_t) k.k192);
+@@ -421,7 +423,7 @@ static void crc32_stream_update(crc32_stream & s, const uint8_t * data, size_t s
+     }
+ }
+ 
+-static uint32_t crc32_stream_final(crc32_stream & s) {
++static uint32_t crc32_stream_final(const crc32_stream & s) {
+     if (!s.fold) {
+         return s.c ^ 0xFFFFFFFFu;
+     }
+-- 
+2.53.0
+

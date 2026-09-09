@@ -323,6 +323,41 @@ byte 2: v2[5:4] | v3[5:0]<<2
 | Interleaved A/B | c32k +2.33% (4/4 arm separation) · server timed-gen parity w3 vs w4 (24.02–24.08 tok/s) |
 | Deploy | LIVE on `qwen4exp-mtp-vk-optim-w4` (health OK, prod flags unchanged, no new flags) |
 
+## Session 007 — 2026-09-09
+
+**Scope:** wave-5 optimization series (branch `optim-w5` @`e8a4d8c5f`, series = 2 patches on top of `optim-w4` @`286f51d4b`; full in-wave history kept on `optim-w5-full` @`5bab7f594`). One GO: CRC32 PCLMUL for the persist-file checksum (T23-CRC; restore-check post-deploy pending). One card closed in F0 without code: sampling per-round cost. One structural NO-GO dropped from the series: FA prefill tile variants (card-1, v1 + v2).
+
+### `src/llama-persist-meta.cpp` (T23-CRC, GO — restore-check post-deploy pending)
+
+| Change | Detail |
+|--------|--------|
+| CRC32 PCLMUL folding | Streaming CRC of the persist file replaces the bytewise table loop on x86-64 with a PCLMULQDQ folding path (`__attribute__((target("pclmul,ssse3")))`, 16 B per iteration, fold state deg <= 94). Bit-exact with the table path: same poly/init/final-xor, reflected-table correspondence documented in-code; folding constants x^e mod F derived at first use (magic static) instead of transcribed literals, with a one-off assert re-deriving k96 the slow way. |
+| Runtime dispatch + fallback | `crc32_pclmul_available()` probed once (magic static); non-x86-64 or no PCLMUL → table path unchanged. Stream API (`crc32_stream_update`/`_final`) owns the <16 B remainder on both paths. |
+| Review fix (2nd commit of the series) | `assert((size & 15) == 0)` in `crc32_fold_update`; `crc32_stream_final` takes `const&`; comment fixes (reference-harness wording, "96 successive multiplications by x"). |
+| Measured basis | CRC = 70% of real restore time; expected −64% restore time with PCLMUL active. |
+
+### Closed in F0 (no code)
+
+| Card | Result |
+|------|--------|
+| card-2 sampling | Closed in F0: 0.375 ms/round measured vs 0.9 ms/round gate. |
+
+### Dropped from the series (card-1 FA-PP-TILE, NO-GO structural)
+
+| Variant | Detail |
+|---------|--------|
+| v1 `GGML_VK_FA_PP_TILE=1` (Bc64 per-shape override, `ggml-vulkan.cpp`) and v2 `=2` (Br32 dual-panel coopmat1, `ggml-vulkan.cpp` + `flash_attn_cm1.comp`), both default OFF | Interleaved c32k: −5.96% (4/4 cell separation); FA op share +25.5%; occupancy LDS 2→1. coopmat2 absent on gfx1151/RADV; roofline re-read confuted the F0 hypothesis. Both commits dropped from the deploy series via cherry-pick rebuild on the base; full history on `optim-w5-full` @`5bab7f594`. |
+
+### Validation
+
+| Check | Result |
+|-------|--------|
+| Series rebuild | cherry-pick clean (no conflicts); `git diff --stat 286f51d4b..optim-w5` touches only `src/llama-persist-meta.cpp`; `ggml/` tree identical to base; `src/llama-persist-meta.cpp` bit-identical to the in-wave chain tip `5bab7f594` |
+| `git am` gate | patches re-applied on a detached worktree at the base → resulting tree SHA identical to `optim-w5` (`449517003313aba8b97d4bcb22ccaf470a82f21e`) |
+| Bit-exactness | PCLMUL path vs table path produce equal CRCs (reference harness in the wave-5 experiment notes) |
+| Restore-check | PENDING post-deploy (real restore timing with PCLMUL active) |
+| Deploy | NOT deployed — series prepared only |
+
 <!-- TEMPLATE FOR FUTURE AI SESSIONS:
 
 ## Session NNN — YYYY-MM-DD

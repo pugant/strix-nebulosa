@@ -1,0 +1,299 @@
+From 4435d1855fb4d72a86455652b3dfc864f09cacf3 Mon Sep 17 00:00:00 2001
+From: pugant <pugant@localhost>
+Date: Wed, 9 Sep 2026 10:36:24 +0200
+Subject: [PATCH 1/2] persist: CRC32 PCLMUL bit-exact con runtime dispatch e
+ fallback tabellare [wave5 t23-crc]
+
+Co-Authored-By: GLM by z.ai
+---
+ src/llama-persist-meta.cpp | 244 ++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 240 insertions(+), 4 deletions(-)
+
+diff --git a/src/llama-persist-meta.cpp b/src/llama-persist-meta.cpp
+index 792945878..42e2a67d5 100644
+--- a/src/llama-persist-meta.cpp
++++ b/src/llama-persist-meta.cpp
+@@ -10,6 +10,10 @@
+ #include <cmath>
+ #include <cstring>
+ 
++#if defined(__x86_64__)
++#include <immintrin.h> // pclmulqdq CRC fold below (target-attributed, no global -m flag)
++#endif
++
+ #include <fcntl.h>
+ #include <unistd.h>
+ 
+@@ -195,9 +199,241 @@ static uint32_t crc32_update(uint32_t c, const uint8_t * data, size_t size) {
+     return c;
+ }
+ 
++// 128-bit fold state, kept as two scalars so no vector type crosses the
++// target-attribute boundary below (the intrinsics live inside the functions)
++struct crc32_fold_state {
++    uint64_t lo = 0;
++    uint64_t hi = 0;
++};
++
++#if defined(__x86_64__)
++// pclmulqdq folding path, bit-exact with the table path above (same poly,
++// init, final xor - S0c bench, logs/optim-w5/s0c-crc-bench.c). The reflected
++// table CRC is the byte-bit-reversed image of a CRC in the normal ring
++// F = x^32 + 0x04C11DB7, where norm(init, M) = (init*x^8n + M(x)*x^32) mod F
++// with M laid out MSB-first. The fold keeps T == prefix(x) (deg <= 94),
++// absorbing 16 B per iteration (2 pclmul); the final reduction folds in
++// init*x^8n and bit-reverses back into the reflected domain, so the < 16 tail
++// bytes (and the whole fallback path) continue through crc32_update unchanged.
++
++// a mod F for deg(a) <= 63 (the reduction constant carries the x^32 term)
++static uint32_t crc32_gf_mod64(uint64_t a) {
++    for (int i = 63; i >= 32; i--) {
++        if (a & (1ull << i)) {
++            a ^= ((((uint64_t) 1) << 32) | (uint64_t) 0x04C11DB7ull) << (i - 32);
++        }
++    }
++    return (uint32_t) a;
++}
++
++// a mod F for deg(a) <= 127 (no shift beyond bit 127: no UB)
++static uint32_t crc32_gf_mod128(unsigned __int128 a) {
++    for (int i = 127; i >= 32; i--) {
++        if (a & ((unsigned __int128) 1 << i)) {
++            a ^= ((((unsigned __int128) 1) << 32) | (unsigned __int128) 0x04C11DB7ull) << (i - 32);
++        }
++    }
++    return (uint32_t) a;
++}
++
++// (a*b) mod F, a,b < 2^32
++static uint32_t crc32_gf_mul32(uint32_t a, uint32_t b) {
++    uint64_t acc = 0;
++    uint64_t bb   = b;
++    while (a) {
++        if (a & 1) {
++            acc ^= bb;
++        }
++        bb <<= 1;
++        a >>= 1;
++    }
++    return crc32_gf_mod64(acc);
++}
++
++// x^e mod F
++static uint32_t crc32_gf_powx(uint64_t e) {
++    uint32_t r    = 1;
++    uint32_t base = 2;
++    while (e) {
++        if (e & 1) {
++            r = crc32_gf_mul32(r, base);
++        }
++        base = crc32_gf_mul32(base, base);
++        e >>= 1;
++    }
++    return r;
++}
++
++static uint32_t crc32_bitrev32(uint32_t v) {
++    v = ((v & 0x55555555u) << 1) | ((v & 0xAAAAAAAAu) >> 1);
++    v = ((v & 0x33333333u) << 2) | ((v & 0xCCCCCCCCu) >> 2);
++    v = ((v & 0x0F0F0F0Fu) << 4) | ((v & 0xF0F0F0F0u) >> 4);
++    v = ((v & 0x00FF00FFu) << 8) | ((v & 0xFF00FF00u) >> 8);
++    return (v << 16) | (v >> 16);
++}
++
++// folding constants x^e mod F, derived at first use (magic static, like the
++// table) instead of transcribed literals - a typo in a magic constant would
++// silently break bit-exactness; the assert re-derives one of them the slow
++// way (96 squarings of x) as a one-off guard
++struct crc32_fold_k {
++    uint32_t k32;
++    uint32_t k96;
++    uint32_t k128;
++    uint32_t k192;
++};
++
++static const crc32_fold_k & crc32_fold_constants() {
++    static const crc32_fold_k k = {
++        crc32_gf_powx(32),
++        crc32_gf_powx(96),
++        crc32_gf_powx(128),
++        crc32_gf_powx(192),
++    };
++    assert(k.k96 == [] {
++        uint32_t r = 1;
++        for (int i = 0; i < 96; i++) {
++            r = crc32_gf_mul32(r, 2);
++        }
++        return r;
++    }());
++    return k;
++}
++
++// folds size bytes into st; size must be a multiple of 16 (crc32_stream below
++// owns the < 16 remainder), 16 B per iteration
++__attribute__((target("pclmul,ssse3")))
++static void crc32_fold_update(crc32_fold_state & st, const uint8_t * data, size_t size) {
++    const crc32_fold_k & k = crc32_fold_constants();
++    const __m128i k128 = _mm_set_epi64x(0, (int64_t) k.k128);
++    const __m128i k192 = _mm_set_epi64x(0, (int64_t) k.k192);
++
++    // per-byte bit reversal via nibble LUT, then byte-order reversal: the
++    // chunk as M' = [br8(b)] laid out MSB-first, ready for the normal ring
++    const __m128i lut = _mm_setr_epi8(0x0, 0x8, 0x4, 0xC, 0x2, 0xA, 0x6, 0xE,
++                                      0x1, 0x9, 0x5, 0xD, 0x3, 0xB, 0x7, 0xF);
++    const __m128i m0f = _mm_set1_epi8((char) 0x0F);
++    const __m128i brb = _mm_setr_epi8(15, 14, 13, 12, 11, 10, 9, 8,
++                                      7, 6, 5, 4, 3, 2, 1, 0);
++
++    __m128i T = _mm_set_epi64x((int64_t) st.hi, (int64_t) st.lo);
++
++    const uint8_t * p     = data;
++    const uint8_t * end16 = data + size;
++    while (p < end16) {
++        __m128i x  = _mm_loadu_si128((const __m128i *) p);
++        __m128i lo = _mm_and_si128(x, m0f);
++        __m128i hi = _mm_and_si128(_mm_srli_epi16(x, 4), m0f);
++        __m128i rb = _mm_or_si128(_mm_slli_epi16(_mm_shuffle_epi8(lut, lo), 4),
++                                  _mm_shuffle_epi8(lut, hi));
++        __m128i C  = _mm_shuffle_epi8(rb, brb);
++
++        __m128i a = _mm_clmulepi64_si128(T, k192, 0x01); // hi64(T) * x^192
++        __m128i b = _mm_clmulepi64_si128(T, k128, 0x00); // lo64(T) * x^128
++        T = _mm_xor_si128(_mm_xor_si128(a, b), C);
++        p += 16;
++    }
++
++    st.lo = (uint64_t) _mm_cvtsi128_si64(T);
++    st.hi = (uint64_t) _mm_cvtsi128_si64(_mm_unpackhi_epi64(T, T));
++}
++
++// reduces the fold state together with init*x^8n: returns the REFLECTED
++// running register after the n_folded bytes already absorbed
++__attribute__((target("pclmul,ssse3")))
++static uint32_t crc32_fold_final(const crc32_fold_state & st, uint64_t n_folded) {
++    const crc32_fold_k & k = crc32_fold_constants();
++    const __m128i k32 = _mm_set_epi64x(0, (int64_t) k.k32);
++    const __m128i k96 = _mm_set_epi64x(0, (int64_t) k.k96);
++    const __m128i T   = _mm_set_epi64x((int64_t) st.hi, (int64_t) st.lo);
++
++    // T(x)*x^32 = lo64(T)*x^32 + hi64(T)*x^96; each product fits in 96 bits,
++    // so XOR them in-register before extracting (no high bits can be lost)
++    __m128i pl = _mm_clmulepi64_si128(T, k32, 0x00);
++    __m128i ph = _mm_clmulepi64_si128(T, k96, 0x01);
++    __m128i ps = _mm_xor_si128(pl, ph);
++    unsigned __int128 U = (unsigned __int128) (uint64_t) _mm_cvtsi128_si64(ps)
++                        | ((unsigned __int128) (uint64_t) _mm_cvtsi128_si64(
++                              _mm_unpackhi_epi64(ps, ps)) << 64);
++    U ^= (unsigned __int128) crc32_gf_mul32(0xFFFFFFFFu, crc32_gf_powx(8ull * n_folded));
++
++    return crc32_bitrev32(crc32_gf_mod128(U));
++}
++
++// runtime dispatch, cached in a magic static (thread-safe); the TU builds
++// without -mpclmul: the intrinsics are behind the target attributes above
++static bool crc32_pclmul_available() {
++    static const bool ok = __builtin_cpu_supports("pclmul")
++                        && __builtin_cpu_supports("ssse3");
++    return ok;
++}
++#else
++// no pclmulqdq path on this target: always the table
++static bool crc32_pclmul_available() {
++    return false;
++}
++static inline void crc32_fold_update(crc32_fold_state &, const uint8_t *, size_t) {
++    assert(false); // unreachable: crc32_stream only folds when pclmulqdq is available
++}
++static inline uint32_t crc32_fold_final(const crc32_fold_state &, uint64_t) {
++    assert(false);
++    return 0;
++}
++#endif
++
++// streaming CRC-32: table fallback or pclmulqdq fold, picked once per stream.
++// The fold path parks a < 16 B remainder in carry so update() is agnostic of
++// the caller's chunking; both paths produce the identical reflected state
++// after every byte (the normal-domain fold composes across calls exactly like
++// the reflected table update does).
++struct crc32_stream {
++    bool             fold   = crc32_pclmul_available();
++    uint32_t         c      = 0xFFFFFFFFu; // reflected state (table path)
++    crc32_fold_state st;                   // fold path
++    uint64_t         folded = 0;           // bytes absorbed by the fold
++    uint8_t          carry[16] = {0};      // fold-path remainder (< 16 B)
++    size_t           ncarry = 0;
++};
++
++static void crc32_stream_update(crc32_stream & s, const uint8_t * data, size_t size) {
++    if (!s.fold) {
++        s.c = crc32_update(s.c, data, size);
++        return;
++    }
++    // top the carry up to a full 16-byte block first: fold blocks always sit
++    // on absolute 16-byte boundaries of the stream, like in the one-shot call
++    while (s.ncarry > 0 && size > 0) {
++        s.carry[s.ncarry++] = *data++;
++        size--;
++        if (s.ncarry == 16) {
++            crc32_fold_update(s.st, s.carry, 16);
++            s.folded += 16;
++            s.ncarry = 0;
++        }
++    }
++    const size_t bulk = size & ~(size_t) 15;
++    crc32_fold_update(s.st, data, bulk);
++    s.folded += bulk;
++    data += bulk;
++    size -= bulk;
++    for (size_t i = 0; i < size; i++) {
++        s.carry[s.ncarry++] = data[i];
++    }
++}
++
++static uint32_t crc32_stream_final(crc32_stream & s) {
++    if (!s.fold) {
++        return s.c ^ 0xFFFFFFFFu;
++    }
++    const uint32_t core = crc32_fold_final(s.st, s.folded);
++    return crc32_update(core, s.carry, s.ncarry) ^ 0xFFFFFFFFu;
++}
++
+ // sanity check-value (CRC-32 IEEE): "123456789" -> 0xCBF43926
+ uint32_t llama_persist_crc32(const uint8_t * data, size_t size) {
+-    return crc32_update(0xFFFFFFFFu, data, size) ^ 0xFFFFFFFFu;
++    crc32_stream s;
++    crc32_stream_update(s, data, size);
++    return crc32_stream_final(s);
+ }
+ 
+ bool llama_persist_crc32_file(const char * path, uint64_t expected_size, uint32_t * crc_out) {
+@@ -210,7 +446,7 @@ bool llama_persist_crc32_file(const char * path, uint64_t expected_size, uint32_
+     // expected_size bytes - shorter OR longer means corruption.
+     // heap buffer: this runs on server task threads, keep the stack flat
+     std::vector<uint8_t> buf(1 << 20);
+-    uint32_t    c     = 0xFFFFFFFFu;
++    crc32_stream crc;
+     uint64_t    total = 0;
+     bool        ok    = true;
+ 
+@@ -226,7 +462,7 @@ bool llama_persist_crc32_file(const char * path, uint64_t expected_size, uint32_
+         if (n == 0) {
+             break; // EOF
+         }
+-        c = crc32_update(c, buf.data(), (size_t) n);
++        crc32_stream_update(crc, buf.data(), (size_t) n);
+         total += (uint64_t) n;
+         if (total > expected_size) {
+             ok = false; // longer than declared: stop early instead of streaming a bad file
+@@ -242,7 +478,7 @@ bool llama_persist_crc32_file(const char * path, uint64_t expected_size, uint32_
+     if (!ok || total != expected_size) {
+         return false; // crc_out untouched on failure
+     }
+-    *crc_out = c ^ 0xFFFFFFFFu;
++    *crc_out = crc32_stream_final(crc);
+     return true;
+ }
+ 
+-- 
+2.53.0
+
