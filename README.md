@@ -162,6 +162,9 @@ This lab adds a thin layer on top of giants' work.
 - **Unsloth** — the UD quantization family and the Flash-Next reference material; our pipeline builds on their published BF16 GGUFs and write-ups.
 - **agentionai** — author of the external MTP drafter that pairs with our qwen4exp quant.
 - **kingjones777** — reference tg/pp numbers on Strix Halo that we cross-checked our own measurements against.
+- **avifenesh** — the original d2t draft-vocabulary trim for the MTP sidecar; our FR-Spec port descends from it.
+- **drluoto** — the qwen4exp port of that trim, the reference trimmer and frequency map, and the Strix Halo drafter measurements that motivated the card.
+- **quimmedes** — the community Q8_0 MTP head our requantized production sidecar derives from.
 - **antirez / Salvatore Sanfilippo** — the ds4 README pattern this page follows, the
   disk-resident model state of his dwarstar (the direct inspiration for our PLE
   disk-offload, `--ple-disk`), and his `ds4_kvstore` — the cross-restart on-disk library
