@@ -30,6 +30,26 @@ struct llama_kv_cell_ext {
     }
 };
 
+// W6-5 (A3-4): visit ONLY the set bits of a per-cell sequence bitset. A cell
+// in the server regime holds 1 of the LLAMA_MAX_SEQ = 256 bits, so a plain
+// scan tests 256 bits to find it; libstdc++ exposes _Find_first/_Find_next
+// for exactly this, and other standard libraries keep the plain scan (same
+// visit order - ascending - and same semantics either way)
+template <typename F>
+inline void llama_kv_cells_seq_foreach(const std::bitset<LLAMA_MAX_SEQ> & bs, const F & fn) {
+#if defined(__GLIBCXX__)
+    for (size_t s = bs._Find_first(); s < LLAMA_MAX_SEQ; s = bs._Find_next(s)) {
+        fn((llama_seq_id) s);
+    }
+#else
+    for (size_t s = 0; s < LLAMA_MAX_SEQ; s++) {
+        if (bs[s]) {
+            fn((llama_seq_id) s);
+        }
+    }
+#endif
+}
+
 // meta information about KV cells that can be part of multiple sequences at the same time
 // TODO: add unit tests
 class llama_kv_cells {
@@ -343,6 +363,13 @@ public:
     llama_seq_id seq_get(uint32_t i) const {
         assert(seq[i].count() == 1);
 
+#if defined(__GLIBCXX__)
+        // A3-4: first set bit directly instead of scanning up to 256 bits
+        // (_Find_first answers LLAMA_MAX_SEQ for an empty bitset - keep the
+        // historical -1 in that (assert-guarded, impossible) case)
+        const size_t s = seq[i]._Find_first();
+        return s < LLAMA_MAX_SEQ ? (llama_seq_id) s : -1;
+#else
         for (int s = 0; s < LLAMA_MAX_SEQ; ++s) {
             if (seq[i].test(s)) {
                 return s;
@@ -350,6 +377,7 @@ public:
         }
 
         return -1;
+#endif
     }
 
     // the minimum position of sequence seq_id currently present in any of the cells
@@ -537,21 +565,19 @@ private:
     }
 
     // remove cell i
+    // A3-4: only the set bits are visited (see llama_kv_cells_seq_foreach) -
+    // a single-sequence cell no longer pays 256 bit tests per operation
     void seq_pos_rm(uint32_t i) {
-        for (int s = 0; s < LLAMA_MAX_SEQ; ++s) {
-            if (seq[i].test(s)) {
-                seq_pos_dec(s, pos[i]);
-            }
-        }
+        llama_kv_cells_seq_foreach(seq[i], [&](llama_seq_id s) {
+            seq_pos_dec(s, pos[i]);
+        });
     }
 
     // add cell i
     void seq_pos_add(uint32_t i) {
-        for (int s = 0; s < LLAMA_MAX_SEQ; ++s) {
-            if (seq[i].test(s)) {
-                seq_pos_inc(s, pos[i]);
-            }
-        }
+        llama_kv_cells_seq_foreach(seq[i], [&](llama_seq_id s) {
+            seq_pos_inc(s, pos[i]);
+        });
     }
 };
 

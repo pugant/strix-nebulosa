@@ -1,0 +1,100 @@
+From 30c2386403369eb57e3ab0440c58d6687d9e5bbf Mon Sep 17 00:00:00 2001
+From: pugant <pugant@localhost>
+Date: Thu, 10 Sep 2026 18:18:21 +0200
+Subject: [PATCH 14/19] qwen4exp: drop the redundant conts in the QSA selection
+ and PLE tail [w6-2]
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Four copies that only re-materialized data that was already in the right
+layout:
+
+- QSA pooled blocks: each of the r member slices was contiguized before
+  entering the ADD chain, but ADD reads through nb, and the chain's last
+  ADD (or the scale when r == 1) still produces the contiguous tensor the
+  following reshape needs. r = compress_ratio dispatches per QSA layer.
+- QSA indexer q: rope_multi's output is already contiguous, so the cont
+  ahead of the reshape fed mul_mat a byte-identical copy.
+- QSA top_k: ggml_top_k allocates its result, same story before reshape_4d.
+- PLE conv tail: silu's output is a fresh contiguous tensor, so the cont
+  ahead of the closing reshape_3d was a pure copy.
+
+Kept (documented in code): the PLE tap kernel-column cont — the tap needs
+COLUMN k of the [kern, hc_dim] weight, a stride-kern gather no view can
+express contiguously (a view_1d picks row k: wrong data, caught by the
+harness), and the transposed-shift/permute/gate conts whose consumers (or
+the matcher fusions) rely on the layout. Bit-exact per the w6-2 harness.
+
+Co-Authored-By: GLM by z.ai <glm@z.ai>
+---
+ src/models/qwen4exp.cpp | 22 ++++++++++++++++------
+ 1 file changed, 16 insertions(+), 6 deletions(-)
+
+diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
+index 5412f82e9..d805f8d88 100644
+--- a/src/models/qwen4exp.cpp
++++ b/src/models/qwen4exp.cpp
+@@ -876,11 +876,13 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
+     members = ggml_reshape_4d(ctx0, members, idx_dim, r, n_blocks, n_stream);
+ 
+     // mean over the block members; r is small, so summing slices beats a transpose plus sum_rows
++    // [w6-2] the slices feed ADD, which reads through nb, so the per-slice cont only added
++    // a dispatch; the last ADD (or the scale when r == 1) still produces the contiguous
++    // tensor the reshape below needs
+     ggml_tensor * pooled = nullptr;
+     for (int64_t i = 0; i < r; ++i) {
+-        ggml_tensor * slice = ggml_cont(ctx0,
+-                ggml_view_3d(ctx0, members, idx_dim, n_blocks, n_stream,
+-                        members->nb[2], members->nb[3], i*members->nb[1]));
++        ggml_tensor * slice = ggml_view_3d(ctx0, members, idx_dim, n_blocks, n_stream,
++                members->nb[2], members->nb[3], i*members->nb[1]);
+         pooled = pooled ? ggml_add(ctx0, pooled, slice) : slice;
+     }
+     pooled = ggml_scale(ctx0, pooled, 1.0f/(float) r);
+@@ -905,8 +907,10 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
+ 
+     // rectify each head dot product before the sum, as in the DeepSeek lightning indexer
+     // mul_mat matches ne[2], so the queries of stream s only meet the blocks of stream s
++    // [w6-2] q comes fresh out of rope_multi and is already contiguous, so the cont was a
++    // byte-identical copy ahead of a reshape that keeps it contiguous
+     ggml_tensor * score = ggml_mul_mat(ctx0, pooled,
+-            ggml_reshape_3d(ctx0, ggml_cont(ctx0, q), idx_dim, n_idx_h*n_tps, n_stream));
++            ggml_reshape_3d(ctx0, q, idx_dim, n_idx_h*n_tps, n_stream));
+     score = ggml_reshape_4d(ctx0, score, n_blocks, n_idx_h, n_tps, n_stream);
+     score = ggml_relu(ctx0, score);
+     score = ggml_cont(ctx0, ggml_permute(ctx0, score, 1, 0, 2, 3));
+@@ -936,7 +940,9 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
+     // the reference returns indexer_top_k + compress_ratio - 1: whole blocks plus the tail
+     const int64_t width = std::min<int64_t>(n_kv, (int64_t) hparams.indexer_top_k + r - 1);
+ 
+-    ggml_tensor * top_k = ggml_cont(ctx0, ggml_top_k(ctx0, expanded, width));
++    // [w6-2] top_k allocates its result, so the cont was a byte-identical copy before the
++    // contiguous reshape below
++    ggml_tensor * top_k = ggml_top_k(ctx0, expanded, width);
+ 
+     // build_attn_qsa reads [n_top_k, n_batch, 1, n_stream], matching the KQ mask.
+     top_k = ggml_reshape_4d(ctx0, top_k, width, n_tps, 1, n_stream);
+@@ -1669,6 +1675,8 @@ ggml_tensor * llama_model_qwen4exp::graph::build_ple(
+                                 ggml_row_size(padded->type, start))));
+ 
+         // column k of the [kern, hc_dim] kernel is one weight per channel
++        // [w6-2] tried a contiguous view_1d of row k here: wrong data, the tap needs
++        // COLUMN k (a stride-kern gather), so the cont that materializes it stays
+         ggml_tensor * wk = ggml_cont(ctx0,
+                 ggml_view_2d(ctx0, model.layers[il].ple_conv1d, 1, hc_dim,
+                         model.layers[il].ple_conv1d->nb[1],
+@@ -1684,7 +1692,9 @@ ggml_tensor * llama_model_qwen4exp::graph::build_ple(
+     }
+ 
+     conv_out = ggml_silu(ctx0, conv_out);
+-    conv_out = ggml_reshape_3d(ctx0, ggml_cont(ctx0, conv_out), n_embd, hc, n_tokens);
++    // [w6-2] silu allocates a fresh contiguous tensor, so the cont before the reshape was
++    // a byte-identical copy
++    conv_out = ggml_reshape_3d(ctx0, conv_out, n_embd, hc, n_tokens);
+     cb(conv_out, "ple_conv_out", il);
+ 
+     return ggml_add(ctx0, hidden, ggml_add(ctx0, gated, conv_out));
+-- 
+2.53.0
+

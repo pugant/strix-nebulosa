@@ -1,0 +1,49 @@
+From 36190a39907e915ffa931f70adaaa64c74aba105 Mon Sep 17 00:00:00 2001
+From: pugant <pugant@localhost>
+Date: Thu, 10 Sep 2026 18:17:38 +0200
+Subject: [PATCH 12/19] qwen4exp: copy the conv-history ring slots without the
+ per-slot cont [w6-2]
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+build_conv_state_at() materialized a contiguous copy of each tail view
+before cpy'ing it into the rollback ring, so every recurrent/PLE layer paid
+K = n_rs_seq+1 CONT dispatches on top of the K CPY writes in each target
+eval (16 of the 17 materialize byte-identical data in decode, where a
+single-token ubatch leaves one distinct s_idx). CPY reads through nb on
+both the CPU dup and the Vulkan copy shader (which even keeps a dedicated
+non-contiguous pipeline), and delta-net-base.cpp build_conv_state() has
+always cpy'd the raw view — the cont here was pure overhead.
+
+With prod's ring (n_rs_seq=16) this drops ~630 CONT dispatches per target
+eval (37 layers with conv state). Bit-exact: same bytes copied into the
+same slots, proven by the w6-2 harness (identical logits/state hashes and
+conv-cache contents).
+
+Co-Authored-By: GLM by z.ai <glm@z.ai>
+---
+ src/models/qwen4exp.cpp | 7 ++++++-
+ 1 file changed, 6 insertions(+), 1 deletion(-)
+
+diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
+index 2c25043f5..a37da0bb5 100644
+--- a/src/models/qwen4exp.cpp
++++ b/src/models/qwen4exp.cpp
+@@ -1552,7 +1552,12 @@ ggml_tensor * llama_model_qwen4exp::graph::build_conv_state_at(
+                 conv_states_all->nb[1],
+                 (s_slot * mem_size + kv_head) * row_size);
+ 
+-        ggml_build_forward_expand(gf, ggml_cpy(ctx0, ggml_cont(ctx0, tail), dst));
++        // [w6-2] the tail view is strided (rows of the wider conv_input), but CPY reads
++        // through nb on every backend (delta-net-base.cpp build_conv_state has cpy'd the
++        // raw view since the start), so materializing a contiguous copy of it first just
++        // added one CONT dispatch per ring slot: K-1 of them carry byte-identical data in
++        // decode (n_tokens == 1 leaves a single distinct s_idx). Copy the view directly.
++        ggml_build_forward_expand(gf, ggml_cpy(ctx0, tail, dst));
+     }
+ 
+     return conv_input;
+-- 
+2.53.0
+

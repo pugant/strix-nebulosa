@@ -1,0 +1,420 @@
+From b21df41a584383c0425965fa4c6fd528165a92d9 Mon Sep 17 00:00:00 2001
+From: pugant <pugant@localhost>
+Date: Thu, 10 Sep 2026 15:18:49 +0200
+Subject: [PATCH 02/19] ggml-backend: memoize backend-support verdicts in sched
+ assignment (A5-C3, W6-9 gradino C3)
+
+split_graph() re-derives the same supports_op()/supports_buft() verdicts on
+every eval for graphs that repeat with stable topology (decode MTP: ~7.7
+evals/round, same weight buffers, same shapes per token count). Route the six
+scheduler-side query sites through two memos:
+
+- supports_op: signature-keyed, 2-way set-associative. The signature captures
+  every tensor field read by the in-tree supports_op implementations
+  (ggml-vulkan, ggml-cpu, amx/repack/kleidiai/spacemit extras): op, type, ne,
+  nb, flags, op_params word 0 for UNARY/GLU/UPSCALE (vk reads the interpolate
+  mode/antialias bits of UPSCALE at ggml-vulkan.cpp:17729-17733; the multimodal
+  mtmd path sets those dynamically) plus SCALE as a defensive superset, and
+  words 0..3 for SOFT_MAX_BACK (cpu max_bias). Any field change = signature
+  mismatch = full recompute; ops with >3 srcs bypass the memo. Exact memcmp
+  validation on every hit (the stored hash is only a pre-filter).
+- supports_buft: keyed on (buft, backend), both immutable for the scheduler
+  lifetime.
+
+The memos survive sched resets by design (cross-eval reuse), never change the
+assignment algorithm, and degrade to direct calls when disabled
+(GGML_SCHED_ASSIGN_MEMO=0, default on) or when allocation fails. Memo stats
+(queries/hits) logged at sched_free with GGML_SCHED_DEBUG=1.
+
+Gate N (bit-exact): harness with 1- and 2-backend scheds over 3 rounds of 17
+representative evals (recurrences, token-count variants, verify/drafter-like
+alternation, same weight consumed by different ops, SILU/GELU params variants,
+UPSCALE with BILINEAR|ANTIALIAS / NEAREST / BICUBIC op_params variants, FA with
+4 srcs = bypass, view_src on pre-allocated cache, forced backend-1 island):
+node-assignment and output digests identical memo ON vs OFF (main passes:
+so-memo hits 318/378 and 327/396). Dedicated UPSCALE sub-sched proves the
+variants produce distinct signatures: 6 queries / 3 misses with the fix vs
+6 queries / 1 miss on a control build without it. test-backend-ops output
+identical ON vs OFF.
+Logs: logs/wave6/w6c3/, report: docs/research/wave6/w6c3-report.md
+
+Review fix (spec review on 3d1089a4b): UPSCALE was missing from the params
+whitelist - a false hit could assign VK without the antialias pipeline.
+
+Co-Authored-By: GLM by z.ai
+---
+ ggml/src/ggml-backend.cpp | 292 +++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 285 insertions(+), 7 deletions(-)
+
+diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
+index 4e36909f4..8805910dd 100644
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -761,6 +761,70 @@ static bool ggml_is_view_op(enum ggml_op op) {
+ #define GGML_SCHED_MAX_COPIES 4
+ #endif
+ 
++// A5-C3 (W6-9, first step): memoization of backend-support verdicts used by the
++// graph-splitting assignment passes.
++//
++// ggml_backend_sched_split_graph() re-derives the same supports_op()/supports_buft()
++// verdicts on every eval for graphs that repeat with stable topology (decode):
++// the verdicts are a pure function of the backend set (fixed for the lifetime of the
++// scheduler) and of the queried tensor's "support signature". The memos below cache
++// the verdicts keyed on that exact signature, so any change to a field the support
++// queries can read produces a signature mismatch and a full recomputation: the memos
++// are a pure optimization and never a semantic - on any doubt they recompute.
++//
++// The signature captures every tensor field read by the in-tree supports_op
++// implementations (ggml-vulkan.cpp ggml_backend_vk_device_supports_op,
++// ggml-cpu.cpp ggml_backend_cpu_device_supports_op, ggml-cpu amx/repack/kleidiai/
++// spacemit extra buffer types): op, type, ne[], nb[], op_params word 0 for
++// UNARY/GLU/UPSCALE (words 0..3 for SOFT_MAX_BACK; SCALE word 0 is captured too
++// as a defensive superset), flags (not read in-tree, captured anyway), and for
++// each src up to GGML_SCHED_MEMO_MAX_SRCS: type, ne[], nb[], buffer->buft. Ops
++// with more non-NULL srcs than that bypass the memo. supports_buft is a pure
++// function of (device, buft), both immutable for the lifetime of the scheduler.
++//
++// Disable with GGML_SCHED_ASSIGN_MEMO=0 (checked once per scheduler).
++
++#ifndef GGML_SCHED_MEMO_MAX_SRCS
++#define GGML_SCHED_MEMO_MAX_SRCS 3
++#endif
++
++#ifndef GGML_SCHED_MEMO_SB_SLOTS
++#define GGML_SCHED_MEMO_SB_SLOTS 128
++#endif
++
++struct ggml_backend_sched_op_sig_src {
++    int64_t                    ne[GGML_MAX_DIMS];
++    size_t                     nb[GGML_MAX_DIMS];
++    ggml_backend_buffer_type_t buft; // NULL when src->buffer == NULL
++    enum ggml_type             type;
++    int32_t                    pad;
++};
++
++struct ggml_backend_sched_op_sig {
++    int64_t                    ne[GGML_MAX_DIMS];
++    size_t                     nb[GGML_MAX_DIMS];
++    uint32_t                   op_params[4];
++    enum ggml_op               op;
++    enum ggml_type             type;
++    int32_t                    flags;
++    int32_t                    n_src; // number of src[] entries captured (<= GGML_SCHED_MEMO_MAX_SRCS)
++    struct ggml_backend_sched_op_sig_src src[GGML_SCHED_MEMO_MAX_SRCS];
++};
++
++struct ggml_backend_sched_so_memo_slot {
++    bool                             in_use;
++    uint32_t                         hash;   // fast reject before the full signature compare
++    uint32_t                         known;  // bit b set: verdict for backends[b] is cached
++    uint32_t                         val;    // bit b: supports_op(backends[b], sig)
++    struct ggml_backend_sched_op_sig sig;
++};
++
++struct ggml_backend_sched_sb_memo_slot {
++    ggml_backend_buffer_type_t buft;
++    int32_t                    backend_id;
++    bool                       val;
++};
++
+ struct ggml_backend_sched_split {
+     int backend_id;
+     int i_start;
+@@ -825,6 +889,17 @@ struct ggml_backend_sched {
+     int debug_realloc;
+     int debug_graph_size;
+     int debug_prev_graph_size;
++
++    // A5-C3 (W6-9): support-verdict memos, see the comment above the memo structs.
++    // 2-way set-associative, so_memo_n is the number of sets (a power of two).
++    struct ggml_backend_sched_so_memo_slot * so_memo; // [2 * so_memo_n]
++    size_t                       so_memo_n;
++    struct ggml_backend_sched_sb_memo_slot * sb_memo;  // [GGML_SCHED_MEMO_SB_SLOTS]
++    bool                         memo_enabled;
++    uint64_t                     memo_so_queries;
++    uint64_t                     memo_so_hits;
++    uint64_t                     memo_sb_queries;
++    uint64_t                     memo_sb_hits;
+ };
+ 
+ #define hash_id(tensor) ggml_hash_find_or_insert(&sched->hash_set, tensor)
+@@ -832,6 +907,171 @@ struct ggml_backend_sched {
+ #define tensor_id_copy(id, backend_id, copy_id) sched->hv_tensor_copies[(id) * sched->n_backends * sched->n_copies + (backend_id) * sched->n_copies + (copy_id)]
+ #define tensor_copy(tensor, backend_id, copy_id) tensor_id_copy(hash_id(tensor), backend_id, copy_id)
+ 
++// ---- A5-C3 (W6-9): support-verdict memos (see the comment above the memo structs) ----
++
++static inline uint32_t ggml_backend_sched_memo_step(uint32_t h, uint64_t w) {
++    h ^= (uint32_t)((w * 0x9E3779B97F4A7C15ull) >> 32);
++    h *= 0x85EBCA6Bu;
++    h ^= h >> 15;
++    return h;
++}
++
++// captures the support signature of `op` into `sig` and computes its hash.
++// returns false when the op has more non-NULL srcs than the memo can store:
++// the caller must then bypass the memo (recompute) - never a wrong answer.
++static bool ggml_backend_sched_op_sig_capture(struct ggml_backend_sched_op_sig * sig, uint32_t * hash, const struct ggml_tensor * op) {
++    memset(sig, 0, sizeof(*sig));
++
++    uint32_t h = 0x12345678u;
++
++    sig->op    = op->op;
++    sig->type  = op->type;
++    sig->flags = op->flags;
++    for (int i = 0; i < GGML_MAX_DIMS; i++) {
++        sig->ne[i] = op->ne[i];
++        sig->nb[i] = op->nb[i];
++    }
++    h = ggml_backend_sched_memo_step(h, (uint64_t) op->op);
++    h = ggml_backend_sched_memo_step(h, (uint64_t) op->type);
++    h = ggml_backend_sched_memo_step(h, (uint32_t) op->flags);
++    for (int i = 0; i < GGML_MAX_DIMS; i++) {
++        h = ggml_backend_sched_memo_step(h, (uint64_t) op->ne[i]);
++        h = ggml_backend_sched_memo_step(h, op->nb[i]);
++    }
++
++    // op_params: only the ops whose supports_op implementations read params are
++    // captured (ggml-vulkan: UNARY/GLU read word 0 via ggml_get_unary_op/
++    // ggml_get_glu_op, UPSCALE reads word 0 mode/antialias bits; ggml-cpu:
++    // SOFT_MAX_BACK reads words 0..1. SCALE is captured too as a defensive
++    // superset even though no in-tree supports_op reads its params). Params are
++    // left out for every other op because ggml does not zero op_params at tensor
++    // creation and unused words may hold stale data.
++    if (op->op == GGML_OP_UNARY || op->op == GGML_OP_GLU || op->op == GGML_OP_UPSCALE || op->op == GGML_OP_SCALE) {
++        sig->op_params[0] = op->op_params[0];
++        h = ggml_backend_sched_memo_step(h, sig->op_params[0]);
++    } else if (op->op == GGML_OP_SOFT_MAX_BACK) {
++        for (int i = 0; i < 4; i++) {
++            sig->op_params[i] = op->op_params[i];
++            h = ggml_backend_sched_memo_step(h, sig->op_params[i]);
++        }
++    }
++
++    int n_src = 0;
++    for (int i = 0; i < GGML_MAX_SRC; i++) {
++        const struct ggml_tensor * src = op->src[i];
++        if (src == NULL) {
++            continue;
++        }
++        if (n_src == GGML_SCHED_MEMO_MAX_SRCS) {
++            return false; // too many srcs for the memo: bypass
++        }
++        struct ggml_backend_sched_op_sig_src * s = &sig->src[n_src++];
++        s->type = src->type;
++        s->pad  = 0;
++        for (int j = 0; j < GGML_MAX_DIMS; j++) {
++            s->ne[j] = src->ne[j];
++            s->nb[j] = src->nb[j];
++        }
++        s->buft = src->buffer ? src->buffer->buft : NULL;
++        h = ggml_backend_sched_memo_step(h, (uint64_t) src->type);
++        h = ggml_backend_sched_memo_step(h, (uint64_t)(uintptr_t) s->buft);
++        for (int j = 0; j < GGML_MAX_DIMS; j++) {
++            h = ggml_backend_sched_memo_step(h, s->ne[j]);
++            h = ggml_backend_sched_memo_step(h, s->nb[j]);
++        }
++    }
++    sig->n_src = n_src;
++
++    *hash = h ? h : 1;
++    return true;
++}
++
++static inline bool ggml_backend_sched_op_sig_equal(const struct ggml_backend_sched_op_sig * a, const struct ggml_backend_sched_op_sig * b) {
++    return memcmp(a, b, sizeof(*a)) == 0;
++}
++
++// ggml_backend_supports_op() routed through the signature-keyed memo.
++static bool ggml_backend_sched_supports_op(ggml_backend_sched_t sched, int backend_id, const struct ggml_tensor * op) {
++    sched->memo_so_queries++;
++
++    if (!sched->memo_enabled) {
++        return ggml_backend_supports_op(sched->backends[backend_id], op);
++    }
++
++    struct ggml_backend_sched_op_sig sig;
++    uint32_t hash;
++    if (!ggml_backend_sched_op_sig_capture(&sig, &hash, op)) {
++        return ggml_backend_supports_op(sched->backends[backend_id], op);
++    }
++
++    struct ggml_backend_sched_so_memo_slot * base = &sched->so_memo[(hash & (sched->so_memo_n - 1)) * 2];
++    const uint32_t bit = 1u << backend_id;
++
++    for (int i = 0; i < 2; i++) {
++        struct ggml_backend_sched_so_memo_slot * slot = &base[i];
++        if (slot->in_use && slot->hash == hash && (slot->known & bit) &&
++            ggml_backend_sched_op_sig_equal(&slot->sig, &sig)) {
++            sched->memo_so_hits++;
++            return (slot->val & bit) != 0;
++        }
++    }
++
++    const bool val = ggml_backend_supports_op(sched->backends[backend_id], op);
++
++    // fill: prefer an unused slot, else the one already holding this signature,
++    // else the one that cannot answer this query, else the coldest one.
++    // "usable" = unused (fresh fill) or same signature (verdict merge).
++    struct ggml_backend_sched_so_memo_slot * slot = &base[0];
++    const bool usable0 = !slot->in_use || (slot->hash == hash && ggml_backend_sched_op_sig_equal(&slot->sig, &sig));
++    if (!usable0) {
++        const bool usable1 = !base[1].in_use || (base[1].hash == hash && ggml_backend_sched_op_sig_equal(&base[1].sig, &sig));
++        if (usable1) {
++            slot = &base[1];
++        } else if ((slot->known & bit) && !(base[1].known & bit)) {
++            slot = &base[1]; // base[0] can answer this query, base[1] cannot
++        } else if ((slot->known & bit) == (base[1].known & bit) && base[1].known < slot->known) {
++            slot = &base[1]; // neither (or both) can answer: evict the coldest
++        }
++    }
++
++    const bool same_sig = slot->in_use && slot->hash == hash && ggml_backend_sched_op_sig_equal(&slot->sig, &sig);
++    slot->in_use = true;
++    slot->hash   = hash;
++    if (!same_sig) {
++        // fresh signature: drop the verdicts cached for the previous one
++        slot->known = 0;
++        slot->val   = 0;
++        slot->sig   = sig;
++    }
++    slot->known |= bit;
++    slot->val    = (slot->val & ~bit) | (val ? bit : 0u);
++
++    return val;
++}
++
++// ggml_backend_supports_buft() routed through the (buft, backend)-keyed memo.
++static bool ggml_backend_sched_supports_buft(ggml_backend_sched_t sched, int backend_id, ggml_backend_buffer_type_t buft) {
++    sched->memo_sb_queries++;
++
++    if (!sched->memo_enabled) {
++        return ggml_backend_supports_buft(sched->backends[backend_id], buft);
++    }
++
++    struct ggml_backend_sched_sb_memo_slot * slot = &sched->sb_memo[ggml_backend_sched_memo_step(0, (uint64_t)(uintptr_t) buft ^ ((uint64_t)(uint32_t) backend_id << 32)) & (GGML_SCHED_MEMO_SB_SLOTS - 1)];
++
++    if (slot->buft == buft && slot->backend_id == backend_id) {
++        sched->memo_sb_hits++;
++        return slot->val;
++    }
++
++    const bool val = ggml_backend_supports_buft(sched->backends[backend_id], buft);
++    slot->buft      = buft;
++    slot->backend_id = backend_id;
++    slot->val       = val;
++
++    return val;
++}
++
+ // returns the priority of the backend, lower id is higher priority
+ static int ggml_backend_sched_backend_id(ggml_backend_sched_t sched, ggml_backend_t backend) {
+     for (int i = 0; i < sched->n_backends; i++) {
+@@ -850,8 +1090,8 @@ static int ggml_backend_sched_backend_from_buffer(ggml_backend_sched_t sched, co
+ 
+     // find highest prio backend that supports the buffer type and the op
+     for (int i = 0; i < sched->n_backends; i++) {
+-        if (ggml_backend_supports_buft(sched->backends[i], buffer->buft) &&
+-            ggml_backend_supports_op(sched->backends[i], op)) {
++        if (ggml_backend_sched_supports_buft(sched, i, buffer->buft) &&
++            ggml_backend_sched_supports_op(sched, i, op)) {
+             return i;
+         }
+     }
+@@ -918,7 +1158,7 @@ static int ggml_backend_sched_backend_id_from_cur(ggml_backend_sched_t sched, st
+             // check if a backend with higher prio wants to offload the op
+             if (sched->op_offload && src_backend_id == sched->n_backends - 1 && ggml_backend_buffer_is_host(src->buffer)) {
+                 for (int b = 0; b < src_backend_id; b++) {
+-                    if (ggml_backend_supports_op(sched->backends[b], tensor) && ggml_backend_offload_op(sched->backends[b], tensor)) {
++                    if (ggml_backend_sched_supports_op(sched, b, tensor) && ggml_backend_offload_op(sched->backends[b], tensor)) {
+                         SET_CAUSE(tensor, "1.off");
+                         return b;
+                     }
+@@ -1000,11 +1240,11 @@ static bool ggml_backend_sched_buffer_supported(ggml_backend_sched_t sched, stru
+         }
+     }
+ 
+-    return buft != NULL && ggml_backend_supports_buft(sched->backends[backend_id], buft);
++    return buft != NULL && ggml_backend_sched_supports_buft(sched, backend_id, buft);
+ }
+ 
+ static void ggml_backend_sched_set_if_supported(ggml_backend_sched_t sched, struct ggml_tensor * node, int cur_backend_id, int * node_backend_id) {
+-    if (ggml_backend_supports_op(sched->backends[cur_backend_id], node)) {
++    if (ggml_backend_sched_supports_op(sched, cur_backend_id, node)) {
+         *node_backend_id = cur_backend_id;
+         SET_CAUSE(node, "2.sup");
+     }
+@@ -1167,7 +1407,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
+             // unassigned node: find the backend with the most supported inputs
+             int n_supported_best = -1;
+             for (int b = 0; b < sched->n_backends; b++) {
+-                if (ggml_backend_supports_op(sched->backends[b], node)) {
++                if (ggml_backend_sched_supports_op(sched, b, node)) {
+                     int n_supported = 0;
+                     for (int j = 0; j < GGML_MAX_SRC; j++) {
+                         struct ggml_tensor * src = node->src[j];
+@@ -1188,7 +1428,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
+         } else {
+             // assigned node: upgrade to higher prio backend if possible
+             for (int b = 0; b < *node_backend_id; b++) {
+-                if (sched->bufts[b] == sched->bufts[*node_backend_id] && ggml_backend_supports_op(sched->backends[b], node)) {
++                if (sched->bufts[b] == sched->bufts[*node_backend_id] && ggml_backend_sched_supports_op(sched, b, node)) {
+                     bool supported = true;
+                     for (int j = 0; j < GGML_MAX_SRC; j++) {
+                         struct ggml_tensor * src = node->src[j];
+@@ -1788,6 +2028,36 @@ ggml_backend_sched_t ggml_backend_sched_new(
+     sched->galloc = ggml_gallocr_new_n(sched->bufts, n_backends);
+     sched->op_offload = op_offload;
+ 
++    // A5-C3 (W6-9): support-verdict memos - see the comment above the memo structs.
++    // The memo outlives sched resets on purpose: recurring graphs reuse the verdicts
++    // across evals. GGML_SCHED_ASSIGN_MEMO=0 disables them.
++    const char * GGML_SCHED_ASSIGN_MEMO = getenv("GGML_SCHED_ASSIGN_MEMO");
++    sched->memo_enabled = GGML_SCHED_ASSIGN_MEMO ? atoi(GGML_SCHED_ASSIGN_MEMO) != 0 : true;
++
++    if (sched->memo_enabled) {
++        // one set per graph node, capped (recurring graphs add a handful of shape
++        // variants per node), 2-way set-associative, power-of-two sets. calloc'd
++        // pages are touched lazily, so the cap costs address space, not RSS.
++        size_t so_memo_n = 1;
++        while (so_memo_n < graph_size && so_memo_n < 16384) {
++            so_memo_n <<= 1;
++        }
++
++        sched->so_memo = (struct ggml_backend_sched_so_memo_slot *) calloc(2 * so_memo_n, sizeof(struct ggml_backend_sched_so_memo_slot));
++        sched->so_memo_n = so_memo_n;
++        sched->sb_memo = (struct ggml_backend_sched_sb_memo_slot *) calloc(GGML_SCHED_MEMO_SB_SLOTS, sizeof(struct ggml_backend_sched_sb_memo_slot));
++
++        if (sched->so_memo == NULL || sched->sb_memo == NULL) {
++            // allocation failure must never change behavior
++            free(sched->so_memo);
++            free(sched->sb_memo);
++            sched->so_memo = NULL;
++            sched->sb_memo = NULL;
++            sched->so_memo_n = 0;
++            sched->memo_enabled = false;
++        }
++    }
++
+     ggml_backend_sched_reset(sched);
+ 
+     return sched;
+@@ -1805,6 +2075,14 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
+     ggml_gallocr_free(sched->galloc);
+     ggml_free(sched->ctx);
+     ggml_hash_set_free(&sched->hash_set);
++    if (sched->debug > 0) {
++        GGML_LOG_DEBUG("%s: support-memo (A5-C3): enabled=%d supports_op queries=%llu hits=%llu supports_buft queries=%llu hits=%llu\n",
++            __func__, sched->memo_enabled,
++            (unsigned long long) sched->memo_so_queries, (unsigned long long) sched->memo_so_hits,
++            (unsigned long long) sched->memo_sb_queries, (unsigned long long) sched->memo_sb_hits);
++    }
++    free(sched->so_memo);
++    free(sched->sb_memo);
+     free(sched->splits);
+     free(sched->hv_tensor_backend_ids);
+     free(sched->hv_tensor_copies);
+-- 
+2.53.0
+

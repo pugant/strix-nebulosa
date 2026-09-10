@@ -1,0 +1,281 @@
+From 416025a76492e12308dad58b84d921a77eb758f6 Mon Sep 17 00:00:00 2001
+From: pugant <pugant@localhost>
+Date: Thu, 10 Sep 2026 15:18:01 +0200
+Subject: [PATCH 04/19] save-stream-CRC: fold the persist CRC while writing, no
+ tmp read-back [w6-7]
+
+W6-7 (A3-3). The persist/park save used to compute the sidecar CRC by
+re-reading the whole tmp file with llama_persist_crc32_file right after
+fdatasync + POSIX_FADV_DONTNEED had dropped it from the page cache - a
+full cold read of 0.9-2.3 GB per save purely to hash bytes the process
+had just written. state_seq_save_file() now takes an optional crc_out:
+the CRC-32 is folded over the exact bytes handed to write_raw (header
+and token section first, then the state section through the io writer's
+single write() funnel), and the new public llama_state_seq_save_file_crc()
+exposes it. save_disk passes the sidecar CRC sink for both components and
+drops the post-fsync read-back; the size_exact stat still guards the
+on-disk length, so an unreadable/short/long file still fails the save.
+
+Gate N: test-state-io-buffer proves the stream-CRC save produces a file
+byte-identical to the plain save (and to the pre-change golden artifacts)
+and that the folded CRC equals a whole-file read-back CRC; crc_out == NULL
+keeps the plain-save behavior exactly.
+
+Note: bytes that corrupt after a successful write+fsync are no longer
+detected at save time (the read-back pass doubled as a read verification);
+the restore-time CRC still catches them before any context mutation.
+
+Co-Authored-By: GLM by z.ai
+---
+ include/llama.h                | 14 +++++++++
+ src/llama-context.cpp          | 57 +++++++++++++++++++++++++++++++---
+ src/llama-context.h            |  3 +-
+ tests/test-state-io-buffer.cpp | 23 ++++++++++++++
+ tools/server/server-task.cpp   | 26 +++++++---------
+ 5 files changed, 102 insertions(+), 21 deletions(-)
+
+diff --git a/include/llama.h b/include/llama.h
+index ecad1d4a9..f32b4b4dd 100644
+--- a/include/llama.h
++++ b/include/llama.h
+@@ -907,6 +907,20 @@ extern "C" {
+                const llama_token * tokens,
+                           size_t   n_token_count);
+ 
++    // W6-7 (A3-3): like llama_state_seq_save_file, but the CRC-32 of the
++    // written bytes is folded while the file is being written (crc_out is
++    // always the CRC of every byte that reached the file, header and token
++    // section included) instead of requiring a whole-file read-back pass.
++    // The produced file is byte-identical to llama_state_seq_save_file's.
++    // crc_out may be NULL, which makes this exactly the plain save.
++    LLAMA_API size_t llama_state_seq_save_file_crc(
++            struct llama_context * ctx,
++                      const char * filepath,
++                    llama_seq_id   seq_id,
++               const llama_token * tokens,
++                          size_t   n_token_count,
++                      uint32_t *   crc_out);
++
+     LLAMA_API size_t llama_state_seq_load_file(
+             struct llama_context * ctx,
+                       const char * filepath,
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index c1fa0d42f..90ff3f86f 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -10,6 +10,7 @@
+ #include "llama-mmap.h"
+ #include "llama-model.h"
+ #include "llama-ext.h"
++#include "llama-persist-meta.h"
+ #include "llama.h"
+ 
+ #include <cinttypes>
+@@ -2749,10 +2750,17 @@ private:
+ 
+ class llama_io_write_file : public llama_io_write_i {
+ public:
+-    llama_io_write_file(llama_file * f) : file(f) {}
++    // W6-7 (A3-3): optional CRC sink - every byte that reaches the file is
++    // folded here (write() is the single funnel: write_tensor stages into the
++    // temp buffer and goes through it), so the CRC is over exactly the bytes
++    // on disk without a read-back pass
++    llama_io_write_file(llama_file * f, llama_persist_crc32_folder * crc = nullptr) : file(f), crc(crc) {}
+ 
+     void write(const void * src, size_t size) override {
+         file->write_raw(src, size);
++        if (crc != nullptr) {
++            crc->update(src, size);
++        }
+         size_written += size;
+     }
+ 
+@@ -2768,6 +2776,7 @@ public:
+ 
+ private:
+     llama_file * file;
++    llama_persist_crc32_folder * crc = nullptr;
+     size_t size_written = 0;
+     std::vector<uint8_t> temp_buffer;
+ };
+@@ -3390,23 +3399,50 @@ size_t llama_context::state_seq_load_file(llama_seq_id seq_id, const char * file
+     return file.tell();
+ }
+ 
+-size_t llama_context::state_seq_save_file(llama_seq_id seq_id, const char * filepath, const llama_token * tokens, size_t n_token_count) {
++size_t llama_context::state_seq_save_file(llama_seq_id seq_id, const char * filepath, const llama_token * tokens, size_t n_token_count, uint32_t * crc_out) {
++    // W6-7 (A3-3): when crc_out is set, the CRC-32 is folded while the bytes
++    // are written - the io writer covers the state section, and the header +
++    // token bytes written directly below are folded explicitly, so the final
++    // value is the CRC of the whole file (identical to a read-back pass)
++    llama_persist_crc32_folder crc;
++
+     llama_file file(filepath, "wb");
+ 
+-    file.write_u32(LLAMA_STATE_SEQ_MAGIC);
+-    file.write_u32(LLAMA_STATE_SEQ_VERSION);
++    const uint32_t magic   = LLAMA_STATE_SEQ_MAGIC;
++    const uint32_t version = LLAMA_STATE_SEQ_VERSION;
++
++    file.write_u32(magic);
++    file.write_u32(version);
+ 
+     // save the prompt
+     file.write_u32((uint32_t) n_token_count);
+     file.write_raw(tokens, sizeof(llama_token) * n_token_count);
+ 
++    // the CRC fold absorbs the bytes in STREAM ORDER: header + tokens first
++    // (written just above), then the state section as the io writer emits it
++    if (crc_out != nullptr) {
++        crc.update(&magic,   sizeof(magic));
++        crc.update(&version, sizeof(version));
++
++        const uint32_t n_token_count_u32 = (uint32_t) n_token_count;
++        crc.update(&n_token_count_u32, sizeof(n_token_count_u32));
++
++        if (n_token_count > 0) {
++            crc.update(tokens, sizeof(llama_token) * n_token_count);
++        }
++    }
++
+     // save the context state using stream saving
+-    llama_io_write_file io(&file);
++    llama_io_write_file io(&file, crc_out != nullptr ? &crc : nullptr);
+     state_seq_write_data(io, seq_id, 0);
+ 
+     const size_t res = file.tell();
+     GGML_ASSERT(res == sizeof(uint32_t) * 3 + sizeof(llama_token) * n_token_count + io.n_bytes());
+ 
++    if (crc_out != nullptr) {
++        *crc_out = crc.finalize();
++    }
++
+     return res;
+ }
+ 
+@@ -4461,6 +4497,17 @@ size_t llama_state_seq_save_file(llama_context * ctx, const char * filepath, lla
+     }
+ }
+ 
++size_t llama_state_seq_save_file_crc(llama_context * ctx, const char * filepath, llama_seq_id seq_id, const llama_token * tokens, size_t n_token_count, uint32_t * crc_out) {
++    ctx->synchronize();
++
++    try {
++        return ctx->state_seq_save_file(seq_id, filepath, tokens, n_token_count, crc_out);
++    } catch (const std::exception & err) {
++        LLAMA_LOG_ERROR("%s: error saving sequence state file: %s\n", __func__, err.what());
++        return 0;
++    }
++}
++
+ size_t llama_state_seq_load_file(llama_context * ctx, const char * filepath, llama_seq_id dest_seq_id, llama_token * tokens_out, size_t n_token_capacity, size_t * n_token_count_out) {
+     ctx->synchronize();
+ 
+diff --git a/src/llama-context.h b/src/llama-context.h
+index 791eca893..14db242ae 100644
+--- a/src/llama-context.h
++++ b/src/llama-context.h
+@@ -192,7 +192,8 @@ struct llama_context {
+           llama_seq_id   seq_id,
+             const char * filepath,
+      const llama_token * tokens,
+-                size_t   n_token_count);
++                size_t   n_token_count,
++          uint32_t *   crc_out = nullptr); // W6-7 (A3-3): fold the CRC while writing
+ 
+     //
+     // perf
+diff --git a/tests/test-state-io-buffer.cpp b/tests/test-state-io-buffer.cpp
+index 71e57e7d9..d5c8b438d 100644
+--- a/tests/test-state-io-buffer.cpp
++++ b/tests/test-state-io-buffer.cpp
+@@ -313,6 +313,29 @@ static void run_arch(llm_arch arch, const char * arch_name, const std::string &
+     const std::string path_blob = dir + "/payload-" + arch_name + ".bin";
+     CHECK(write_file(path_blob, blob_a.data(), blob_a.size()), "payload artifact written");
+ 
++    // 5b. [W6-7] save with the in-stream CRC: the produced file must be
++    //     byte-identical to the plain save and the folded CRC must equal the
++    //     CRC a whole-file read-back computes (gate N: sidecar equivalence)
++    {
++        uint32_t crc_stream = 0;
++        const std::string path_state3 = dir + "/state-" + arch_name + "-crcsave.bin";
++        const size_t n3 = llama_state_seq_save_file_crc(ctx.get(), path_state3.c_str(), 0,
++                tokens.data(), tokens.size(), &crc_stream);
++        CHECK(n3 == n_saved, "save_file_crc produced the same byte count");
++        CHECK(files_equal(path_state, path_state3), "save_file_crc file bytes identical to the plain save (gate N)");
++
++        uint32_t crc_file = 0;
++        CHECK(llama_persist_crc32_file(path_state3.c_str(), (uint64_t) n3, &crc_file), "file read-back CRC computable");
++        CHECK(crc_stream == crc_file, "in-stream CRC == read-back CRC (gate N)");
++        CHECK(crc_stream != 0, "crc is nonzero");
++
++        // crc_out == nullptr must behave exactly like the plain save
++        const std::string path_state4 = dir + "/state-" + arch_name + "-nullcrc.bin";
++        const size_t n4 = llama_state_seq_save_file_crc(ctx.get(), path_state4.c_str(), 0,
++                tokens.data(), tokens.size(), nullptr);
++        CHECK(n4 == n_saved && files_equal(path_state, path_state4), "save_file_crc with NULL crc_out is the plain save");
++    }
++
+     // 6. [W6-5] buffer restore: the same payload bytes consumed from a host
+     //    buffer must produce the identical restored state (gate N: the
+     //    load_buffer path is byte-equivalent to the file path)
+diff --git a/tools/server/server-task.cpp b/tools/server/server-task.cpp
+index a84dbf69d..48d305e2a 100644
+--- a/tools/server/server-task.cpp
++++ b/tools/server/server-task.cpp
+@@ -3276,12 +3276,17 @@ bool server_prompt_cache::save_disk(
+ 
+     // T23: CRC of the persisted bytes, computed on the durable tmp file BEFORE
+     // the rename; an unreadable/short/long file right after writing it means
+-    // the storage is broken - a save failure like any other
++    // the storage is broken - a save failure like any other.
++    // W6-7 (A3-3): the CRC is now folded DURING the write (stream CRC over the
++    // exact bytes handed to write_raw, header included) instead of re-reading
++    // the whole tmp file after fdatasync+DONTNEED dropped it from the page
++    // cache - the size_exact stat still guards the on-disk length.
+     uint32_t crc_main = 0;
+     uint32_t crc_drft = 0;
+ 
+-    const size_t n_main = llama_state_seq_save_file(
+-        ctx_main, path_main_tmp_utf8.c_str(), id_slot, tokens.data(), tokens.size());
++    const size_t n_main = llama_state_seq_save_file_crc(
++        ctx_main, path_main_tmp_utf8.c_str(), id_slot, tokens.data(), tokens.size(),
++        persist_on ? &crc_main : nullptr);
+     size_t actual_main = 0;
+     if (n_main == 0 ||
+         !server_prompt_cache_disk_size_exact(path_main_tmp_utf8, n_main, &actual_main) ||
+@@ -3290,16 +3295,12 @@ bool server_prompt_cache::save_disk(
+                 entry_id, path_main_tmp_utf8.c_str());
+         return fail_io("target-save", path_main_tmp_utf8);
+     }
+-    if (persist_on && !llama_persist_crc32_file(path_main_tmp_utf8.c_str(), (uint64_t) n_main, &crc_main)) {
+-        SRV_ERR("persist crc failed: entry=%" PRIu64 " component=target bytes=%zu path=%s\n",
+-                entry_id, n_main, path_main_tmp_utf8.c_str());
+-        return fail_io("target-crc", path_main_tmp_utf8);
+-    }
+ 
+     size_t n_drft = 0;
+     if (ctx_drft) {
+-        n_drft = llama_state_seq_save_file(
+-            ctx_drft, path_drft_tmp_utf8.c_str(), id_slot, tokens.data(), tokens.size());
++        n_drft = llama_state_seq_save_file_crc(
++            ctx_drft, path_drft_tmp_utf8.c_str(), id_slot, tokens.data(), tokens.size(),
++            persist_on ? &crc_drft : nullptr);
+         size_t actual_drft = 0;
+         if (n_drft == 0 ||
+             !server_prompt_cache_disk_size_exact(path_drft_tmp_utf8, n_drft, &actual_drft) ||
+@@ -3308,11 +3309,6 @@ bool server_prompt_cache::save_disk(
+                     entry_id, path_drft_tmp_utf8.c_str());
+             return fail_io("draft-save", path_drft_tmp_utf8);
+         }
+-        if (persist_on && !llama_persist_crc32_file(path_drft_tmp_utf8.c_str(), (uint64_t) n_drft, &crc_drft)) {
+-            SRV_ERR("persist crc failed: entry=%" PRIu64 " component=draft bytes=%zu path=%s\n",
+-                    entry_id, n_drft, path_drft_tmp_utf8.c_str());
+-            return fail_io("draft-crc", path_drft_tmp_utf8);
+-        }
+     }
+ 
+     const size_t actual_total = n_main + n_drft;
+-- 
+2.53.0
+

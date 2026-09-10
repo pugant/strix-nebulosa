@@ -1,0 +1,1426 @@
+From 7e903c90192679a8881d1a5ddf6d5be4d5478356 Mon Sep 17 00:00:00 2001
+From: pugant <pugant@localhost>
+Date: Thu, 10 Sep 2026 15:14:58 +0200
+Subject: [PATCH 03/19] restore-read-once + meta-bulk/bitset: single cold read
+ for persist/park restores [w6-5]
+
+W6-5 (A3-1 var.B + A3-4). The persist/park restore used to read the whole
+entry payload from disk TWICE: llama_persist_crc32_file for the sidecar
+verify (which ends with POSIX_FADV_DONTNEED), then the load pass. load_disk
+now streams each component into a host buffer exactly once (CRC folded in
+the same pass), verifies both components against the sidecar CRC before
+either context is mutated, and restores from RAM via the new
+llama_state_seq_load_buffer() - the buffer IO defers backend tensor_set
+calls exactly like the proven RAM-restore path. On allocation failure the
+two-pass disk path serves the restore unchanged.
+
+A3-4: kv/recurrent state meta now bulk-reads the fixed-size single-seq
+record block (one io.read instead of 3-4 per cell) and writes the per-cell
+head as one block (seq_ids vector hoisted out of the loop); seq bitset
+iteration (seq_pos_rm/add, seq_get) visits only set bits via
+_Find_first/_Find_next on libstdc++ (plain scan fallback elsewhere).
+Incremental CRC exposed as llama_persist_crc32_folder (pimpl over the
+wave-5 crc32_stream).
+
+Gate N: test-state-io-buffer (tiny in-memory model, CPU-only) proves the
+buffer restore is bit-identical to the file restore and the on-disk format
+unchanged - artifacts byte-identical to the pre-change golden run
+(logs/wave6/w6a3-golden-baseline.sha256); test-persist-meta covers the
+folder equivalence; new test-kv-cells pins the bitset bookkeeping
+(duplicate positions, rm/keep/cp/set transitions).
+
+Gauges unchanged: persist_last_restore_ms / park_restore_crc_ms keep their
+meaning (crc_ms = read+verify pass, load_ms = restore), read_path=host-buffer
+added to the load marker.
+
+Co-Authored-By: GLM by z.ai
+---
+ include/llama.h                |  16 ++
+ src/llama-context.cpp          |  64 ++++++
+ src/llama-context.h            |  10 +
+ src/llama-kv-cache.cpp         |  73 ++++--
+ src/llama-kv-cells.h           |  46 +++-
+ src/llama-memory-recurrent.cpp |  26 ++-
+ src/llama-persist-meta.cpp     |  40 ++++
+ src/llama-persist-meta.h       |  26 +++
+ tests/CMakeLists.txt           |   7 +
+ tests/test-kv-cells.cpp        | 159 ++++++++++++++
+ tests/test-persist-meta.cpp    |  71 ++++++
+ tests/test-state-io-buffer.cpp | 390 +++++++++++++++++++++++++++++++++
+ tools/server/server-task.cpp   | 144 ++++++++++--
+ 13 files changed, 1018 insertions(+), 54 deletions(-)
+ create mode 100644 tests/test-kv-cells.cpp
+ create mode 100644 tests/test-state-io-buffer.cpp
+
+diff --git a/include/llama.h b/include/llama.h
+index 1a5499f30..ecad1d4a9 100644
+--- a/include/llama.h
++++ b/include/llama.h
+@@ -915,6 +915,22 @@ extern "C" {
+                           size_t   n_token_capacity,
+                           size_t * n_token_count_out);
+ 
++    // W6-5 (A3-1 var.B): like llama_state_seq_load_file, but the sequence
++    // state payload - the exact bytes llama_state_seq_save_file wrote - is
++    // consumed from a host memory buffer instead of a file, so a caller that
++    // already holds the payload in RAM (single disk read + CRC verify) can
++    // restore without reading the file again. `data` stays owned by the caller
++    // and must remain valid for the duration of the call. Returns the number
++    // of bytes consumed (0 on failure, like the file variant).
++    LLAMA_API size_t llama_state_seq_load_buffer(
++            struct llama_context * ctx,
++                    const uint8_t * data,
++                           size_t   size,
++                     llama_seq_id   dest_seq_id,
++                      llama_token * tokens_out,
++                           size_t   n_token_capacity,
++                           size_t * n_token_count_out);
++
+ #define LLAMA_STATE_SEQ_FLAGS_NONE 0
+ 
+ // for backwards-compat
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index a6d15dbf2..c1fa0d42f 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -3277,6 +3277,59 @@ bool llama_context::state_load_file(const char * filepath, llama_token * tokens_
+     return true;
+ }
+ 
++size_t llama_context::state_seq_load_buffer(llama_seq_id seq_id, const uint8_t * data, size_t size, llama_token * tokens_out, size_t n_token_capacity, size_t * n_token_count_out) {
++    // W6-5 (A3-1 var.B): mirror of state_seq_load_file over a host buffer that
++    // already holds the saved payload - the buffer IO defers the backend
++    // tensor_set calls to destruction exactly like the proven RAM-restore path
++    // (state_seq_set_data), so nothing here changes the restore semantics
++    llama_io_read_host io(data, size);
++
++    // version checks
++    {
++        uint32_t magic   = 0;
++        uint32_t version = 0;
++
++        io.read(&magic,   sizeof(magic));
++        io.read(&version, sizeof(version));
++
++        if (magic != LLAMA_STATE_SEQ_MAGIC || version != LLAMA_STATE_SEQ_VERSION) {
++            LLAMA_LOG_ERROR("%s: unknown (magic, version) for sequence state buffer: %08x, %08x\n", __func__, magic, version);
++            return 0;
++        }
++    }
++
++    // load the prompt
++    {
++        uint32_t n_token_count = 0;
++
++        io.read(&n_token_count, sizeof(n_token_count));
++
++        if (n_token_count > n_token_capacity) {
++            LLAMA_LOG_ERROR("%s: token count in sequence state buffer exceeded capacity! %u > %zu\n", __func__, n_token_count, n_token_capacity);
++            return 0;
++        }
++
++        io.read(tokens_out, sizeof(llama_token) * n_token_count);
++        *n_token_count_out = n_token_count;
++    }
++
++    // restore the context state
++    {
++        // note: state_seq_read_data returns io.n_bytes(), which here includes
++        // the header + token bytes read above (the file variant constructs its
++        // io after the header, so its nread covers the state section only) -
++        // the total must cover the whole buffer for a valid payload
++        const size_t nread = state_seq_read_data(io, seq_id, 0);
++        if (!nread) {
++            LLAMA_LOG_ERROR("%s: failed to restore sequence state\n", __func__);
++            return 0;
++        }
++        GGML_ASSERT(nread == io.n_bytes());
++    }
++
++    return io.n_bytes();
++}
++
+ bool llama_context::state_save_file(const char * filepath, const llama_token * tokens, size_t n_token_count) {
+     llama_file file(filepath, "wb");
+ 
+@@ -4419,6 +4472,17 @@ size_t llama_state_seq_load_file(llama_context * ctx, const char * filepath, lla
+     }
+ }
+ 
++size_t llama_state_seq_load_buffer(llama_context * ctx, const uint8_t * data, size_t size, llama_seq_id dest_seq_id, llama_token * tokens_out, size_t n_token_capacity, size_t * n_token_count_out) {
++    ctx->synchronize();
++
++    try {
++        return ctx->state_seq_load_buffer(dest_seq_id, data, size, tokens_out, n_token_capacity, n_token_count_out);
++    } catch (const std::exception & err) {
++        LLAMA_LOG_ERROR("%s: error loading sequence state buffer: %s\n", __func__, err.what());
++        return 0;
++    }
++}
++
+ ///
+ 
+ int32_t llama_encode(
+diff --git a/src/llama-context.h b/src/llama-context.h
+index 87fdb0294..791eca893 100644
+--- a/src/llama-context.h
++++ b/src/llama-context.h
+@@ -178,6 +178,16 @@ struct llama_context {
+                 size_t   n_token_capacity,
+                 size_t * n_token_count_out);
+ 
++    // W6-5 (A3-1 var.B): state_seq_load_file over a host buffer holding the
++    // exact bytes a state_seq_save_file produced (see llama.h)
++    size_t state_seq_load_buffer(
++          llama_seq_id     seq_id,
++          const uint8_t *  data,
++                size_t     size,
++           llama_token *   tokens_out,
++                size_t     n_token_capacity,
++                size_t *   n_token_count_out);
++
+     size_t state_seq_save_file(
+           llama_seq_id   seq_id,
+             const char * filepath,
+diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
+index 8b620fe95..4d45ae607 100644
+--- a/src/llama-kv-cache.cpp
++++ b/src/llama-kv-cache.cpp
+@@ -2190,9 +2190,21 @@ const slot_info_vec_t *   sinfos_in) {
+ void llama_kv_cache::state_write_meta(llama_io_write_i & io, const cell_ranges_t & cr, llama_seq_id seq_id) const {
+     const auto & cells = v_cells[cr.strm];
+ 
++    // W6-5 (A3-4): the per-cell record head {pos, n_seq_id[, ext]} is
++    // contiguous in the stream - stage it once and emit a single io.write
++    // instead of two/three per cell, and hoist the seq_ids vector out of the
++    // loop (one allocation per save instead of one per cell). The byte
++    // sequence is identical to the per-field writes it replaces.
++    const bool has_ext = hparams.n_pos_per_embd() > 1;
++
++    std::vector<llama_seq_id> seq_ids;
++    seq_ids.reserve(n_seq_max);
++
++    uint8_t head[sizeof(llama_pos) + sizeof(uint32_t) + sizeof(llama_kv_cell_ext)];
++
+     for (const auto & range : cr.data) {
+         for (uint32_t i = range.first; i < range.second; ++i) {
+-            std::vector<llama_seq_id> seq_ids;
++            seq_ids.clear();
+ 
+             for (llama_seq_id cur = 0; cur < (int) n_seq_max; ++cur) {
+                 if (cur == seq_id || seq_id == -1) {
+@@ -2205,16 +2217,18 @@ void llama_kv_cache::state_write_meta(llama_io_write_i & io, const cell_ranges_t
+             const llama_pos pos     = cells.pos_get(i);
+             const uint32_t n_seq_id = seq_ids.size();
+ 
+-            io.write(&pos,      sizeof(pos));
+-            io.write(&n_seq_id, sizeof(n_seq_id));
++            memcpy(head + 0, &pos,      sizeof(pos));
++            memcpy(head + sizeof(pos), &n_seq_id, sizeof(n_seq_id));
+ 
+-            if (hparams.n_pos_per_embd() > 1) {
++            if (has_ext) {
+                 const llama_kv_cell_ext ext = cells.ext_get(i);
+-                io.write(&ext, sizeof(ext));
++                memcpy(head + sizeof(pos) + sizeof(n_seq_id), &ext, sizeof(ext));
+             }
+ 
+-            for (const auto & seq_id : seq_ids) {
+-                io.write(&seq_id, sizeof(seq_id));
++            io.write(head, has_ext ? sizeof(head) : sizeof(pos) + sizeof(n_seq_id));
++
++            if (!seq_ids.empty()) {
++                io.write(seq_ids.data(), seq_ids.size() * sizeof(llama_seq_id));
+             }
+         }
+     }
+@@ -2333,31 +2347,42 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
+ 
+         ubatch.seq_id_unq[0] = dest_seq_id;
+ 
++        // W6-5 (A3-4): a single-sequence record is FIXED-SIZE - {pos,
++        // n_seq_id, [ext], seq_id} with n_seq_id == 1 (validated below, the
++        // only other value is an error) - so the whole meta block is read with
++        // ONE io.read and parsed from memory instead of 3-4 reads per cell.
++        // Field order and byte layout are unchanged.
++        const bool has_ext = hparams.n_pos_per_embd() > 1;
++        const size_t rec_size = sizeof(llama_pos) + sizeof(uint32_t)
++            + (has_ext ? sizeof(llama_kv_cell_ext) : 0) + sizeof(llama_seq_id);
++
++        std::vector<uint8_t> meta((size_t) cell_count * rec_size);
++        io.read(meta.data(), meta.size());
++
+         for (uint32_t i = 0; i < cell_count; ++i) {
++            const uint8_t * rec = meta.data() + (size_t) i * rec_size;
++
+             llama_pos pos;
+             uint32_t n_seq_id;
+ 
+-            io.read(&pos,      sizeof(pos));
+-            io.read(&n_seq_id, sizeof(n_seq_id));
++            memcpy(&pos,      rec, sizeof(pos));
++            memcpy(&n_seq_id, rec + sizeof(pos), sizeof(n_seq_id));
+ 
+             if (n_seq_id != 1) {
+                 LLAMA_LOG_ERROR("%s: invalid seq_id-agnostic kv cell\n", __func__);
+                 return false;
+             }
+ 
+-            if (hparams.n_pos_per_embd() > 1) {
++            if (has_ext) {
+                 llama_kv_cell_ext ext;
+-                io.read(&ext, sizeof(ext));
++                memcpy(&ext, rec + sizeof(pos) + sizeof(n_seq_id), sizeof(ext));
+ 
+                 ubatch.pos[i + ubatch.n_tokens]   = ext.y;
+                 ubatch.pos[i + ubatch.n_tokens*2] = ext.x;
+             }
+ 
+-            // read the sequence id, but directly discard it - we will use dest_seq_id instead
+-            {
+-                llama_seq_id seq_id;
+-                io.read(&seq_id, sizeof(seq_id));
+-            }
++            // the record's sequence id is read but directly discarded - we use
++            // dest_seq_id instead
+ 
+             ubatch.pos[i]      = pos;
+             ubatch.n_seq_id[i] = n_seq_id;
+@@ -2426,18 +2451,26 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
+             return false;
+         }
+ 
++        // W6-5 (A3-4): the fixed-size record head {pos, n_seq_id[, ext]} is
++        // read with one io.read per cell instead of 2-3; the seq_id tail stays
++        // per-value (its length is data-dependent and each value is validated
++        // as before)
++        const bool has_ext_whole = hparams.n_pos_per_embd() > 1;
++        uint8_t head_whole[sizeof(llama_pos) + sizeof(uint32_t) + sizeof(llama_kv_cell_ext)];
++
+         for (uint32_t i = 0; i < cell_count; ++i) {
+             llama_pos pos;
+             uint32_t  n_seq_id;
+ 
+-            io.read(&pos,      sizeof(pos));
+-            io.read(&n_seq_id, sizeof(n_seq_id));
++            io.read(head_whole, has_ext_whole ? sizeof(head_whole) : sizeof(pos) + sizeof(n_seq_id));
++            memcpy(&pos,      head_whole, sizeof(pos));
++            memcpy(&n_seq_id, head_whole + sizeof(pos), sizeof(n_seq_id));
+ 
+             cells.pos_set(i, pos);
+ 
+-            if (hparams.n_pos_per_embd() > 1) {
++            if (has_ext_whole) {
+                 llama_kv_cell_ext ext;
+-                io.read(&ext, sizeof(ext));
++                memcpy(&ext, head_whole + sizeof(pos) + sizeof(n_seq_id), sizeof(ext));
+                 cells.ext_set(i, ext);
+             }
+ 
+diff --git a/src/llama-kv-cells.h b/src/llama-kv-cells.h
+index a165c2d35..e38ee1d01 100644
+--- a/src/llama-kv-cells.h
++++ b/src/llama-kv-cells.h
+@@ -30,6 +30,26 @@ struct llama_kv_cell_ext {
+     }
+ };
+ 
++// W6-5 (A3-4): visit ONLY the set bits of a per-cell sequence bitset. A cell
++// in the server regime holds 1 of the LLAMA_MAX_SEQ = 256 bits, so a plain
++// scan tests 256 bits to find it; libstdc++ exposes _Find_first/_Find_next
++// for exactly this, and other standard libraries keep the plain scan (same
++// visit order - ascending - and same semantics either way)
++template <typename F>
++inline void llama_kv_cells_seq_foreach(const std::bitset<LLAMA_MAX_SEQ> & bs, const F & fn) {
++#if defined(__GLIBCXX__)
++    for (size_t s = bs._Find_first(); s < LLAMA_MAX_SEQ; s = bs._Find_next(s)) {
++        fn((llama_seq_id) s);
++    }
++#else
++    for (size_t s = 0; s < LLAMA_MAX_SEQ; s++) {
++        if (bs[s]) {
++            fn((llama_seq_id) s);
++        }
++    }
++#endif
++}
++
+ // meta information about KV cells that can be part of multiple sequences at the same time
+ // TODO: add unit tests
+ class llama_kv_cells {
+@@ -343,6 +363,13 @@ public:
+     llama_seq_id seq_get(uint32_t i) const {
+         assert(seq[i].count() == 1);
+ 
++#if defined(__GLIBCXX__)
++        // A3-4: first set bit directly instead of scanning up to 256 bits
++        // (_Find_first answers LLAMA_MAX_SEQ for an empty bitset - keep the
++        // historical -1 in that (assert-guarded, impossible) case)
++        const size_t s = seq[i]._Find_first();
++        return s < LLAMA_MAX_SEQ ? (llama_seq_id) s : -1;
++#else
+         for (int s = 0; s < LLAMA_MAX_SEQ; ++s) {
+             if (seq[i].test(s)) {
+                 return s;
+@@ -350,6 +377,7 @@ public:
+         }
+ 
+         return -1;
++#endif
+     }
+ 
+     // the minimum position of sequence seq_id currently present in any of the cells
+@@ -537,21 +565,19 @@ private:
+     }
+ 
+     // remove cell i
++    // A3-4: only the set bits are visited (see llama_kv_cells_seq_foreach) -
++    // a single-sequence cell no longer pays 256 bit tests per operation
+     void seq_pos_rm(uint32_t i) {
+-        for (int s = 0; s < LLAMA_MAX_SEQ; ++s) {
+-            if (seq[i].test(s)) {
+-                seq_pos_dec(s, pos[i]);
+-            }
+-        }
++        llama_kv_cells_seq_foreach(seq[i], [&](llama_seq_id s) {
++            seq_pos_dec(s, pos[i]);
++        });
+     }
+ 
+     // add cell i
+     void seq_pos_add(uint32_t i) {
+-        for (int s = 0; s < LLAMA_MAX_SEQ; ++s) {
+-            if (seq[i].test(s)) {
+-                seq_pos_inc(s, pos[i]);
+-            }
+-        }
++        llama_kv_cells_seq_foreach(seq[i], [&](llama_seq_id s) {
++            seq_pos_inc(s, pos[i]);
++        });
+     }
+ };
+ 
+diff --git a/src/llama-memory-recurrent.cpp b/src/llama-memory-recurrent.cpp
+index 45d9f68dc..555b8cac2 100644
+--- a/src/llama-memory-recurrent.cpp
++++ b/src/llama-memory-recurrent.cpp
+@@ -814,14 +814,18 @@ void llama_memory_recurrent::state_read(llama_io_read_i & io, llama_seq_id seq_i
+ }
+ 
+ void llama_memory_recurrent::state_write_meta(llama_io_write_i & io, const std::vector<std::pair<uint32_t, uint32_t>> & cell_ranges, llama_seq_id seq_id) const {
++    // W6-5 (A3-4): {pos, n_seq_id} are contiguous in the stream - one
++    // io.write per cell instead of two; byte sequence unchanged
+     for (const auto & range : cell_ranges) {
+         for (uint32_t i = range.first; i < range.second; ++i) {
+             const auto & cell = cells[i];
+             const llama_pos pos      = cell.pos;
+             const uint32_t  n_seq_id = seq_id == -1 ? cell.seq_id.size() : 0;
+ 
+-            io.write(&pos,      sizeof(pos));
+-            io.write(&n_seq_id, sizeof(n_seq_id));
++            uint8_t head[sizeof(llama_pos) + sizeof(uint32_t)];
++            memcpy(head + 0, &pos, sizeof(pos));
++            memcpy(head + sizeof(pos), &n_seq_id, sizeof(n_seq_id));
++            io.write(head, sizeof(head));
+ 
+             if (n_seq_id) {
+                 for (auto seq_id : cell.seq_id) {
+@@ -973,12 +977,18 @@ bool llama_memory_recurrent::state_read_meta(llama_io_read_i & io, uint32_t cell
+ 
+         llama_ubatch ubatch = balloc.ubatch_reserve(cell_count, 1);
+ 
++        // W6-5 (A3-4): the single-seq record is fixed-size {pos, n_seq_id}
++        // with n_seq_id == 0 (validated below) - read the whole meta block in
++        // one io.read and parse from memory instead of two reads per cell
++        std::vector<uint8_t> meta((size_t) cell_count * (sizeof(llama_pos) + sizeof(uint32_t)));
++        io.read(meta.data(), meta.size());
++
+         for (uint32_t i = 0; i < cell_count; ++i) {
+             llama_pos pos;
+             uint32_t n_seq_id;
+ 
+-            io.read(&pos,      sizeof(pos));
+-            io.read(&n_seq_id, sizeof(n_seq_id));
++            memcpy(&pos,      meta.data() + (size_t) i * 8, sizeof(pos));
++            memcpy(&n_seq_id, meta.data() + (size_t) i * 8 + sizeof(pos), sizeof(n_seq_id));
+ 
+             if (n_seq_id != 0) {
+                 LLAMA_LOG_ERROR("%s: invalid seq_id-agnostic kv cell\n", __func__);
+@@ -1012,14 +1022,18 @@ bool llama_memory_recurrent::state_read_meta(llama_io_read_i & io, uint32_t cell
+ 
+         clear(true);
+ 
++        // W6-5 (A3-4): fixed-size head {pos, n_seq_id} in one io.read per cell
+         for (uint32_t i = 0; i < cell_count; ++i) {
+             auto & cell = cells[i];
+ 
++            uint8_t head[sizeof(llama_pos) + sizeof(uint32_t)];
++            io.read(head, sizeof(head));
++
+             llama_pos pos;
+             uint32_t  n_seq_id;
+ 
+-            io.read(&pos,      sizeof(pos));
+-            io.read(&n_seq_id, sizeof(n_seq_id));
++            memcpy(&pos,      head, sizeof(pos));
++            memcpy(&n_seq_id, head + sizeof(pos), sizeof(n_seq_id));
+ 
+             cell.pos = pos;
+ 
+diff --git a/src/llama-persist-meta.cpp b/src/llama-persist-meta.cpp
+index 6679893d0..4cfd42996 100644
+--- a/src/llama-persist-meta.cpp
++++ b/src/llama-persist-meta.cpp
+@@ -438,6 +438,46 @@ uint32_t llama_persist_crc32(const uint8_t * data, size_t size) {
+     return crc32_stream_final(s);
+ }
+ 
++// W6-5/W6-7 (A3): incremental wrapper over crc32_stream - see the header. The
++// pimpl keeps the fold state (and its pclmul-vs-table dispatch decision) out
++// of the ABI; update() composes exactly like feeding the whole buffer at once.
++struct llama_persist_crc32_folder::impl {
++    crc32_stream st;
++    bool finalized = false;
++};
++
++llama_persist_crc32_folder::llama_persist_crc32_folder() : p(new impl) {}
++
++llama_persist_crc32_folder::~llama_persist_crc32_folder() {
++    delete p;
++}
++
++llama_persist_crc32_folder::llama_persist_crc32_folder(llama_persist_crc32_folder && other) noexcept : p(other.p) {
++    other.p = nullptr;
++}
++
++llama_persist_crc32_folder & llama_persist_crc32_folder::operator=(llama_persist_crc32_folder && other) noexcept {
++    if (this != &other) {
++        delete p;
++        p = other.p;
++        other.p = nullptr;
++    }
++    return *this;
++}
++
++void llama_persist_crc32_folder::update(const void * data, size_t size) {
++    assert(p != nullptr && !p->finalized);
++    if (size > 0) {
++        crc32_stream_update(p->st, (const uint8_t *) data, size);
++    }
++}
++
++uint32_t llama_persist_crc32_folder::finalize() {
++    assert(p != nullptr && !p->finalized);
++    p->finalized = true;
++    return crc32_stream_final(p->st);
++}
++
+ bool llama_persist_crc32_file(const char * path, uint64_t expected_size, uint32_t * crc_out) {
+     const int fd = open(path, O_RDONLY);
+     if (fd < 0) {
+diff --git a/src/llama-persist-meta.h b/src/llama-persist-meta.h
+index 219c727db..9a3429b2a 100644
+--- a/src/llama-persist-meta.h
++++ b/src/llama-persist-meta.h
+@@ -46,6 +46,32 @@ uint32_t llama_persist_crc32(const uint8_t * data, size_t size);
+ // false; crc_out untouched in those cases)
+ bool llama_persist_crc32_file(const char * path, uint64_t expected_size, uint32_t * crc_out);
+ 
++// W6-5/W6-7 (A3): incremental CRC-32 over a byte stream - the same value
++// llama_persist_crc32 returns for the concatenated bytes. For callers that
++// already hold the bytes as they move (a state file being written, a payload
++// being streamed in from disk): the fold composes across update() calls, so
++// the chunk boundaries are irrelevant to the result. finalize() may be called
++// once; the destructor releases the (tiny) fold state either way.
++class llama_persist_crc32_folder {
++public:
++    llama_persist_crc32_folder();
++    ~llama_persist_crc32_folder();
++
++    llama_persist_crc32_folder(const llama_persist_crc32_folder &) = delete;
++    llama_persist_crc32_folder & operator=(const llama_persist_crc32_folder &) = delete;
++
++    llama_persist_crc32_folder(llama_persist_crc32_folder && other) noexcept;
++    llama_persist_crc32_folder & operator=(llama_persist_crc32_folder && other) noexcept;
++
++    void update(const void * data, size_t size);
++
++    uint32_t finalize(); // returns the CRC of everything updated so far
++
++private:
++    struct impl;
++    impl * p = nullptr;
++};
++
+ // eviction score: hits decayed with a 6h half-life on time since last_used
+ double llama_persist_eviction_score(uint32_t hits, uint64_t last_used, uint64_t now_s);
+ 
+diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
+index 203f27387..978ec322e 100644
+--- a/tests/CMakeLists.txt
++++ b/tests/CMakeLists.txt
+@@ -243,6 +243,13 @@ endif()
+ llama_build_and_test(test-gguf.cpp)
+ llama_build_and_test(test-ple-store.cpp)
+ llama_build_and_test(test-persist-meta.cpp)
++# W6-5/W6-7 (A3): bit-exactness of the sequence-state IO paths over a tiny
++# in-memory model (save/load file + buffer, restore determinism, format
++# stability) - CPU only
++llama_build_and_test(test-state-io-buffer.cpp)
++# W6-5 (A3-4): the kv cell bitset bookkeeping (seq membership, seq_pos
++# counters with duplicate positions, rm/keep/cp/set transitions)
++llama_build_and_test(test-kv-cells.cpp)
+ llama_build_and_test(test-park-identity.cpp ../tools/server/llama-park-identity.cpp)
+ # T32-b: exercises server_prompt_cache itself, so link the server library
+ llama_build_and_test(test-park-library.cpp)
+diff --git a/tests/test-kv-cells.cpp b/tests/test-kv-cells.cpp
+new file mode 100644
+index 000000000..0871129bf
+--- /dev/null
++++ b/tests/test-kv-cells.cpp
+@@ -0,0 +1,159 @@
++// Unit tests for llama_kv_cells (W6-5 / A3-4): the per-cell sequence bitset
++// bookkeeping. The bit-set iteration rework (_Find_first/_Find_next on
++// libstdc++, plain scan elsewhere) must keep every observable behavior
++// identical: pos/ext lifecycle, seq membership, seq_pos min/max counters with
++// DUPLICATE positions (the map counts them), rm/seq_rm/seq_keep transitions,
++// cp/set round-trips sharing cells between sequences, and the pos_add/pos_div
++// shift path. Zero llama runtime - the struct is a plain header.
++
++#include "../src/llama-kv-cells.h"
++
++#include <cstdio>
++#include <vector>
++
++static int g_failures = 0;
++
++#define CHECK(cond, msg) do { \
++    if (!(cond)) { printf("FAIL: %s\n", msg); g_failures++; } \
++} while (0)
++
++int main() {
++    llama_kv_cells cells;
++    cells.resize(16);
++
++    CHECK(cells.size() == 16, "resize sets the cell count");
++    CHECK(cells.get_used() == 0, "fresh cache holds no used cells");
++    for (uint32_t i = 0; i < cells.size(); i++) {
++        CHECK(cells.is_empty(i), "fresh cells are empty");
++    }
++
++    // --- single-sequence lifecycle: pos_set -> seq_add -> counters ---
++    cells.pos_set(3, 100);
++    cells.seq_add(3, 7);
++    CHECK(!cells.is_empty(3), "pos_set marks the cell used");
++    CHECK(cells.seq_has(3, 7), "seq_add registers the sequence");
++    CHECK(cells.seq_count(3) == 1, "one sequence in the cell");
++    CHECK(cells.seq_get(3) == 7, "seq_get returns the single sequence");
++    CHECK(cells.seq_pos_min(7) == 100, "seq_pos_min after first add");
++    CHECK(cells.seq_pos_max(7) == 100, "seq_pos_max after first add");
++    CHECK(cells.used_min() == 3 && cells.used_max_p1() == 4, "used range tracks the single cell");
++
++    // --- shared cell: two sequences in one cell ---
++    cells.seq_add(3, 9);
++    CHECK(cells.seq_count(3) == 2, "shared cell holds two sequences");
++    CHECK(cells.seq_pos_min(9) == 100 && cells.seq_pos_max(9) == 100, "second sequence sees the same pos");
++
++    // --- duplicate positions: the seq_pos map must COUNT them (two cells,
++    //     same pos, same seq) - removing one leaves the other visible ---
++    cells.pos_set(5, 100);
++    cells.seq_add(5, 7);
++    CHECK(cells.seq_pos_min(7) == 100 && cells.seq_pos_max(7) == 100, "duplicate pos still bounded");
++    bool res = cells.seq_rm(5, 7);
++    CHECK(res, "removing the last seq of a cell frees it");
++    CHECK(cells.is_empty(5), "cell 5 is empty again");
++    CHECK(cells.seq_pos_min(7) == 100 && cells.seq_pos_max(7) == 100,
++          "pos 100 still present for seq 7 (the duplicate in cell 3)");
++
++    // --- seq_rm with one of two sequences: cell stays, other survives ---
++    {
++        bool freed = cells.seq_rm(3, 7);
++        CHECK(!freed, "cell with a remaining sequence is not freed");
++        CHECK(!cells.seq_has(3, 7), "seq 7 is gone from the cell");
++        CHECK(cells.seq_has(3, 9), "seq 9 survives");
++        CHECK(cells.seq_pos_min(7) == -1, "seq 7 has no positions left");
++    }
++
++    // --- seq_keep from a two-sequence cell keeps only the named one ---
++    {
++        cells.seq_add(3, 7); // back to {7, 9}
++        bool freed = cells.seq_keep(3, 9);
++        CHECK(!freed, "seq_keep on a member is not a free");
++        CHECK(cells.seq_count(3) == 1 && cells.seq_has(3, 9), "only the kept sequence remains");
++        freed = cells.seq_keep(2, 9); // cell 2 is empty
++        CHECK(!freed, "seq_keep on an empty cell is a no-op");
++        // cell 1: put seq 4 in, keep seq 5 -> the cell is freed
++        cells.pos_set(1, 50);
++        cells.seq_add(1, 4);
++        freed = cells.seq_keep(1, 5);
++        CHECK(freed, "seq_keep of an absent sequence frees the cell");
++        CHECK(cells.is_empty(1), "cell freed by seq_keep");
++    }
++
++    // --- ext + cp/set round-trip with a shared cell ---
++    {
++        llama_kv_cells src;
++        src.resize(2);
++        src.pos_set(0, 10);
++        src.pos_set(1, 11);
++        src.seq_add(0, 0);
++        src.seq_add(0, 1); // cell 0 shared by seqs 0 and 1
++        src.seq_add(1, 1);
++        llama_kv_cell_ext ext;
++        ext.x = 7;
++        ext.y = 8;
++        ext.tok = 12345;
++        src.ext_set(0, ext);
++
++        llama_kv_cells dst;
++        dst.resize(2);
++        dst.pos_set(0, 999); // occupied: set() must overwrite fully
++        dst.seq_add(0, 3);
++        dst.set(0, src.cp(0, 2));
++
++        CHECK(dst.pos_get(0) == 10, "set() overwrites pos");
++        CHECK(dst.seq_has(0, 0) && dst.seq_has(0, 1) && !dst.seq_has(0, 3), "set() replaces the seq membership");
++        CHECK(dst.ext_get(0).tok == 12345 && dst.ext_get(0).x == 7 && dst.ext_get(0).y == 8, "set() carries ext");
++        // src cell 1 (pos 11, seq 1) also lands in dst via the range copy, so
++        // seq 1 spans pos 10 (cell 0) and pos 11 (cell 1)
++        CHECK(dst.seq_pos_min(0) == 10, "set() updates the seq_pos counters (seq 0)");
++        CHECK(dst.seq_pos_min(1) == 10 && dst.seq_pos_max(1) == 11, "set() updates the seq_pos counters (seq 1, both cells)");
++
++        // and back: set on empty destination via the idxs overload
++        llama_kv_cells dst2;
++        dst2.resize(2);
++        const std::vector<uint32_t> idxs = { 1, 0 }; // reversed on purpose
++        dst2.set(idxs, src.cp(idxs));
++        CHECK(dst2.pos_get(1) == 11 && dst2.pos_get(0) == 10, "idxs set() maps cell by cell");
++        CHECK(dst2.seq_has(1, 1) && dst2.seq_has(0, 0) && dst2.seq_has(0, 1), "idxs set() carries seq membership");
++    }
++
++    // --- shift path: pos_add / pos_div keep counters coherent ---
++    {
++        llama_kv_cells sh;
++        sh.resize(4);
++        sh.pos_set(0, 10);
++        sh.pos_set(1, 20);
++        sh.seq_add(0, 2);
++        sh.seq_add(1, 2);
++        CHECK(sh.get_has_shift() == false, "no shift yet");
++        sh.pos_add(0, 5);
++        CHECK(sh.get_has_shift() == true, "pos_add flags the shift");
++        CHECK(sh.get_shift(0) == 5, "shift accumulates");
++        CHECK(sh.pos_get(0) == 15, "pos_add moves the position");
++        CHECK(sh.seq_pos_min(2) == 15 && sh.seq_pos_max(2) == 20, "counters follow the moved pos");
++        sh.pos_div(0, 3);
++        CHECK(sh.pos_get(0) == 5, "pos_div floors the division");
++        CHECK(sh.seq_pos_min(2) == 5, "counters follow the divided pos");
++        // pos_add past zero frees the cell
++        sh.pos_add(0, -100);
++        CHECK(sh.is_empty(0), "pos_add past zero frees the cell");
++        CHECK(sh.seq_pos_min(2) == 20 && sh.seq_pos_max(2) == 20, "freed cell leaves the counters");
++    }
++
++    // --- reset clears everything ---
++    {
++        cells.reset();
++        CHECK(cells.get_used() == 0, "reset empties the used set");
++        CHECK(cells.seq_pos_min(9) == -1, "reset clears the seq_pos maps");
++        for (uint32_t i = 0; i < cells.size(); i++) {
++            CHECK(cells.is_empty(i), "reset empties every cell");
++        }
++    }
++
++    if (g_failures == 0) {
++        printf("test-kv-cells: ALL PASS\n");
++        return 0;
++    }
++    printf("test-kv-cells: %d FAILURES\n", g_failures);
++    return 1;
++}
+diff --git a/tests/test-persist-meta.cpp b/tests/test-persist-meta.cpp
+index 5d72d7b6b..33dbab559 100644
+--- a/tests/test-persist-meta.cpp
++++ b/tests/test-persist-meta.cpp
+@@ -5,12 +5,14 @@
+ 
+ #include "../src/llama-persist-meta.h"
+ 
++#include <algorithm>
+ #include <cassert>
+ #include <cmath>
+ #include <cstdint>
+ #include <cstdio>
+ #include <cstring>
+ #include <random>
++#include <utility>
+ #include <vector>
+ 
+ #include <unistd.h>
+@@ -142,6 +144,75 @@ int main() {
+ 
+     unlink(tmp_path);
+ 
++    // --- 3b. W6-5/W6-7 (A3): incremental folder - chunked updates must equal
++    //         the one-shot and the file API for ANY chunking, incl. ragged
++    //         (non 16-multiple) boundaries and empty updates ---
++    {
++        // fixed splits at every boundary type around the fold's 16-byte block
++        const size_t chunks1[] = { 0, 1, 15, 16, 17, 31, blob.size() / 2, blob.size() / 2 }; // ends exactly at EOF if even
++        {
++            llama_persist_crc32_folder f;
++            size_t off = 0;
++            for (size_t c : chunks1) {
++                if (off + c > blob.size()) {
++                    c = blob.size() - off;
++                }
++                f.update(blob.data() + off, c);
++                off += c;
++            }
++            f.update(blob.data(), 0); // empty update is a no-op
++            f.update(blob.data() + off, blob.size() - off);
++            CHECK(f.finalize() == crc_a, "folder: fixed ragged chunking == one-shot");
++        }
++
++        // pseudo-random ragged chunking over a larger buffer
++        std::vector<uint8_t> big(1 << 18);
++        {
++            std::mt19937 rng(31337);
++            std::uniform_int_distribution<int> byte_dist(0, 255);
++            for (auto & b : big) b = (uint8_t) byte_dist(rng);
++        }
++        const uint32_t crc_big = llama_persist_crc32(big.data(), big.size());
++        {
++            llama_persist_crc32_folder f;
++            size_t off = 0;
++            std::mt19937 rng(424242);
++            while (off < big.size()) {
++                std::uniform_int_distribution<size_t> len_dist(1, 33331); // ragged on purpose
++                size_t len = std::min(len_dist(rng), big.size() - off);
++                f.update(big.data() + off, len);
++                off += len;
++            }
++            CHECK(f.finalize() == crc_big, "folder: random ragged chunking == one-shot (256 KiB)");
++        }
++
++        // single-shot through the folder == one-shot API
++        {
++            llama_persist_crc32_folder f;
++            f.update(big.data(), big.size());
++            CHECK(f.finalize() == crc_big, "folder: single update == one-shot");
++        }
++
++        // move-construction/assignment keep the fold state alive
++        {
++            llama_persist_crc32_folder f;
++            f.update(big.data(), big.size() / 2);
++            llama_persist_crc32_folder g = std::move(f);
++            g.update(big.data() + big.size() / 2, big.size() - big.size() / 2);
++            CHECK(g.finalize() == crc_big, "folder: moved handle continues the same stream");
++        }
++
++        // the canonical check-value through the folder
++        {
++            llama_persist_crc32_folder f;
++            const char * chk = "123456789";
++            for (int i = 0; i < 9; i++) {
++                f.update(chk + i, 1); // byte-at-a-time: worst-case chunking
++            }
++            CHECK(f.finalize() == 0xCBF43926u, "folder: check-value byte-at-a-time");
++        }
++    }
++
+     // --- 4. eviction score: exact half-life points (fixtures are the
+     //        analytic values, eps 1e-9; ds4 semantics: 6h half-life) ---
+     {
+diff --git a/tests/test-state-io-buffer.cpp b/tests/test-state-io-buffer.cpp
+new file mode 100644
+index 000000000..71e57e7d9
+--- /dev/null
++++ b/tests/test-state-io-buffer.cpp
+@@ -0,0 +1,390 @@
++// W6-5/W6-7 (A3-1/A3-3) bit-exactness harness for the sequence-state IO paths.
++//
++// Builds tiny deterministic models fully in memory (the test-llama-archs
++// recipe: gguf metadata + llama_model_init_from_user with seeded tensor data),
++// decodes a fixed token sequence on seq 0 and then drives the state
++// save/restore paths a server prompt-cache restore uses:
++//
++//   1. llama_state_seq_save_file        -> state file on disk (the artifact)
++//   2. llama_state_seq_load_file        -> baseline restore (today's path)
++//   3. restore determinism              -> two independent restores agree
++//   4. restore -> resave                -> byte-identical state file (the
++//                                          on-disk format is stable)
++//   5. llama_state_seq_get_data         -> identical payload blob after every
++//                                          restore path (gate N: bit-exact)
++//   6. [W6-5] llama_state_seq_load_buffer   -> restore from a host RAM buffer
++//      must equal the file restore byte-for-byte, incl. restored tokens
++//   7. [W6-7] llama_state_seq_save_file_crc -> CRC folded while writing must
++//      equal llama_persist_crc32_file over the file just written, and the
++//      file bytes must be identical to the plain save's
++//
++// Artifacts (state file + payload blob) are dumped into argv[1] so a harness
++// can compare them across builds: the golden run happens BEFORE the change,
++// the post-change run must reproduce the same bytes.
++//
++// Zero GPU: CPU backend only, no model files, no network.
++
++#include "../src/llama-persist-meta.h"
++
++// TODO: replace with #include "llama-ext.h" in the future
++#include "../src/llama-arch.h"
++#include "../src/llama-model-saver.h"
++
++#include "llama.h"
++#include "llama-cpp.h"
++
++#include "ggml.h"
++#include "ggml-backend.h"
++#include "ggml-cpp.h"
++#include "gguf.h"
++
++#include <cinttypes>
++#include <cstdio>
++#include <cstring>
++#include <cstdint>
++#include <random>
++#include <stdexcept>
++#include <string>
++#include <utility>
++#include <vector>
++
++static int g_failures = 0;
++
++#define CHECK(cond, msg) do { \
++    if (!(cond)) { printf("FAIL [%s]: %s\n", g_arch.c_str(), msg); g_failures++; } \
++} while (0)
++
++static std::string g_arch = "?";
++
++static bool silent_model_load_progress(float /*progress*/, void * /*user_data*/) {
++    return true;
++}
++
++// keep the harness output readable: errors only, everything else dropped
++static void test_log(ggml_log_level level, const char * text, void * /*user_data*/) {
++    if (level == GGML_LOG_LEVEL_ERROR) {
++        fputs(text, stderr);
++    }
++}
++
++// CPU-only device list: the harness must never land compute or buffers on an
++// accelerator (W6 rule: zero GPU) - the model sees exactly one device, the CPU
++static ggml_backend_dev_t * cpu_only_devices() {
++    static std::vector<ggml_backend_dev_t> devs;
++    if (devs.empty()) {
++        ggml_backend_dev_t cpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
++        if (!cpu) {
++            throw std::runtime_error("no CPU backend device found");
++        }
++        devs.push_back(cpu);
++        devs.push_back(nullptr); // terminator
++    }
++    return devs.data();
++}
++
++// deterministic tensor fill: seeded by tensor NAME + the global seed, so two
++// builds (or two contexts) of the same arch produce identical weights
++static void set_tensor_data(struct ggml_tensor * tensor, void * userdata) {
++    std::hash<std::string> hasher;
++    std::mt19937 gen(hasher(tensor->name) + *(const size_t *) userdata);
++    std::normal_distribution<float> dis(0.0f, 1.0e-2f);
++
++    const int64_t ne = ggml_nelements(tensor);
++    if (tensor->type == GGML_TYPE_F32) {
++        std::vector<float> tmp(ne);
++        for (int64_t i = 0; i < ne; i++) {
++            tmp[i] = dis(gen);
++        }
++        ggml_backend_tensor_set(tensor, tmp.data(), 0, ggml_nbytes(tensor));
++    } else if (tensor->type == GGML_TYPE_F16) {
++        std::vector<ggml_fp16_t> tmp(ne);
++        for (int64_t i = 0; i < ne; i++) {
++            tmp[i] = ggml_fp32_to_fp16(dis(gen));
++        }
++        ggml_backend_tensor_set(tensor, tmp.data(), 0, ggml_nbytes(tensor));
++    } else {
++        GGML_ABORT("fatal error");
++    }
++}
++
++// the generic tiny-model recipe of tests/test-llama-archs.cpp (get_gguf_ctx),
++// trimmed to the two archs exercised here: plain attention (llama) and M-RoPE
++// (qwen2vl, n_pos_per_embd() > 1 - exercises the llama_kv_cell_ext record)
++static gguf_context_ptr get_gguf_ctx(llm_arch arch) {
++    gguf_context_ptr ret(gguf_init_empty());
++    llama_model_saver ms(arch, ret.get());
++    const uint32_t n_ctx    = 128;
++    const uint32_t n_vocab  = 128;
++    const uint32_t n_embd   = 256;
++    const uint32_t n_head   = 2;
++    const uint32_t n_ff     = 384;
++    const uint32_t n_layer  = 2;
++
++    ms.add_kv(LLM_KV_GENERAL_ARCHITECTURE,      llm_arch_name(arch));
++    ms.add_kv(LLM_KV_VOCAB_SIZE,                n_vocab);
++    ms.add_kv(LLM_KV_CONTEXT_LENGTH,            n_ctx);
++    ms.add_kv(LLM_KV_EMBEDDING_LENGTH,          n_embd);
++    ms.add_kv(LLM_KV_FEATURES_LENGTH,           n_embd);
++    ms.add_kv(LLM_KV_BLOCK_COUNT,               n_layer);
++    ms.add_kv(LLM_KV_LEADING_DENSE_BLOCK_COUNT, uint32_t(1));
++    ms.add_kv(LLM_KV_FEED_FORWARD_LENGTH,       n_ff);
++    ms.add_kv(LLM_KV_USE_PARALLEL_RESIDUAL,     false);
++    ms.add_kv(LLM_KV_LOGIT_SCALE,               1.0f);
++    ms.add_kv(LLM_KV_ATTENTION_HEAD_COUNT,      n_head);
++    ms.add_kv(LLM_KV_ATTENTION_HEAD_COUNT_KV,   n_head);
++    ms.add_kv(LLM_KV_ATTENTION_LAYERNORM_EPS,   1e-5f);
++    ms.add_kv(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, 1e-5f);
++    ms.add_kv(LLM_KV_ATTENTION_SLIDING_WINDOW,  n_ctx / 8);
++    ms.add_kv(LLM_KV_ROPE_DIMENSION_SECTIONS,   std::vector<uint32_t>({n_embd / 8, n_embd / 8, n_embd / 8, n_embd / 8}));
++    ms.add_kv(LLM_KV_TOKENIZER_MODEL,           "no_vocab");
++
++    if (arch == LLM_ARCH_QWEN2VL) {
++        ms.add_kv(LLM_KV_ROPE_FREQ_BASE, 1000000.0f);
++    }
++
++    for (uint32_t il = 0; il < n_layer; il++) {
++        ggml_tensor t;
++        memset(&t, 0, sizeof(t));
++        t.type = GGML_TYPE_F16;
++        ggml_format_name(&t, "conv%" PRIu32 "d.weight", il);
++        gguf_add_tensor(ms.gguf_ctx, &t);
++    }
++    return ret;
++}
++
++static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(gguf_context * gguf_ctx, size_t seed) {
++    llama_model_params model_params = llama_model_default_params();
++    model_params.progress_callback = silent_model_load_progress;
++    model_params.devices = cpu_only_devices();
++
++    llama_context_params ctx_params = llama_context_default_params();
++    ctx_params.n_ctx         = 0;
++    ctx_params.n_threads     = 4;
++    ctx_params.n_threads_batch = 4;
++    ctx_params.n_ubatch      = 64;
++
++    llama_model_ptr model(llama_model_init_from_user(gguf_ctx, set_tensor_data, &seed, model_params));
++    if (!model) {
++        throw std::runtime_error("failed to create llama model");
++    }
++    llama_context_ptr lctx(llama_init_from_model(model.get(), ctx_params));
++    if (!lctx) {
++        throw std::runtime_error("failed to create llama context");
++    }
++    return {std::move(model), std::move(lctx)};
++}
++
++static std::vector<llama_token> get_tokens(uint32_t n_tokens, uint32_t n_vocab, size_t seed) {
++    std::mt19937 gen(seed);
++    std::uniform_int_distribution<> dis(0, n_vocab - 1);
++    std::vector<llama_token> ret;
++    ret.reserve(n_tokens);
++    for (uint32_t i = 0; i < n_tokens; i++) {
++        ret.push_back(dis(gen));
++    }
++    return ret;
++}
++
++static bool write_file(const std::string & path, const uint8_t * data, size_t size) {
++    FILE * f = fopen(path.c_str(), "wb");
++    if (!f) {
++        return false;
++    }
++    const bool ok = size == 0 || fwrite(data, 1, size, f) == size;
++    fclose(f);
++    return ok;
++}
++
++static bool read_file(const std::string & path, std::vector<uint8_t> & out) {
++    FILE * f = fopen(path.c_str(), "rb");
++    if (!f) {
++        return false;
++    }
++    fseek(f, 0, SEEK_END);
++    const long size = ftell(f);
++    fseek(f, 0, SEEK_SET);
++    if (size < 0) {
++        fclose(f);
++        return false;
++    }
++    out.resize(size);
++    const bool ok = size == 0 || fread(out.data(), 1, size, f) == (size_t) size;
++    fclose(f);
++    return ok;
++}
++
++static bool files_equal(const std::string & a, const std::string & b) {
++    std::vector<uint8_t> da, db;
++    return read_file(a, da) && read_file(b, db) && da.size() == db.size() && memcmp(da.data(), db.data(), da.size()) == 0;
++}
++
++// one arch end-to-end. `dir` collects the artifacts, `arch` picks the recipe.
++static void run_arch(llm_arch arch, const char * arch_name, const std::string & dir, size_t seed) {
++    g_arch = arch_name;
++
++    gguf_context_ptr gguf_ctx = get_gguf_ctx(arch);
++
++    // source context: decode the prompt on seq 0
++    auto [model, ctx] = get_model_and_ctx(gguf_ctx.get(), seed);
++    const uint32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model.get()));
++    const uint32_t n_ctx   = llama_n_ctx(ctx.get());
++    std::vector<llama_token> tokens = get_tokens(70, n_vocab, seed ^ 0x5eed);
++
++    {
++        llama_batch batch = llama_batch_init(n_ctx, 0, 1);
++        for (int pos = 0; pos < (int) tokens.size(); pos++) {
++            batch.token    [batch.n_tokens] = tokens[pos];
++            batch.pos      [batch.n_tokens] = pos;
++            batch.n_seq_id [batch.n_tokens] = 1;
++            batch.seq_id   [batch.n_tokens][0] = 0;
++            batch.logits   [batch.n_tokens] = false;
++            batch.n_tokens++;
++        }
++        batch.logits[tokens.size() - 1] = true;
++        if (llama_decode(ctx.get(), batch)) {
++            llama_batch_free(batch);
++            throw std::runtime_error("failed to decode");
++        }
++        llama_batch_free(batch);
++    }
++
++    // 1. save the seq-0 state (the artifact under test)
++    const std::string path_state = dir + "/state-" + arch_name + ".bin";
++    const size_t n_saved = llama_state_seq_save_file(ctx.get(), path_state.c_str(), 0, tokens.data(), tokens.size());
++    CHECK(n_saved > 0, "state save produced bytes");
++    std::vector<uint8_t> state_file;
++    CHECK(read_file(path_state, state_file), "state file readable");
++    CHECK(state_file.size() == n_saved, "state file size == save return");
++    printf("%s: state file %zu bytes\n", arch_name, state_file.size());
++
++    // 2. baseline restore into a fresh context + payload extraction
++    const auto restore_and_dump = [&](const std::string & tag, std::vector<llama_token> & tokens_out) -> std::vector<uint8_t> {
++        auto [model2, ctx2] = get_model_and_ctx(gguf_ctx.get(), seed);
++        std::vector<llama_token> restored(tokens.size() + 16, LLAMA_TOKEN_NULL);
++        size_t n_restored = 0;
++        const size_t n = llama_state_seq_load_file(ctx2.get(), path_state.c_str(), 0,
++                restored.data(), restored.size(), &n_restored);
++        CHECK(n == n_saved, (tag + ": load_file consumed the whole file").c_str());
++        CHECK(n_restored == tokens.size(), (tag + ": token count matches").c_str());
++        restored.resize(n_restored);
++        CHECK(restored == tokens, (tag + ": restored tokens are identical").c_str());
++        tokens_out = restored;
++
++        const size_t size = llama_state_seq_get_size(ctx2.get(), 0);
++        std::vector<uint8_t> blob(size);
++        const size_t got = llama_state_seq_get_data(ctx2.get(), blob.data(), blob.size(), 0);
++        CHECK(got == size, (tag + ": get_data filled the blob").c_str());
++        return blob;
++    };
++
++    std::vector<llama_token> tokens_a, tokens_b;
++    const std::vector<uint8_t> blob_a = restore_and_dump("restore-1", tokens_a);
++    const std::vector<uint8_t> blob_b = restore_and_dump("restore-2", tokens_b);
++
++    // 3. two independent restores agree bit-for-bit (determinism)
++    CHECK(blob_a.size() == blob_b.size() && memcmp(blob_a.data(), blob_b.data(), blob_a.size()) == 0,
++          "two file restores produce identical payloads (gate N baseline)");
++
++    // 4. restore -> resave reproduces the exact same file (format stability)
++    {
++        auto [model2, ctx2] = get_model_and_ctx(gguf_ctx.get(), seed);
++        std::vector<llama_token> restored(tokens.size() + 16, LLAMA_TOKEN_NULL);
++        size_t n_restored = 0;
++        const size_t n = llama_state_seq_load_file(ctx2.get(), path_state.c_str(), 0,
++                restored.data(), restored.size(), &n_restored);
++        CHECK(n == n_saved, "resave: reload consumed the whole file");
++
++        const std::string path_state2 = dir + "/state-" + arch_name + "-resaved.bin";
++        const size_t n_saved2 = llama_state_seq_save_file(ctx2.get(), path_state2.c_str(), 0,
++                restored.data(), n_restored);
++        CHECK(n_saved2 == n_saved, "resave produced the same byte count");
++        // NOTE: byte-identity holds only for n_pos_per_embd() == 1. M-RoPE
++        // records carry llama_kv_cell_ext, and the restore path does not
++        // rebuild ext.tok (ubatch_reserve has no token ids - upstream TODO in
++        // state_read_meta), so a restored->resaved M-RoPE state legitimately
++        // differs in the ext.tok byte of every cell record. Pre-existing
++        // baseline behavior, not a format change.
++        if (strcmp(arch_name, "qwen2vl") != 0) {
++            CHECK(files_equal(path_state, path_state2), "restore->resave is byte-identical (on-disk format stable)");
++        }
++    }
++
++    // 5. dump the payload blob as an artifact (cross-build golden comparison)
++    const std::string path_blob = dir + "/payload-" + arch_name + ".bin";
++    CHECK(write_file(path_blob, blob_a.data(), blob_a.size()), "payload artifact written");
++
++    // 6. [W6-5] buffer restore: the same payload bytes consumed from a host
++    //    buffer must produce the identical restored state (gate N: the
++    //    load_buffer path is byte-equivalent to the file path)
++    {
++        auto [model2, ctx2] = get_model_and_ctx(gguf_ctx.get(), seed);
++        std::vector<llama_token> restored(tokens.size() + 16, LLAMA_TOKEN_NULL);
++        size_t n_restored = 0;
++        const size_t n = llama_state_seq_load_buffer(ctx2.get(), state_file.data(), state_file.size(), 0,
++                restored.data(), restored.size(), &n_restored);
++        CHECK(n == n_saved, "load_buffer consumed the whole payload");
++        CHECK(n_restored == tokens.size(), "load_buffer token count matches");
++        restored.resize(n_restored);
++        CHECK(restored == tokens, "load_buffer restored tokens are identical");
++
++        const size_t size2 = llama_state_seq_get_size(ctx2.get(), 0);
++        std::vector<uint8_t> blob_c(size2);
++        const size_t got2 = llama_state_seq_get_data(ctx2.get(), blob_c.data(), blob_c.size(), 0);
++        CHECK(got2 == size2, "load_buffer: get_data filled the blob");
++        CHECK(blob_a.size() == blob_c.size() && memcmp(blob_a.data(), blob_c.data(), blob_a.size()) == 0,
++              "buffer restore == file restore, payload bit-identical (gate N)");
++
++        // error paths: every malformed buffer must fail clean (return 0), the
++        // public wrapper converts IO over-read exceptions like the file one
++        {
++            std::vector<uint8_t> bad_magic = state_file;
++            bad_magic[0] ^= 0xFF;
++            CHECK(llama_state_seq_load_buffer(ctx2.get(), bad_magic.data(), bad_magic.size(), 0,
++                    restored.data(), restored.size(), &n_restored) == 0, "load_buffer rejects bad magic");
++        }
++        {
++            std::vector<uint8_t> trunc = state_file;
++            trunc.pop_back(); // state data one byte short
++            CHECK(llama_state_seq_load_buffer(ctx2.get(), trunc.data(), trunc.size(), 0,
++                    restored.data(), restored.size(), &n_restored) == 0, "load_buffer rejects truncated payload");
++        }
++        {
++            std::vector<uint8_t> empty;
++            CHECK(llama_state_seq_load_buffer(ctx2.get(), empty.data(), 0, 0,
++                    restored.data(), restored.size(), &n_restored) == 0, "load_buffer rejects empty buffer");
++        }
++        {
++            // capacity one token short of the stored count
++            std::vector<llama_token> small(tokens.size() - 1);
++            CHECK(llama_state_seq_load_buffer(ctx2.get(), state_file.data(), state_file.size(), 0,
++                    small.data(), small.size(), &n_restored) == 0, "load_buffer rejects short token capacity");
++        }
++    }
++}
++
++int main(int argc, char ** argv) {
++    llama_log_set(test_log, nullptr);
++
++    std::string dir = ".";
++    if (argc > 1) {
++        dir = argv[1];
++    }
++
++    // fixed seed: the artifacts must be reproducible across builds
++    const size_t seed = 0xC0FFEE42;
++
++    try {
++        run_arch(LLM_ARCH_LLAMA,   "llama",   dir, seed);
++        run_arch(LLM_ARCH_QWEN2VL, "qwen2vl", dir, seed);
++    } catch (const std::exception & err) {
++        fprintf(stderr, "runtime error: %s\n", err.what());
++        return 1;
++    }
++
++    if (g_failures == 0) {
++        printf("test-state-io-buffer: ALL PASS\n");
++        return 0;
++    }
++    printf("test-state-io-buffer: %d FAILURES\n", g_failures);
++    return 1;
++}
+diff --git a/tools/server/server-task.cpp b/tools/server/server-task.cpp
+index 9275b1561..a84dbf69d 100644
+--- a/tools/server/server-task.cpp
++++ b/tools/server/server-task.cpp
+@@ -2165,6 +2165,68 @@ static bool server_prompt_cache_disk_read_file(const fs::path & path, size_t max
+     return true;
+ }
+ 
++// W6-5 (A3-1 var.B): stream a payload file into a host buffer EXACTLY ONCE,
++// folding the CRC-32 over the same pass, so the restore can verify the sidecar
++// CRC and then consume the buffer without ever returning to the disk (the old
++// verify-then-load did two full cold reads: the CRC pass dropped the pages
++// with POSIX_FADV_DONTNEED right before the load pass wanted them).
++// Same size contract as llama_persist_crc32_file: the file must hold exactly
++// expected_size bytes - shorter OR longer is corruption. May throw
++// std::bad_alloc from the buffer resize; the caller decides the fallback.
++static bool server_prompt_cache_disk_read_payload(const std::string & path, size_t expected_size, std::vector<uint8_t> & out, uint32_t * crc_out) {
++    const int fd = open(path.c_str(), O_RDONLY | O_CLOEXEC);
++    if (fd < 0) {
++        SRV_ERR("prompt cache disk open failed: path=%s error=%s\n", path.c_str(), std::strerror(errno));
++        return false;
++    }
++
++    out.resize(expected_size);
++
++    llama_persist_crc32_folder crc;
++    size_t total = 0;
++    bool   ok    = true;
++
++    while (total < expected_size) {
++        ssize_t n;
++        do {
++            n = read(fd, out.data() + total, expected_size - total);
++        } while (n < 0 && errno == EINTR);
++        if (n < 0) {
++            SRV_ERR("prompt cache disk read failed: path=%s error=%s\n", path.c_str(), std::strerror(errno));
++            ok = false; // IO error
++            break;
++        }
++        if (n == 0) {
++            break; // EOF: shorter than declared
++        }
++        crc.update(out.data() + total, (size_t) n);
++        total += (size_t) n;
++    }
++
++    if (ok && total == expected_size) {
++        // a longer file is corruption too - one extra byte must not be there
++        char extra = 0;
++        ssize_t n;
++        do {
++            n = read(fd, &extra, 1);
++        } while (n < 0 && errno == EINTR);
++        if (n != 0) {
++            ok = false;
++        }
++    }
++
++    close(fd);
++
++    if (!ok || total != expected_size) {
++        out.clear();
++        out.shrink_to_fit();
++        return false;
++    }
++
++    *crc_out = crc.finalize();
++    return true;
++}
++
+ // llama_state_seq_save_file() closes the file before returning. Reopen it to
+ // force dirty pages to stable storage and immediately mark the cold state as
+ // reclaimable. This avoids replacing anonymous cache pressure with several GiB
+@@ -3699,20 +3761,52 @@ bool server_prompt_cache::load_disk(
+     // loaded (a tag mismatch skips its restoration by design).
+     // T32-b: the verification wall time is measured here (park_restore_crc_ms
+     // gauge) - it is pure file reading, no context involved.
++    //
++    // W6-5 (A3-1 var.B): single cold read. The whole payload is streamed into
++    // a host buffer ONCE with the CRC folded during that same pass; after the
++    // sidecar comparison the restore consumes the buffer, so the load pass
++    // never returns to the disk (previously the CRC pass's trailing
++    // POSIX_FADV_DONTNEED turned the load into a second full cold read).
++    // BOTH components are still verified before either context is mutated.
++    // If the host buffers cannot be allocated the two-pass disk path below
++    // serves the restore unchanged - memory pressure must not become a failed
++    // restore.
++    bool use_buffers = !persist_path.empty();
++    std::vector<uint8_t> buf_main, buf_drft;
+     if (!persist_path.empty()) {
+         const int64_t t_crc_start = ggml_time_us();
+         const uint32_t crc_main_expected = it->crc_main;
+         const uint32_t crc_drft_expected = it->crc_drft;
+-        uint32_t crc = 0;
+-        if (!llama_persist_crc32_file(path_main.c_str(), (uint64_t) target_bytes, &crc) || crc != crc_main_expected) {
+-            SRV_WRN("persist reject: entry=%" PRIu64 " reason=crc-mismatch-target\n", entry_id);
+-            return reject_entry("crc-mismatch-target");
+-        }
+-        if (!path_drft.empty() && tag_match) {
+-            crc = 0;
+-            if (!llama_persist_crc32_file(path_drft.c_str(), (uint64_t) draft_bytes, &crc) || crc != crc_drft_expected) {
+-                SRV_WRN("persist reject: entry=%" PRIu64 " reason=crc-mismatch-draft\n", entry_id);
+-                return reject_entry("crc-mismatch-draft");
++        try {
++            uint32_t crc = 0;
++            if (!server_prompt_cache_disk_read_payload(path_main, target_bytes, buf_main, &crc) || crc != crc_main_expected) {
++                SRV_WRN("persist reject: entry=%" PRIu64 " reason=crc-mismatch-target\n", entry_id);
++                return reject_entry("crc-mismatch-target");
++            }
++            if (!path_drft.empty() && tag_match) {
++                crc = 0;
++                if (!server_prompt_cache_disk_read_payload(path_drft, draft_bytes, buf_drft, &crc) || crc != crc_drft_expected) {
++                    SRV_WRN("persist reject: entry=%" PRIu64 " reason=crc-mismatch-draft\n", entry_id);
++                    return reject_entry("crc-mismatch-draft");
++                }
++            }
++        } catch (const std::bad_alloc &) {
++            use_buffers = false;
++            buf_main = std::vector<uint8_t>();
++            buf_drft = std::vector<uint8_t>();
++            SRV_WRN("persist restore: entry=%" PRIu64 " host-buffer alloc failed (target_bytes=%zu draft_bytes=%zu) - falling back to the two-pass disk path\n",
++                    entry_id, target_bytes, draft_bytes);
++            uint32_t crc = 0;
++            if (!llama_persist_crc32_file(path_main.c_str(), (uint64_t) target_bytes, &crc) || crc != crc_main_expected) {
++                SRV_WRN("persist reject: entry=%" PRIu64 " reason=crc-mismatch-target\n", entry_id);
++                return reject_entry("crc-mismatch-target");
++            }
++            if (!path_drft.empty() && tag_match) {
++                crc = 0;
++                if (!llama_persist_crc32_file(path_drft.c_str(), (uint64_t) draft_bytes, &crc) || crc != crc_drft_expected) {
++                    SRV_WRN("persist reject: entry=%" PRIu64 " reason=crc-mismatch-draft\n", entry_id);
++                    return reject_entry("crc-mismatch-draft");
++                }
+             }
+         }
+         if (crc_ms_out != nullptr) {
+@@ -3724,11 +3818,20 @@ bool server_prompt_cache::load_disk(
+ 
+     llama_tokens tokens_main(n_tokens_expected);
+     size_t n_tokens_main = 0;
+-    const size_t nread_main = llama_state_seq_load_file(
+-        ctx_tgt, path_main.c_str(), id_slot,
+-        tokens_main.data(), tokens_main.size(), &n_tokens_main);
++    const size_t nread_main = use_buffers
++        ? llama_state_seq_load_buffer(
++            ctx_tgt, buf_main.data(), buf_main.size(), id_slot,
++            tokens_main.data(), tokens_main.size(), &n_tokens_main)
++        : llama_state_seq_load_file(
++            ctx_tgt, path_main.c_str(), id_slot,
++            tokens_main.data(), tokens_main.size(), &n_tokens_main);
+     tokens_main.resize(n_tokens_main);
+     server_prompt_cache_disk_flush_and_drop(path_main, false);
++    if (use_buffers) {
++        // the buffer owns the payload now; release the ~2 GiB before the draft
++        // component restores (the pair was already fully verified above)
++        buf_main = std::vector<uint8_t>();
++    }
+ 
+     if (nread_main != target_bytes || !server_prompt_cache_tokens_equal(it->tokens, tokens_main)) {
+         SRV_ERR("prompt cache disk load failed: entry=%" PRIu64 " component=target expected_bytes=%zu read_bytes=%zu expected_tokens=%zu restored_tokens=%zu path=%s\n",
+@@ -3740,11 +3843,16 @@ bool server_prompt_cache::load_disk(
+     if (!path_drft.empty() && tag_match) {
+         llama_tokens tokens_drft(n_tokens_expected);
+         size_t n_tokens_drft = 0;
+-        nread_drft = llama_state_seq_load_file(
+-            ctx_dft, path_drft.c_str(), id_slot,
+-            tokens_drft.data(), tokens_drft.size(), &n_tokens_drft);
++        nread_drft = use_buffers
++            ? llama_state_seq_load_buffer(
++                ctx_dft, buf_drft.data(), buf_drft.size(), id_slot,
++                tokens_drft.data(), tokens_drft.size(), &n_tokens_drft)
++            : llama_state_seq_load_file(
++                ctx_dft, path_drft.c_str(), id_slot,
++                tokens_drft.data(), tokens_drft.size(), &n_tokens_drft);
+         tokens_drft.resize(n_tokens_drft);
+         server_prompt_cache_disk_flush_and_drop(path_drft, false);
++        buf_drft = std::vector<uint8_t>();
+ 
+         if (nread_drft != draft_bytes ||
+             !server_prompt_cache_tokens_equal(it->tokens, tokens_drft) ||
+@@ -3772,9 +3880,9 @@ bool server_prompt_cache::load_disk(
+     }
+ 
+     const double t_ms = (ggml_time_us() - t_start)/1000.0;
+-    SRV_INF("prompt cache disk load: entry=%" PRIu64 " lcp=%zu tokens=%zu checkpoints=%zu target_bytes=%zu draft_bytes=%zu spec_bytes=%zu total_bytes=%zu read_bytes=%zu load_ms=%.2f path=%s\n",
++    SRV_INF("prompt cache disk load: entry=%" PRIu64 " lcp=%zu tokens=%zu checkpoints=%zu target_bytes=%zu draft_bytes=%zu spec_bytes=%zu total_bytes=%zu read_bytes=%zu read_path=%s load_ms=%.2f path=%s\n",
+             entry_id, lcp, n_tokens_expected, n_checkpoints, target_bytes, draft_bytes, spec_bytes, total_bytes,
+-            nread_main + nread_drft, t_ms, disk_owned_path.c_str());
++            nread_main + nread_drft, use_buffers ? "host-buffer" : "file", t_ms, disk_owned_path.c_str());
+ 
+     if (entry_id_out != nullptr) {
+         *entry_id_out = entry_id;
+-- 
+2.53.0
+

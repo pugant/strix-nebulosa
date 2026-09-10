@@ -12,6 +12,8 @@
 #include <string>
 #include <vector>
 #include <cinttypes>
+#include <cstdint>
+#include <memory>
 
 using json = nlohmann::ordered_json;
 
@@ -255,7 +257,63 @@ json json_get_nested_values(const std::vector<std::string> & paths, const json &
  * - only string, example: "string"
  * - mixed string and tokens, example: [12, 34, "string", 56, 78]
  */
-llama_tokens tokenize_mixed(const llama_vocab * vocab, const json & json_prompt, bool add_special, bool parse_special);
+llama_tokens tokenize_mixed(const llama_vocab * vocab, const json & json_prompt, bool add_special, bool parse_special,
+                            class server_token_prefix_cache * prefix_cache = nullptr);
+
+//
+// W6-6 / A4-S1: token-prefix cache for conversation prompts
+//
+
+struct server_token_prefix_cache_stats {
+    uint64_t n_lookups       = 0;  // total tokenize() calls seen
+    uint64_t n_full          = 0;  // full tokenizations served (miss / bypass)
+    uint64_t n_reuse         = 0;  // spliced results (cached prefix reused)
+    uint64_t n_reuse_full_hit = 0; // identical prompt served straight from cache
+    uint64_t n_bypass_type   = 0;  // non-BPE vocab: splice not supported, bypassed
+    uint64_t n_bypass_flag   = 0;  // (add_special, parse_special) differs from the entry
+    uint64_t n_bypass_short  = 0;  // common prefix too small to be worth a splice
+    uint64_t n_selfcheck_ok  = 0;  // self-check splices that matched the full tokenization
+    uint64_t n_selfcheck_fail = 0; // self-check mismatches (cache disabled when > 0)
+    uint64_t bytes_reused    = 0;  // total prefix bytes served from cache
+    bool     enabled         = true; // false after a self-check failure or env disable
+};
+
+/**
+ * Reuses the tokenized prefix of the previous prompt when a stateless client
+ * (e.g. pi) resends the same conversation with new turns appended: only the
+ * new tail is tokenized and spliced onto the cached token stream.
+ *
+ * Bit-identity with a full tokenization is by construction for BPE vocabularies:
+ * the splice point is always the start of a special-token fragment (a hard
+ * boundary of tokenizer_st_partition), and BPE fragments tokenize independently.
+ * Every entry is verified at creation (sum of token pieces must re-spell the
+ * prompt exactly) and the first splices are self-checked against a full
+ * tokenization; any mismatch disables the cache permanently for the process.
+ *
+ * Thread-safe (HTTP worker threads call tokenize() concurrently).
+ * Disable with LLAMA_SERVER_TOKEN_PREFIX_CACHE=0.
+ */
+class server_token_prefix_cache {
+  public:
+    // max_entries: LRU entries kept (one per interleaved conversation is enough)
+    // selfcheck_n: first splices verified against a full tokenization
+    server_token_prefix_cache(const llama_vocab * vocab, size_t max_entries = 4, uint32_t selfcheck_n = 3);
+    ~server_token_prefix_cache();
+
+    server_token_prefix_cache(const server_token_prefix_cache &) = delete;
+    server_token_prefix_cache & operator=(const server_token_prefix_cache &) = delete;
+
+    // same semantics as common_tokenize(vocab, text, add_special, parse_special)
+    llama_tokens tokenize(const std::string & text, bool add_special, bool parse_special);
+
+    server_token_prefix_cache_stats get_stats() const;
+    void reset(); // drop cached entries (enabled state is kept)
+
+  private:
+    struct entry;
+    struct impl;
+    std::unique_ptr<impl> pimpl;
+};
 
 // return the last index of character that can form a valid string
 // if the last character is potentially cut in half, return the index before the cut
@@ -283,7 +341,8 @@ std::vector<server_tokens> tokenize_input_prompts(
                                         mtmd_context * mctx,
                                         const json & json_prompt,
                                         bool add_special,
-                                        bool parse_special);
+                                        bool parse_special,
+                                        class server_token_prefix_cache * prefix_cache = nullptr);
 
 //
 // OAI utils

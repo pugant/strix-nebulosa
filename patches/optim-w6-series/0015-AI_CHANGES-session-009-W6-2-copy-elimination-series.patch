@@ -1,0 +1,48 @@
+From 8094a3d4f858e2634fffbbe67c27f1c037f9c367 Mon Sep 17 00:00:00 2001
+From: pugant <pugant@localhost>
+Date: Thu, 10 Sep 2026 18:24:07 +0200
+Subject: [PATCH 15/19] AI_CHANGES: session 009 (W6-2 copy elimination series)
+
+Co-Authored-By: GLM by z.ai <glm@z.ai>
+---
+ AI_CHANGES.md | 24 ++++++++++++++++++++++++
+ 1 file changed, 24 insertions(+)
+
+diff --git a/AI_CHANGES.md b/AI_CHANGES.md
+index 262cb14ea..dc50218b6 100644
+--- a/AI_CHANGES.md
++++ b/AI_CHANGES.md
+@@ -410,6 +410,30 @@ byte 2: v2[5:4] | v3[5:0]<<2
+ | Cells driver note | host Mesa 26.0.8 (non-prod): i-cells were functional gates, timings not comparable with prod (container 25.3.6) |
+ | Deploy | NOT deployed — default 0 = zero effect; deploy and flag activation = user GO (prerequisites in `docs/t32b-REPORT.md`) |
+ 
++## Session 009 — 2026-09-10
++
++**Scope:** W6-2 (wave-6 card A1-C1) — eliminate the eliminable CPY/CONT copies from the qwen4exp decode graph, host-side only; P3 fine attribution first.
++
++### `tests/test-copy-elim.cpp` (new) + `tests/CMakeLists.txt`
++
++| Fix | Detail |
++|-----|--------|
++| Attribution harness | Synthetic mini qwen4exp GGUF writer (trunk+MTP and draft-only; GDN + QSA + PLE + hc + MoE gate/up separate) + fixed decode schedule (prefill 8, N×1, one n=3 batch, 3 drafter evals with h input, target n_rs_seq=16) + per-node graph dump via the eval callback (op/name/shape/contiguity/FNV data-hash/src ops/named ancestor) + logits/state hashes for the bit-exact gate. Built via llama_build, not in ctest. |
++
++### `src/models/qwen4exp.cpp`
++
++| Fix | Line(s) | Detail |
++|-----|---------|--------|
++| conv-ring cont | build_conv_state_at | cpy the strided tail view directly (CPY reads through nb; delta-net-base always did); the per-slot `ggml_cont` added K−1 byte-identical CONT dispatches per layer-eval in decode. ~630 CONT/eval-target saved in prod |
++| hc collapse | build_hc_mix | fold the streams straight off their views (ADD already consumed a strided src1); drops the cont of stream 0, 97 CONT/eval-target |
++| QSA pooled | build_qsa_top_k | drop the per-slice cont (ADD reads views; the last ADD/scale yields the contiguous tensor the reshape needs) |
++| QSA q/top_k | build_qsa_top_k | drop cont of already-contiguous fresh tensors ahead of reshapes |
++| PLE tail | build_ple | drop cont of silu's fresh output before reshape_3d |
++| kept (documented) | build_ple | the kernel-column cont is a stride-kern gather (view_1d = row, wrong data — caught by the harness, reverted); shifted/permute/gate conts stay for consumer/matcher layout |
++
++**Verification:** bit-exact vs base `482d84333` (same harness both sides): 10/10 logits hashes + full state hash identical; 6.158/6.169 named tensor instances identical (the 11 diffs are the GDN fused result's never-read unwritten snapshot tail, proven by the matching cache writes). CONT per trunk eval 96→12, drafter 4→1, CPY unchanged (structural ring writes). Artifacts: `logs/wave6/w6m2-attribuzione.txt`, dumps and hashes alongside. VK build rc=0.
++
++
+ <!-- TEMPLATE FOR FUTURE AI SESSIONS:
+ 
+ Addendum (post final-review): fix `423a7b59b` — euristica LONGEST nutrita con la size d'ARRIVO del task (task_prev->tokens, spec r3) invece del boundary di slot (che include i generati e rendeva l'eguaglianza irraggiungibile); gate sorgente anti-regressione nel test. Serie finale: 13 commit, tree SHA `808af2282` (gate git-am pari).
+-- 
+2.53.0
+

@@ -1,0 +1,1185 @@
+From 6b634c3c7770d0d5f6a3c886be1e5c611533174c Mon Sep 17 00:00:00 2001
+From: pugant <pugant@localhost>
+Date: Thu, 10 Sep 2026 15:30:17 +0200
+Subject: [PATCH 07/19] token-prefix cache: reuse conversation prefix tokens
+ per request [w6-6 a4-s1]
+
+Stateless clients (pi) resend the whole conversation every round; the server
+re-tokenized all of it (75 ms @131k tokens) even when 99% of the tokens were
+identical to the previous request.
+
+server_token_prefix_cache (server-common) keeps the last prompts per
+(add_special, parse_special) with their token streams and byte spans. On a
+prefix hit the token stream is spliced: cached prefix + freshly tokenized
+tail, where the splice point is always the start of a special-token fragment
+(a hard boundary of tokenizer_st_partition; BPE fragments tokenize
+independently, so the result is bit-identical to a full tokenization).
+
+Safety rails: BPE vocabularies only (SPM/WPM/UGM keep cross-fragment state
+and are bypassed); every entry is verified at creation (token pieces must
+re-spell the prompt exactly, else the vocab is not cached); the first splices
+are self-checked against a full tokenization and any mismatch disables the
+cache; LLAMA_SERVER_TOKEN_PREFIX_CACHE=0 disables it outright.
+
+Wired into handle_completions_impl only (chat/completions hot path); token
+stream is unchanged for the prompt cache / park downstream (same key: the
+produced tokens are identical by gate).
+
+tests/test-token-prefix-cache.cpp: bit-identity gate over a synthetic
+multilingual corpus (CJK, thinking blocks, tool-call JSON, adjacent/partial
+special markers), growing conversations, mid-prefix edits, full hits, flag
+changes, concurrency; bypass assertions for SPM. With the real pi prompt
+(412 KB / 131k tokens): 16/16 rounds bit-identical, tokenize 618 -> 114 ms
+over the round series (5.4x); e2e template+tokenize @873 KB warm 4.8x.
+
+Co-Authored-By: GLM by z.ai
+---
+ tests/test-token-prefix-cache.cpp | 558 ++++++++++++++++++++++++++++++
+ tools/server/server-common.cpp    | 384 +++++++++++++++++++-
+ tools/server/server-common.h      |  63 +++-
+ tools/server/server-context.cpp   |  15 +-
+ 4 files changed, 1010 insertions(+), 10 deletions(-)
+ create mode 100644 tests/test-token-prefix-cache.cpp
+
+diff --git a/tests/test-token-prefix-cache.cpp b/tests/test-token-prefix-cache.cpp
+new file mode 100644
+index 000000000..d44758395
+--- /dev/null
++++ b/tests/test-token-prefix-cache.cpp
+@@ -0,0 +1,558 @@
++// W6-6 / A4-S1 — gate bit-identita' del token-prefix cache conversazione.
++//
++// Il cache (server_token_prefix_cache) deve produrre, per prompt conversazionali
++// che crescono alla fine (client stateless tipo pi), un token stream IDENTICO
++// bit-per-bit alla tokenizzazione piena (common_tokenize), e deve invalidare
++// correttamente su edit mid-prefix / cambio flag / testo non correlato.
++//
++// usage: test-token-prefix-cache <vocab.gguf> [pi-prompt.txt]
++//   - senza [pi-prompt.txt] gira solo il corpus sintetico (modalita' CI)
++//   - con [pi-prompt.txt] aggiunge il corpus reale pi (412 KB, ~131k token) e
++//     stampa la misura ms prima/dopo (tokenizzazione piena vs cache warm)
++
++#include "server-common.h"
++
++#include <algorithm>
++#include <cassert>
++#include <chrono>
++#include <cstdio>
++#include <cstring>
++#include <fstream>
++#include <string>
++#include <thread>
++#include <vector>
++
++#undef NDEBUG
++#include <cassert>
++
++static bool expect_bypass_vocab(const llama_vocab * vocab) {
++    return llama_vocab_type(vocab) != LLAMA_VOCAB_TYPE_BPE;
++}
++
++using namespace std::chrono;
++
++static steady_clock::time_point t_now() {
++    return steady_clock::now();
++}
++
++static double ms_since(steady_clock::time_point t0) {
++    return duration<double, std::milli>(steady_clock::now() - t0).count();
++}
++
++// tokenizzazione piena di riferimento (path server: add_special+parse_special)
++static std::vector<llama_token> ref_tokenize(const llama_vocab * vocab, const std::string & text, bool add_special = true) {
++    return common_tokenize(vocab, text, add_special, true);
++}
++
++static bool tokens_equal(const std::vector<llama_token> & a, const std::vector<llama_token> & b) {
++    return a.size() == b.size() && std::equal(a.begin(), a.end(), b.begin());
++}
++
++// raccoglie i special token del vocab (attr CONTROL|USER_DEFINED|UNKNOWN), testi non vuoti
++static std::vector<std::pair<llama_token, std::string>> vocab_specials(const llama_vocab * vocab) {
++    std::vector<std::pair<llama_token, std::string>> out;
++    const int32_t n = llama_vocab_n_tokens(vocab);
++    for (llama_token tok = 0; tok < n; ++tok) {
++        const auto attr = llama_vocab_get_attr(vocab, tok);
++        if (attr & (LLAMA_TOKEN_ATTR_CONTROL | LLAMA_TOKEN_ATTR_USER_DEFINED | LLAMA_TOKEN_ATTR_UNKNOWN)) {
++            const char * text = llama_vocab_get_text(vocab, tok);
++            if (text != nullptr && text[0] != '\0') {
++                out.emplace_back(tok, std::string(text));
++            }
++        }
++    }
++    // i piu' lunghi prima (stesso criterio di ordinamento del partitioner)
++    std::sort(out.begin(), out.end(), [](const auto & a, const auto & b) { return a.second.size() > b.second.size(); });
++    return out;
++}
++
++// pool di contenuti multilingue / casi limite per i messaggi sintetici
++static const std::vector<std::string> k_contents = {
++    // prosa EN
++    "The quick brown fox jumps over the lazy dog while the tokenizer caches its prefix across rounds.",
++    // CJK
++    "月亮在白莲花般的云朵里穿行，晚风吹来一阵阵快乐的歌声，我们坐在高高的谷堆旁边，听妈妈讲那过去的事情。",
++    "日本語のテキストです。トークナイザーは接頭辞を再利用します。必要なのは末尾の差分だけです。",
++    // italiano accentato
++    "Perché la cache funziona, basta che il prefisso conversazione cresca alla fine: né più, né meno.",
++    // codice
++    "```cpp\nfor (size_t i = 0; i < n_words; ++i) {\n    auto & word = words[i];\n    bpe_merge(word, ranks);\n}\n```",
++    // tool-call-like JSON
++    "{\"name\": \"read_file\", \"arguments\": {\"path\": \"/tmp/a4/wave6.go\", \"offset\": 1024}}",
++    // thinking block
++    "<think>\nLet me analyze the request: the conversation prefix is unchanged, only the tail grows.\n</think>\n",
++    // emoji + misto
++    "mix 🚀🧠✅ with ASCII and 数字 123 and symbols @#$%^&*()",
++    // spazi e ritorni
++    "line1\n\n\nline3   with   runs\t\tof\twhitespace and trailing spaces   ",
++    // numeri
++    "3.141592653589793 2718281828459045 1e-9 0xDEADBEEF 0b1010",
++    // quasi-special (prefisso di special ma NON completo: deve restare nel delta)
++    "incomplete marker <|im_ and <|end and <|tool",
++    // special dentro una parola
++    "abc",
++    // stringa vuota e punteggiatura
++    "...",
++    "",
++};
++
++// costruisce un messaggio in stile ChatML usando i special REALI del vocab
++static std::string synth_message(const std::string & open, const std::string & close, size_t i, bool with_close = true) {
++    const auto & content = k_contents[i % k_contents.size()];
++    std::string role = (i % 3 == 0) ? "user" : (i % 3 == 1 ? "assistant" : "tool");
++    std::string msg = open + role + "\n" + content;
++    if (with_close) {
++        msg += close + "\n";
++    }
++    // talvolta incolla un special dentro il contenuto (sub-word)
++    if (i % 7 == 3) {
++        msg += "tail" + close + "after\n";
++    }
++    return msg;
++}
++
++static void check_round(const llama_vocab * vocab, server_token_prefix_cache & cache, const std::string & text,
++                        const char * scenario, size_t round, bool add_special = true) {
++    const auto expected = ref_tokenize(vocab, text, add_special);
++    const auto got      = cache.tokenize(text, add_special, true);
++    if (!tokens_equal(expected, got)) {
++        fprintf(stderr, "FAIL %s round %zu: token stream mismatch (expected %zu tokens, got %zu)\n",
++                scenario, round, expected.size(), got.size());
++        for (size_t i = 0; i < std::min(expected.size(), got.size()); ++i) {
++            if (expected[i] != got[i]) {
++                fprintf(stderr, "  first diff at token %zu: expected %d, got %d\n", i, expected[i], got[i]);
++                break;
++            }
++        }
++        assert(false && "bit-identity gate");
++    }
++}
++
++static void run_synthetic(const llama_vocab * vocab, const std::vector<std::pair<llama_token, std::string>> & specials) {
++    assert(!specials.empty() && "il fixture deve avere >= 1 special token per esercitare lo splice");
++    const std::string open  = specials[0].second;
++    const std::string close = specials.size() > 1 ? specials[1].second : specials[0].second;
++    // vocabs non-BPM (SPM/WPM/UGM) tengono stato cross-frammento: la cache deve
++    // essere DISABILITATA e servire sempre la tokenizzazione piena (bypass)
++    const bool expect_bypass = llama_vocab_type(vocab) != LLAMA_VOCAB_TYPE_BPE;
++
++    // 1) conversazione crescente (pattern pi) — 40 round
++    {
++        server_token_prefix_cache cache(vocab);
++        std::string conv;
++        for (size_t r = 0; r < 40; ++r) {
++            conv += synth_message(open, close, r);
++            // ogni 5 round aggiungi anche un blocco thinking con special adiacenti
++            if (r % 5 == 2) {
++                conv += open + close + open; // special adiacenti senza testo in mezzo
++                conv += "assistant\ncompact " + std::to_string(r) + close + "\n";
++            }
++            check_round(vocab, cache, conv, "growing", r);
++        }
++        const auto stats = cache.get_stats();
++        if (expect_bypass) {
++            assert(!stats.enabled && "vocab non-BPE: la cache deve restare disabilitata");
++            assert(stats.n_reuse == 0 && stats.n_reuse_full_hit == 0);
++        } else {
++            assert(stats.n_reuse > 0 && "lo splice deve essere stato esercitato (growing)");
++            assert(stats.n_selfcheck_fail == 0);
++            assert(stats.enabled);
++        }
++        fprintf(stderr, "growing 40 rounds: lookups=%llu reuse=%llu full=%llu bytes_reused=%llu\n",
++                (unsigned long long) stats.n_lookups, (unsigned long long) stats.n_reuse,
++                (unsigned long long) stats.n_full, (unsigned long long) stats.bytes_reused);
++    }
++
++    // 2) edit mid-prefix: modifica un messaggio gia' inviato e reinvia
++    {
++        server_token_prefix_cache cache(vocab);
++        std::string conv;
++        std::vector<std::string> msgs;
++        for (size_t r = 0; r < 12; ++r) {
++            msgs.push_back(synth_message(open, close, r));
++            conv += msgs.back();
++            check_round(vocab, cache, conv, "edit-build", r);
++        }
++        for (size_t m = 0; m < msgs.size(); m += 3) {
++            std::string edited;
++            for (size_t j = 0; j < msgs.size(); ++j) {
++                edited += (j == m) ? (open + "user\nEDITED MID PREFIX " + std::to_string(j) + close + "\n") : msgs[j];
++            }
++            edited += synth_message(open, close, msgs.size());
++            check_round(vocab, cache, edited, "edit-mid", m);
++        }
++        const auto stats = cache.get_stats();
++        assert(stats.n_selfcheck_fail == 0);
++    }
++
++    // 3) full-hit (regenerate: stesso testo identico)
++    {
++        server_token_prefix_cache cache(vocab);
++        std::string conv;
++        for (size_t r = 0; r < 8; ++r) {
++            conv += synth_message(open, close, r);
++        }
++        check_round(vocab, cache, conv, "fullhit-1", 0);
++        check_round(vocab, cache, conv, "fullhit-2", 1);
++        check_round(vocab, cache, conv, "fullhit-3", 2);
++        const auto stats = cache.get_stats();
++        if (!expect_bypass) {
++            assert(stats.n_reuse_full_hit > 0);
++        }
++    }
++
++    // 4) testo non correlato (nessun prefisso condiviso) + alternanza di due conversazioni
++    {
++        server_token_prefix_cache cache(vocab);
++        std::string conv_a, conv_b;
++        for (size_t r = 0; r < 10; ++r) {
++            conv_a += synth_message(open, close, r);
++            conv_b += open + "user\nConversazione B round " + std::to_string(r) + " 雪の降る町を歩く。\n" + close + "\n";
++            check_round(vocab, cache, conv_a, "interleave-a", r);
++            check_round(vocab, cache, conv_b, "interleave-b", r);
++        }
++        // testo completamente diverso
++        check_round(vocab, cache, "unrelated short prompt with no shared prefix at all", "unrelated", 0);
++        const auto stats = cache.get_stats();
++        assert(stats.n_selfcheck_fail == 0);
++    }
++
++    // 5) flag add_special=false (entry distinte per flag)
++    {
++        server_token_prefix_cache cache(vocab);
++        std::string conv;
++        for (size_t r = 0; r < 6; ++r) {
++            conv += synth_message(open, close, r);
++            check_round(vocab, cache, conv, "nospecial-first", r, false);
++            check_round(vocab, cache, conv, "nospecial-true", r, true);
++        }
++        const auto stats = cache.get_stats();
++        assert(stats.n_selfcheck_fail == 0);
++    }
++
++    // 6) prompt senza alcun special (prosa pura): nessun cut disponibile, deve comunque restare identico
++    {
++        server_token_prefix_cache cache(vocab);
++        std::string prose;
++        for (size_t r = 0; r < 10; ++r) {
++            prose += "Round " + std::to_string(r) + ": plain prose without any special token, just words and spaces. ";
++            prose += k_contents[r % k_contents.size()];
++            check_round(vocab, cache, prose, "prose-only", r);
++        }
++    }
++
++    // 7) concorrenza: piu' thread sulla stessa cache, risultati identici al riferimento
++    {
++        server_token_prefix_cache cache(vocab);
++        std::string conv;
++        for (size_t r = 0; r < 24; ++r) {
++            conv += synth_message(open, close, r);
++        }
++        std::vector<std::thread> workers;
++        std::vector<int> failures(4, 0);
++        for (int w = 0; w < 4; ++w) {
++            workers.emplace_back([&, w]() {
++                for (size_t r = 0; r < 6; ++r) {
++                    // ogni worker taglia la conversazione a lunghezze diverse (prefissi condivisi)
++                    std::string partial = conv.substr(0, conv.size() / 2 + (w * 137 + r * 271) % (conv.size() / 2));
++                    if (!tokens_equal(ref_tokenize(vocab, partial), cache.tokenize(partial, true, true))) {
++                        failures[w]++;
++                    }
++                }
++            });
++        }
++        for (auto & t : workers) {
++            t.join();
++        }
++        for (int f : failures) {
++            assert(f == 0 && "concurrency mismatch");
++        }
++        const auto stats = cache.get_stats();
++        assert(stats.n_selfcheck_fail == 0);
++    }
++}
++
++// corpus reale pi: taglia il prompt ai confini dei special (round crescenti) e misura
++static void run_pi_corpus(const llama_vocab * vocab, const std::string & prompt,
++                          const std::vector<std::pair<llama_token, std::string>> & specials) {
++    fprintf(stderr, "pi corpus: %zu bytes\n", prompt.size());
++
++    // round = prefissi crescenti del prompt, tagliati all'inizio di un special
++    std::vector<size_t> cut_points;
++    for (const auto & [tok, text] : specials) {
++        size_t pos = 0;
++        while ((pos = prompt.find(text, pos)) != std::string::npos) {
++            cut_points.push_back(pos);
++            pos += text.size();
++        }
++    }
++    std::sort(cut_points.begin(), cut_points.end());
++    cut_points.erase(std::unique(cut_points.begin(), cut_points.end()), cut_points.end());
++    assert(!cut_points.empty());
++
++    // ~16 round sparsi sull'intervallo (ogni round e' un prefisso del successivo)
++    std::vector<size_t> rounds;
++    for (int i = 1; i <= 16; ++i) {
++        size_t idx = (cut_points.size() - 1) * i / 16;
++        rounds.push_back(cut_points[idx]);
++    }
++
++    // gate bit-identita' sul corpus reale
++    {
++        server_token_prefix_cache cache(vocab);
++        for (size_t r = 0; r < rounds.size(); ++r) {
++            std::string partial = prompt.substr(0, rounds[r]);
++            check_round(vocab, cache, partial, "pi-grow", r);
++        }
++        const auto stats = cache.get_stats();
++        assert(stats.n_reuse > 0);
++        assert(stats.n_selfcheck_fail == 0);
++        fprintf(stderr, "pi bit-identity: 16/16 round OK (reuse=%llu full=%llu)\n",
++                (unsigned long long) stats.n_reuse, (unsigned long long) stats.n_full);
++    }
++
++    // misura: piena vs cache warm (stessa sequenza di round, cache nuova)
++    {
++        std::vector<std::string> texts;
++        for (size_t r = 0; r < rounds.size(); ++r) {
++            texts.push_back(prompt.substr(0, rounds[r]));
++        }
++        const std::string & last = texts.back();
++
++        // warmup
++        (void) ref_tokenize(vocab, last);
++
++        // prima: tokenizzazione piena per ogni round
++        double t_full = 0.0;
++        {
++            auto t0 = t_now();
++            size_t n_tok = 0;
++            for (const auto & t : texts) {
++                n_tok += ref_tokenize(vocab, t).size();
++            }
++            t_full = ms_since(t0);
++            fprintf(stderr, "pi measure FULL: %.1f ms over %zu rounds (%zu tokens on last round)\n",
++                    t_full, texts.size(), ref_tokenize(vocab, texts.back()).size());
++        }
++
++        // dopo: cache warm (round 0 miss, tutti gli altri splice)
++        double t_cached = 0.0;
++        {
++            server_token_prefix_cache cache(vocab);
++            auto t0 = t_now();
++            size_t n_tok = 0;
++            for (const auto & t : texts) {
++                n_tok += cache.tokenize(t, true, true).size();
++            }
++            t_cached = ms_since(t0);
++            const auto stats = cache.get_stats();
++            fprintf(stderr, "pi measure CACHED: %.1f ms over %zu rounds (reuse=%llu full=%llu bytes_reused=%llu)\n",
++                    t_cached, texts.size(), (unsigned long long) stats.n_reuse, (unsigned long long) stats.n_full,
++                    (unsigned long long) stats.bytes_reused);
++        }
++        fprintf(stderr, "pi measure: full=%.1f ms cached=%.1f ms speedup=%.1fx\n",
++                t_full, t_cached, t_full / t_cached);
++    }
++}
++
++// misura end-to-end del path host per-request (W6-6 completo): parse messaggi ->
++// apply template (--jinja) -> tokenize, conversazione crescente alla scala pi.
++// cold  = template fresco + tokenizzazione piena (comportamento pre-card)
++// warm  = template con cache parser/gen-prompt + token-prefix cache (post-card)
++static void run_e2e_measure(const llama_vocab * vocab) {
++    const char * tmpl_path = "models/templates/Qwen-ChatML-no-think.jinja";
++    std::ifstream tin(tmpl_path, std::ios::binary);
++    if (!tin.good()) {
++        tmpl_path = "../models/templates/Qwen-ChatML-no-think.jinja";
++        tin.open(tmpl_path, std::ios::binary);
++    }
++    if (!tin.good()) {
++        fprintf(stderr, "e2e: template Qwen-ChatML-no-think.jinja non trovato, skip\n");
++        return;
++    }
++    const std::string tmpl_src((std::istreambuf_iterator<char>(tin)), std::istreambuf_iterator<char>());
++
++    const std::vector<std::string> contents = {
++        "Analizza il file src/llama-vocab.cpp e riduci le passate ridondanti del tokenizer BPE.",
++        "月亮在白莲花般的云朵里穿行，晚风吹来一阵阵快乐的歌声，我们坐在高高的谷堆旁边。",
++        "```cpp\nauto words = unicode_regex_split(text, regex);\nfor (auto & w : words) { merge(w); }\n```",
++        "{\"name\": \"edit_file\", \"arguments\": {\"path\": \"server-common.cpp\", \"old\": \"x\", \"new\": \"y\"}}",
++        "<think>\nthe prefix is unchanged, only the tail grows; reuse the tokens\n</think>",
++    };
++
++    // conversazione crescente: 16 round, ~25 KB per round -> ~410 KB finale
++    std::vector<std::vector<common_chat_msg>> rounds;
++    std::vector<common_chat_msg>              msgs;
++    for (size_t r = 0; r < 16; ++r) {
++        for (size_t j = 0; j < 25; ++j) {
++            common_chat_msg m;
++            m.role    = ((r * 25 + j) % 3 == 0) ? "user" : (((r * 25 + j) % 3 == 1) ? "assistant" : "tool");
++            m.content = contents[(r + j) % contents.size()];
++            for (int k = 0; k < 20; ++k) {
++                m.content += "\nline " + std::to_string(k) + ": " + contents[(r + j + k) % contents.size()];
++            }
++            if (m.role == "assistant") {
++                m.reasoning_content = "reasoning round " + std::to_string(r);
++            }
++            msgs.push_back(std::move(m));
++        }
++        rounds.push_back(msgs);
++    }
++
++    auto build_inputs = [](const std::vector<common_chat_msg> & m) {
++        common_chat_templates_inputs inputs;
++        inputs.messages              = m;
++        inputs.use_jinja             = true;
++        inputs.add_generation_prompt = true;
++        inputs.reasoning_format      = COMMON_REASONING_FORMAT_DEEPSEEK;
++        return inputs;
++    };
++
++    // warmup
++    {
++        common_chat_templates_ptr t = common_chat_templates_init(nullptr, tmpl_src);
++        (void) common_chat_templates_apply(t.get(), build_inputs(rounds.front()));
++        (void) common_tokenize(vocab, common_chat_templates_apply(t.get(), build_inputs(rounds.back())).prompt, true, true);
++    }
++
++    double t_cold = 0.0;
++    size_t last_tokens = 0, last_bytes = 0;
++    {
++        std::vector<double> per_round;
++        for (const auto & m : rounds) {
++            auto t0 = t_now();
++            common_chat_templates_ptr t = common_chat_templates_init(nullptr, tmpl_src);
++            const auto res = common_chat_templates_apply(t.get(), build_inputs(m));
++            const auto toks = common_tokenize(vocab, res.prompt, true, true);
++            per_round.push_back(ms_since(t0));
++            last_tokens = toks.size();
++            last_bytes  = res.prompt.size();
++        }
++        t_cold = std::accumulate(per_round.begin(), per_round.end(), 0.0);
++        fprintf(stderr, "e2e cold per-round ms:");
++        for (double v : per_round) fprintf(stderr, " %.1f", v);
++        fprintf(stderr, "\n");
++    }
++
++    double t_warm = 0.0;
++    {
++        common_chat_templates_ptr  t = common_chat_templates_init(nullptr, tmpl_src);
++        server_token_prefix_cache  cache(vocab);
++        std::vector<double> per_round;
++        for (const auto & m : rounds) {
++            auto t0 = t_now();
++            const auto res  = common_chat_templates_apply(t.get(), build_inputs(m));
++            const auto toks = cache.tokenize(res.prompt, true, true);
++            per_round.push_back(ms_since(t0));
++            last_tokens     = toks.size();
++        }
++        t_warm = std::accumulate(per_round.begin(), per_round.end(), 0.0);
++        fprintf(stderr, "e2e warm per-round ms:");
++        for (double v : per_round) fprintf(stderr, " %.1f", v);
++        fprintf(stderr, "\n");
++        const auto stats = cache.get_stats();
++        fprintf(stderr, "e2e warm: reuse=%llu full=%llu selfcheck_ok=%llu fail=%llu\n",
++                (unsigned long long) stats.n_reuse, (unsigned long long) stats.n_full,
++                (unsigned long long) stats.n_selfcheck_ok, (unsigned long long) stats.n_selfcheck_fail);
++    }
++
++    fprintf(stderr, "e2e (template apply + tokenize): %zu rounds, last prompt %zu B / %zu tokens\n",
++            rounds.size(), last_bytes, last_tokens);
++    fprintf(stderr, "e2e COLD: %.1f ms   WARM: %.1f ms   speedup %.1fx\n", t_cold, t_warm, t_warm > 0 ? t_cold / t_warm : 0.0);
++}
++static void run_big_synthetic_measure(const llama_vocab * vocab, const std::vector<std::pair<llama_token, std::string>> & specials) {
++    const std::string open  = specials[0].second;
++    const std::string close = specials.size() > 1 ? specials[1].second : specials[0].second;
++
++    // costruisce ~500 KB di conversazione
++    std::vector<std::string> texts;
++    std::string conv;
++    for (size_t r = 0; conv.size() < 500 * 1024; ++r) {
++        conv += synth_message(open, close, r);
++        if (r % 10 == 0) {
++            texts.push_back(conv);
++        }
++    }
++    texts.push_back(conv);
++    // tieni ~24 round
++    std::vector<std::string> keep;
++    for (size_t i = 0; i < texts.size(); ++i) {
++        if (i % std::max<size_t>(1, texts.size() / 24) == 0 || i + 1 == texts.size()) {
++            keep.push_back(texts[i]);
++        }
++    }
++    texts = keep;
++
++    (void) ref_tokenize(vocab, texts.back());
++    const size_t n_tokens_last = ref_tokenize(vocab, texts.back()).size();
++    fprintf(stderr, "synthetic big: %zu bytes, last round %zu tokens\n", texts.back().size(), n_tokens_last);
++
++    double t_full = 0.0;
++    {
++        auto t0 = t_now();
++        for (const auto & t : texts) {
++            (void) ref_tokenize(vocab, t);
++        }
++        t_full = ms_since(t0);
++        fprintf(stderr, "synthetic FULL: %.1f ms over %zu rounds\n", t_full, texts.size());
++    }
++    double t_cached = 0.0;
++    {
++        server_token_prefix_cache cache(vocab);
++        auto t0 = t_now();
++        for (const auto & t : texts) {
++            (void) cache.tokenize(t, true, true);
++        }
++        t_cached = ms_since(t0);
++        const auto stats = cache.get_stats();
++        fprintf(stderr, "synthetic CACHED: %.1f ms over %zu rounds (reuse=%llu full=%llu)\n", t_cached, texts.size(),
++                (unsigned long long) stats.n_reuse, (unsigned long long) stats.n_full);
++    }
++    fprintf(stderr, "synthetic: full=%.1f ms cached=%.1f ms speedup=%.1fx\n", t_full, t_cached, t_full / t_cached);
++}
++
++int main(int argc, char ** argv) {
++    if (argc < 2) {
++        fprintf(stderr, "usage: %s <vocab.gguf> [pi-prompt.txt]\n", argv[0]);
++        return 2;
++    }
++
++    llama_model_params mp = llama_model_default_params();
++    mp.vocab_only   = true;  // nessun tensore: zero allocazioni device (gate ZERO GPU)
++    mp.use_mmap     = true;
++    mp.check_tensors = false;
++
++    llama_model * model = llama_model_load_from_file(argv[1], mp);
++    if (model == nullptr) {
++        fprintf(stderr, "failed to load vocab from %s\n", argv[1]);
++        return 1;
++    }
++    const llama_vocab * vocab = llama_model_get_vocab(model);
++    const auto specials = vocab_specials(vocab);
++    fprintf(stderr, "vocab type=%d tokens=%d specials=%zu (longest: '%s')\n",
++            (int) llama_vocab_type(vocab), llama_vocab_n_tokens(vocab), specials.size(),
++            specials.empty() ? "-" : specials[0].second.c_str());
++
++    run_synthetic(vocab, specials);
++
++    if (argc >= 3) {
++        std::ifstream in(argv[2], std::ios::binary);
++        std::string prompt((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
++        if (prompt.size() > 4096) {
++            run_pi_corpus(vocab, prompt, specials);
++        } else {
++            fprintf(stderr, "pi prompt too short (%zu bytes), skipping pi corpus\n", prompt.size());
++        }
++    } else {
++        run_big_synthetic_measure(vocab, specials);
++    }
++
++    if (!expect_bypass_vocab(vocab)) {
++        run_e2e_measure(vocab);
++    }
++
++    llama_model_free(model);
++
++    fprintf(stderr, "%s: ALL OK\n", argv[0]);
++    return 0;
++}
+diff --git a/tools/server/server-common.cpp b/tools/server/server-common.cpp
+index 3d75cec52..fc394ad92 100644
+--- a/tools/server/server-common.cpp
++++ b/tools/server/server-common.cpp
+@@ -12,6 +12,9 @@
+ #include <random>
+ #include <sstream>
+ #include <fstream>
++#include <atomic>
++#include <mutex>
++#include <cstring>
+ 
+ json format_error_response(const std::string & message, const enum error_type type) {
+     std::string type_str;
+@@ -643,7 +646,8 @@ json json_get_nested_values(const std::vector<std::string> & paths, const json &
+     return result;
+ }
+ 
+-llama_tokens tokenize_mixed(const llama_vocab * vocab, const json & json_prompt, bool add_special, bool parse_special) {
++llama_tokens tokenize_mixed(const llama_vocab * vocab, const json & json_prompt, bool add_special, bool parse_special,
++                            server_token_prefix_cache * prefix_cache) {
+     // If `add_bos` is true, we only add BOS, when json_prompt is a string,
+     // or the first element of the json_prompt array is a string.
+     llama_tokens prompt_tokens;
+@@ -656,7 +660,11 @@ llama_tokens tokenize_mixed(const llama_vocab * vocab, const json & json_prompt,
+ 
+                 llama_tokens p;
+                 if (first) {
+-                    p = common_tokenize(vocab, s, add_special, parse_special);
++                    if (prefix_cache != nullptr) {
++                        p = prefix_cache->tokenize(s, add_special, parse_special);
++                    } else {
++                        p = common_tokenize(vocab, s, add_special, parse_special);
++                    }
+                     first = false;
+                 } else {
+                     p = common_tokenize(vocab, s, false, parse_special);
+@@ -673,12 +681,369 @@ llama_tokens tokenize_mixed(const llama_vocab * vocab, const json & json_prompt,
+         }
+     } else {
+         auto s = json_prompt.template get<std::string>();
+-        prompt_tokens = common_tokenize(vocab, s, add_special, parse_special);
++        if (prefix_cache != nullptr) {
++            prompt_tokens = prefix_cache->tokenize(s, add_special, parse_special);
++        } else {
++            prompt_tokens = common_tokenize(vocab, s, add_special, parse_special);
++        }
+     }
+ 
+     return prompt_tokens;
+ }
+ 
++//
++// W6-6 / A4-S1: token-prefix cache
++//
++
++// minimum shared prefix (bytes) before a splice is worth attempting
++static constexpr size_t k_tok_prefix_min_reuse_bytes = 256;
++// minimum prompt size (bytes) for an entry to be cached at all
++static constexpr size_t k_tok_prefix_min_entry_bytes = 1024;
++
++struct server_token_prefix_cache::entry {
++    bool     add_special   = false;
++    bool     parse_special = false;
++    std::string  text;
++    llama_tokens tokens;
++    // byte offset in `text` just past each token's last byte (tokens.size() entries;
++    // a leading BOS added by add_special maps to offset 0)
++    std::vector<uint32_t> tok_end;
++    // token index / byte start / piece length of every special-attr token, in token order
++    struct special_mark {
++        uint32_t index;
++        uint32_t start;
++        uint32_t length;
++    };
++    std::vector<special_mark> specials;
++
++    size_t size_bytes() const {
++        return text.size() + tokens.size() * sizeof(llama_token) + tok_end.size() * sizeof(uint32_t) +
++               specials.size() * sizeof(special_mark);
++    }
++};
++
++struct server_token_prefix_cache::impl {
++    const llama_vocab * vocab;
++    const size_t   max_entries;
++    const uint32_t selfcheck_n;
++    const bool     bpe_type;
++    const bool     add_bos;
++    const bool     add_eos;
++    const llama_token tok_bos;
++    const llama_token tok_eos;
++
++    std::atomic<bool> enabled_flag { true };
++
++    uint32_t selfchecks_done = 0;
++    server_token_prefix_cache_stats stats;
++
++    mutable std::mutex mtx;
++    std::vector<std::shared_ptr<const entry>> lru; // most recent first
++
++    impl(const llama_vocab * vocab, size_t max_entries, uint32_t selfcheck_n)
++            : vocab(vocab), max_entries(max_entries), selfcheck_n(selfcheck_n),
++              bpe_type(llama_vocab_type(vocab) == LLAMA_VOCAB_TYPE_BPE),
++              add_bos(llama_vocab_get_add_bos(vocab)), add_eos(llama_vocab_get_add_eos(vocab)),
++              tok_bos(llama_vocab_bos(vocab)), tok_eos(llama_vocab_eos(vocab)) {
++        const char * env = std::getenv("LLAMA_SERVER_TOKEN_PREFIX_CACHE");
++        if (env != nullptr && std::strcmp(env, "0") == 0) {
++            stats.enabled = false;
++        }
++        if (!bpe_type) {
++            // SPM/WPM/UGM keep cross-fragment state (e.g. the space prefix after a
++            // special token), so a tail splice is not provably identical: bypass
++            stats.enabled = false;
++        }
++        enabled_flag.store(stats.enabled, std::memory_order_relaxed);
++    }
++
++    // length of the piece of `tok` rendered with special=true; on a negative
++    // return the piece did not fit and must be fetched into a bigger buffer
++    static int32_t piece_length(const llama_vocab * vocab, llama_token tok, char * buf, size_t buf_size) {
++        return llama_token_to_piece(vocab, tok, buf, (int32_t) buf_size, /*lstrip*/ 0, /*special*/ true);
++    }
++
++    // walks tokens [token_from..end): appends their cumulative byte end offsets and
++    // the special-attr marks; verifies that each piece re-spells `text` exactly at
++    // byte_pos. leading BOS / trailing EOS added by add_special are skipped (they
++    // cover no prompt bytes). returns false when the invariant does not hold.
++    bool walk_tokens(const llama_tokens & tokens, const std::string & text, size_t token_from, bool add_special,
++                     std::vector<uint32_t> & tok_end_out, std::vector<entry::special_mark> & specials_out,
++                     size_t & byte_pos) const {
++        char buf[512];
++        for (size_t i = token_from; i < tokens.size(); ++i) {
++            const llama_token tok = tokens[i];
++            if (i == 0 && add_special && add_bos && tok == tok_bos) {
++                tok_end_out.push_back((uint32_t) byte_pos);
++                continue;
++            }
++            if (i + 1 == tokens.size() && add_special && add_eos && tok == tok_eos) {
++                tok_end_out.push_back((uint32_t) byte_pos);
++                continue;
++            }
++            int32_t len = piece_length(vocab, tok, buf, sizeof(buf));
++            const char * piece = buf;
++            std::string big;
++            if (len < 0) {
++                big.resize((size_t)(-len));
++                len = llama_token_to_piece(vocab, tok, big.data(), (int32_t) big.size(), 0, true);
++                if (len < 0 || (size_t) len != big.size()) {
++                    return false;
++                }
++                piece = big.data();
++            }
++            if (byte_pos + (size_t) len > text.size() || memcmp(text.data() + byte_pos, piece, (size_t) len) != 0) {
++                return false;
++            }
++            byte_pos += (size_t) len;
++            tok_end_out.push_back((uint32_t) byte_pos);
++            const auto attr = llama_vocab_get_attr(vocab, tok);
++            if (attr & (LLAMA_TOKEN_ATTR_CONTROL | LLAMA_TOKEN_ATTR_USER_DEFINED | LLAMA_TOKEN_ATTR_UNKNOWN)) {
++                specials_out.push_back({ (uint32_t) i, (uint32_t) byte_pos - (uint32_t) len, (uint32_t) len });
++            }
++        }
++        return true;
++    }
++
++    // builds a fresh entry from a full tokenization; nullptr when the invariant
++    // fails or the prompt is too small to be worth caching
++    std::shared_ptr<const entry> build_entry(const std::string & text, const llama_tokens & tokens, bool add_special,
++                                             bool parse_special) const {
++        if (text.size() < k_tok_prefix_min_entry_bytes) {
++            return nullptr;
++        }
++        auto e = std::make_shared<entry>();
++        e->add_special   = add_special;
++        e->parse_special = parse_special;
++        e->text          = text;
++        e->tokens        = tokens;
++        e->tok_end.reserve(tokens.size());
++        size_t byte_pos = 0;
++        if (!walk_tokens(tokens, e->text, 0, add_special, e->tok_end, e->specials, byte_pos) || byte_pos != e->text.size()) {
++            // pieces do not re-spell the prompt: this vocab cannot be spliced safely
++            return nullptr;
++        }
++        return e;
++    }
++
++    // builds the next entry by extending the prefix entry with the spliced tail
++    std::shared_ptr<const entry> extend_entry(const entry & base, uint32_t cut_index, uint32_t cut_start,
++                                              const std::string & text, llama_tokens && tokens, bool add_special,
++                                              bool parse_special) const {
++        auto e = std::make_shared<entry>();
++        e->add_special   = add_special;
++        e->parse_special = parse_special;
++        e->text          = text;
++        e->tokens        = std::move(tokens);
++
++        e->tok_end.assign(base.tok_end.begin(), base.tok_end.begin() + cut_index);
++        e->specials.reserve(base.specials.size() + 8);
++        for (const auto & s : base.specials) {
++            if (s.index < cut_index) {
++                e->specials.push_back(s);
++            }
++        }
++
++        size_t byte_pos = cut_start;
++        if (!walk_tokens(e->tokens, e->text, cut_index, add_special, e->tok_end, e->specials, byte_pos) ||
++                byte_pos != e->text.size()) {
++            return nullptr;
++        }
++        return e;
++    }
++
++    static size_t common_prefix_len(const std::string & a, const std::string & b) {
++        const size_t n = std::min(a.size(), b.size());
++        size_t i = 0;
++        for (; i + 64 <= n; i += 64) {
++            if (memcmp(a.data() + i, b.data() + i, 64) != 0) {
++                break;
++            }
++        }
++        for (; i < n && a[i] == b[i]; ++i) {
++        }
++        return i;
++    }
++
++    // caller holds mtx
++    void insert_entry(std::shared_ptr<const entry> e) {
++        for (auto it = lru.begin(); it != lru.end();) {
++            if (*it == e) {
++                it = lru.erase(it);
++            } else {
++                ++it;
++            }
++        }
++        lru.insert(lru.begin(), std::move(e));
++        while (lru.size() > max_entries) {
++            lru.pop_back();
++        }
++    }
++};
++
++server_token_prefix_cache::server_token_prefix_cache(const llama_vocab * vocab, size_t max_entries, uint32_t selfcheck_n)
++        : pimpl(std::make_unique<impl>(vocab, max_entries, selfcheck_n)) {}
++
++server_token_prefix_cache::~server_token_prefix_cache() = default;
++
++server_token_prefix_cache_stats server_token_prefix_cache::get_stats() const {
++    std::lock_guard<std::mutex> lock(pimpl->mtx);
++    return pimpl->stats;
++}
++
++void server_token_prefix_cache::reset() {
++    std::lock_guard<std::mutex> lock(pimpl->mtx);
++    pimpl->lru.clear();
++}
++
++llama_tokens server_token_prefix_cache::tokenize(const std::string & text, bool add_special, bool parse_special) {
++    // fast path: cache disabled (env, non-BPE vocab, or a failed self-check)
++    if (!pimpl->enabled_flag.load(std::memory_order_relaxed)) {
++        llama_tokens tokens = common_tokenize(pimpl->vocab, text, add_special, parse_special);
++        std::lock_guard<std::mutex> lock(pimpl->mtx);
++        pimpl->stats.n_lookups++;
++        if (!pimpl->bpe_type) {
++            pimpl->stats.n_bypass_type++;
++        }
++        return tokens;
++    }
++
++    std::shared_ptr<const entry> best;
++    size_t best_prefix = 0;
++    bool   flag_match_any = false;
++    {
++        std::lock_guard<std::mutex> lock(pimpl->mtx);
++        pimpl->stats.n_lookups++;
++        for (auto & e : pimpl->lru) {
++            if (e->add_special != add_special || e->parse_special != parse_special) {
++                continue;
++            }
++            flag_match_any = true;
++            const size_t pfx = impl::common_prefix_len(e->text, text);
++            if (pfx > best_prefix) {
++                best = e;
++                best_prefix = pfx;
++            }
++        }
++    }
++
++    auto full_tokenize = [&]() {
++        return common_tokenize(pimpl->vocab, text, add_special, parse_special);
++    };
++
++    // miss: tokenize fully and cache the result as the new conversation state
++    if (best == nullptr || best_prefix < k_tok_prefix_min_reuse_bytes) {
++        {
++            std::lock_guard<std::mutex> lock(pimpl->mtx);
++            if (!flag_match_any && !pimpl->lru.empty()) {
++                pimpl->stats.n_bypass_flag++;
++            } else if (best != nullptr) {
++                pimpl->stats.n_bypass_short++;
++            }
++        }
++        llama_tokens tokens = full_tokenize();
++        auto e = pimpl->build_entry(text, tokens, add_special, parse_special);
++        std::lock_guard<std::mutex> lock(pimpl->mtx);
++        pimpl->stats.n_full++;
++        if (e != nullptr) {
++            pimpl->insert_entry(std::move(e));
++        }
++        return tokens;
++    }
++
++    // full hit: identical prompt (retry / regenerate)
++    if (best_prefix == text.size() && text.size() == best->text.size()) {
++        std::lock_guard<std::mutex> lock(pimpl->mtx);
++        pimpl->stats.n_reuse_full_hit++;
++        pimpl->stats.n_reuse++;
++        pimpl->stats.bytes_reused += best_prefix;
++        pimpl->insert_entry(best);
++        return best->tokens;
++    }
++
++    // splice point: the last special-token start fully inside the shared prefix
++    // with at least one token before it (so add_special prefix tokens are always
++    // inherited from the cache). special-token starts are hard boundaries of
++    // tokenizer_st_partition, and BPE fragments tokenize independently, so
++    // full == cached_prefix + tokenize(tail) holds by construction.
++    uint32_t cut_index = 0;
++    uint32_t cut_start = 0;
++    for (const auto & s : best->specials) {
++        if (s.index >= 1 && (size_t)(s.start + s.length) <= best_prefix &&
++                s.start >= k_tok_prefix_min_reuse_bytes) {
++            cut_index = s.index;
++            cut_start = s.start;
++        }
++    }
++
++    if (cut_index == 0) {
++        // no safe boundary inside the shared prefix (e.g. prose without special
++        // tokens): full tokenization
++        llama_tokens tokens = full_tokenize();
++        auto e = pimpl->build_entry(text, tokens, add_special, parse_special);
++        std::lock_guard<std::mutex> lock(pimpl->mtx);
++        pimpl->stats.n_full++;
++        if (e != nullptr) {
++            pimpl->insert_entry(std::move(e));
++        }
++        return tokens;
++    }
++
++    // splice: cached prefix + freshly tokenized tail. the tail is tokenized with
++    // add_special=false (BOS is inherited from the prefix, EOS is re-appended
++    // below), mirroring llama_vocab::tokenize's ends-only special handling.
++    llama_tokens result;
++    {
++        llama_tokens delta = common_tokenize(pimpl->vocab, text.substr(cut_start), false, parse_special);
++        result.reserve(cut_index + delta.size() + 1);
++        result.assign(best->tokens.begin(), best->tokens.begin() + cut_index);
++        result.insert(result.end(), delta.begin(), delta.end());
++        if (add_special && pimpl->add_eos) {
++            result.push_back(pimpl->tok_eos);
++        }
++    }
++    auto next_entry = pimpl->extend_entry(*best, cut_index, cut_start, text, llama_tokens(result), add_special,
++                                          parse_special);
++
++    // self-check the first splices against a full tokenization
++    bool do_selfcheck = false;
++    {
++        std::lock_guard<std::mutex> lock(pimpl->mtx);
++        do_selfcheck = pimpl->selfchecks_done < pimpl->selfcheck_n;
++    }
++    if (do_selfcheck) {
++        const llama_tokens full = full_tokenize();
++        std::lock_guard<std::mutex> lock(pimpl->mtx);
++        pimpl->selfchecks_done++;
++        if (full == result) {
++            pimpl->stats.n_selfcheck_ok++;
++        } else {
++            pimpl->stats.n_selfcheck_fail++;
++            pimpl->stats.enabled = false;
++            pimpl->enabled_flag.store(false, std::memory_order_relaxed);
++            pimpl->lru.clear();
++            SRV_ERR("tokenizer prefix cache: self-check FAILED (splice != full tokenization), cache disabled%s\n", "");
++            return full;
++        }
++    }
++
++    {
++        std::lock_guard<std::mutex> lock(pimpl->mtx);
++        pimpl->stats.n_reuse++;
++        pimpl->stats.bytes_reused += cut_start;
++        if (next_entry != nullptr) {
++            pimpl->insert_entry(std::move(next_entry));
++        }
++    }
++
++    // a concurrent self-check may have just disabled the cache: never return an
++    // unverified splice once that happened
++    if (!pimpl->enabled_flag.load(std::memory_order_relaxed)) {
++        return full_tokenize();
++    }
++    return result;
++}
++
+ size_t validate_utf8(const std::string& text) {
+     size_t len = text.size();
+     if (len == 0) return 0;
+@@ -761,13 +1126,15 @@ server_tokens process_mtmd_prompt(mtmd_context * mctx, std::string prompt, std::
+  * - "prompt": [12, 34, "string", 56, 78]
+  * - "prompt": { "prompt_string": "string", "multimodal_data": [ "base64" ] }
+  */
+-static server_tokens tokenize_input_subprompt(const llama_vocab * vocab, mtmd_context * mctx, const json & json_prompt, bool add_special, bool parse_special) {
++static server_tokens tokenize_input_subprompt(const llama_vocab * vocab, mtmd_context * mctx, const json & json_prompt,
++                                               bool add_special, bool parse_special,
++                                               server_token_prefix_cache * prefix_cache = nullptr) {
+     constexpr char JSON_STRING_PROMPT_KEY[] = "prompt_string";
+     constexpr char JSON_MTMD_DATA_KEY[] = "multimodal_data";
+     const bool has_mtmd = mctx != nullptr;
+     if (json_prompt.is_string() || json_is_array_of_mixed_numbers_strings(json_prompt)) {
+         // string or mixed
+-        llama_tokens tmp = tokenize_mixed(vocab, json_prompt, add_special, parse_special);
++        llama_tokens tmp = tokenize_mixed(vocab, json_prompt, add_special, parse_special, prefix_cache);
+         return server_tokens(tmp, false);
+     } else if (json_is_array_of_numbers(json_prompt)) {
+         // array of tokens
+@@ -795,15 +1162,18 @@ static server_tokens tokenize_input_subprompt(const llama_vocab * vocab, mtmd_co
+    }
+ }
+ 
+-std::vector<server_tokens> tokenize_input_prompts(const llama_vocab * vocab, mtmd_context * mctx, const json & json_prompt, bool add_special, bool parse_special) {
++std::vector<server_tokens> tokenize_input_prompts(const llama_vocab * vocab, mtmd_context * mctx, const json & json_prompt,
++                                                  bool add_special, bool parse_special,
++                                                  server_token_prefix_cache * prefix_cache) {
+     std::vector<server_tokens> result;
+     if (json_prompt.is_array() && !json_is_array_and_contains_numbers(json_prompt)) {
+         result.reserve(json_prompt.size());
+         for (const auto & p : json_prompt) {
++            // the token-prefix cache only applies to plain string prompts
+             result.push_back(tokenize_input_subprompt(vocab, mctx, p,add_special, parse_special));
+         }
+     } else {
+-        result.push_back(tokenize_input_subprompt(vocab, mctx, json_prompt, add_special, parse_special));
++        result.push_back(tokenize_input_subprompt(vocab, mctx, json_prompt, add_special, parse_special, prefix_cache));
+     }
+     if (result.empty()) {
+         throw std::runtime_error("\"prompt\" must not be empty");
+diff --git a/tools/server/server-common.h b/tools/server/server-common.h
+index 527452347..0bdb6b24d 100644
+--- a/tools/server/server-common.h
++++ b/tools/server/server-common.h
+@@ -12,6 +12,8 @@
+ #include <string>
+ #include <vector>
+ #include <cinttypes>
++#include <cstdint>
++#include <memory>
+ 
+ using json = nlohmann::ordered_json;
+ 
+@@ -255,7 +257,63 @@ json json_get_nested_values(const std::vector<std::string> & paths, const json &
+  * - only string, example: "string"
+  * - mixed string and tokens, example: [12, 34, "string", 56, 78]
+  */
+-llama_tokens tokenize_mixed(const llama_vocab * vocab, const json & json_prompt, bool add_special, bool parse_special);
++llama_tokens tokenize_mixed(const llama_vocab * vocab, const json & json_prompt, bool add_special, bool parse_special,
++                            class server_token_prefix_cache * prefix_cache = nullptr);
++
++//
++// W6-6 / A4-S1: token-prefix cache for conversation prompts
++//
++
++struct server_token_prefix_cache_stats {
++    uint64_t n_lookups       = 0;  // total tokenize() calls seen
++    uint64_t n_full          = 0;  // full tokenizations served (miss / bypass)
++    uint64_t n_reuse         = 0;  // spliced results (cached prefix reused)
++    uint64_t n_reuse_full_hit = 0; // identical prompt served straight from cache
++    uint64_t n_bypass_type   = 0;  // non-BPE vocab: splice not supported, bypassed
++    uint64_t n_bypass_flag   = 0;  // (add_special, parse_special) differs from the entry
++    uint64_t n_bypass_short  = 0;  // common prefix too small to be worth a splice
++    uint64_t n_selfcheck_ok  = 0;  // self-check splices that matched the full tokenization
++    uint64_t n_selfcheck_fail = 0; // self-check mismatches (cache disabled when > 0)
++    uint64_t bytes_reused    = 0;  // total prefix bytes served from cache
++    bool     enabled         = true; // false after a self-check failure or env disable
++};
++
++/**
++ * Reuses the tokenized prefix of the previous prompt when a stateless client
++ * (e.g. pi) resends the same conversation with new turns appended: only the
++ * new tail is tokenized and spliced onto the cached token stream.
++ *
++ * Bit-identity with a full tokenization is by construction for BPE vocabularies:
++ * the splice point is always the start of a special-token fragment (a hard
++ * boundary of tokenizer_st_partition), and BPE fragments tokenize independently.
++ * Every entry is verified at creation (sum of token pieces must re-spell the
++ * prompt exactly) and the first splices are self-checked against a full
++ * tokenization; any mismatch disables the cache permanently for the process.
++ *
++ * Thread-safe (HTTP worker threads call tokenize() concurrently).
++ * Disable with LLAMA_SERVER_TOKEN_PREFIX_CACHE=0.
++ */
++class server_token_prefix_cache {
++  public:
++    // max_entries: LRU entries kept (one per interleaved conversation is enough)
++    // selfcheck_n: first splices verified against a full tokenization
++    server_token_prefix_cache(const llama_vocab * vocab, size_t max_entries = 4, uint32_t selfcheck_n = 3);
++    ~server_token_prefix_cache();
++
++    server_token_prefix_cache(const server_token_prefix_cache &) = delete;
++    server_token_prefix_cache & operator=(const server_token_prefix_cache &) = delete;
++
++    // same semantics as common_tokenize(vocab, text, add_special, parse_special)
++    llama_tokens tokenize(const std::string & text, bool add_special, bool parse_special);
++
++    server_token_prefix_cache_stats get_stats() const;
++    void reset(); // drop cached entries (enabled state is kept)
++
++  private:
++    struct entry;
++    struct impl;
++    std::unique_ptr<impl> pimpl;
++};
+ 
+ // return the last index of character that can form a valid string
+ // if the last character is potentially cut in half, return the index before the cut
+@@ -283,7 +341,8 @@ std::vector<server_tokens> tokenize_input_prompts(
+                                         mtmd_context * mctx,
+                                         const json & json_prompt,
+                                         bool add_special,
+-                                        bool parse_special);
++                                        bool parse_special,
++                                        class server_token_prefix_cache * prefix_cache = nullptr);
+ 
+ //
+ // OAI utils
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index 8cc76134b..d7a82ffb6 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -915,6 +915,11 @@ public:
+     mtmd_context * mctx = nullptr;
+     const llama_vocab * vocab = nullptr;
+ 
++    // W6-6 / A4-S1: reuses the tokenized conversation prefix across requests
++    // (stateless clients resend the whole history; only the tail is new).
++    // Thread-safe: HTTP worker threads tokenize concurrently.
++    std::unique_ptr<server_token_prefix_cache> token_prefix_cache;
++
+     server_queue    queue_tasks;
+     server_response queue_results;
+ 
+@@ -1079,6 +1084,13 @@ private:
+ 
+         vocab = llama_model_get_vocab(model_tgt);
+ 
++        token_prefix_cache = std::make_unique<server_token_prefix_cache>(vocab);
++        {
++            const auto cache_stats = token_prefix_cache->get_stats();
++            SRV_INF("tokenizer prefix cache %s (vocab type %d)\n",
++                    cache_stats.enabled ? "enabled" : "disabled", (int) llama_vocab_type(vocab));
++        }
++
+         n_ctx = llama_n_ctx(ctx_tgt);
+ 
+         add_bos_token = llama_vocab_get_add_bos(vocab);
+@@ -5180,7 +5192,8 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
+             inputs.push_back(process_mtmd_prompt(ctx_server.mctx, prompt.get<std::string>(), files));
+         } else {
+             // Everything else, including multimodal completions.
+-            inputs = tokenize_input_prompts(ctx_server.vocab, ctx_server.mctx, prompt, true, true);
++            inputs = tokenize_input_prompts(ctx_server.vocab, ctx_server.mctx, prompt, true, true,
++                                            ctx_server.token_prefix_cache.get());
+         }
+ 
+         // tasks.reserve(inputs.size()); // TODO: this is inaccurate due to child tasks
+-- 
+2.53.0
+

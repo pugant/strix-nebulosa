@@ -438,6 +438,46 @@ uint32_t llama_persist_crc32(const uint8_t * data, size_t size) {
     return crc32_stream_final(s);
 }
 
+// W6-5/W6-7 (A3): incremental wrapper over crc32_stream - see the header. The
+// pimpl keeps the fold state (and its pclmul-vs-table dispatch decision) out
+// of the ABI; update() composes exactly like feeding the whole buffer at once.
+struct llama_persist_crc32_folder::impl {
+    crc32_stream st;
+    bool finalized = false;
+};
+
+llama_persist_crc32_folder::llama_persist_crc32_folder() : p(new impl) {}
+
+llama_persist_crc32_folder::~llama_persist_crc32_folder() {
+    delete p;
+}
+
+llama_persist_crc32_folder::llama_persist_crc32_folder(llama_persist_crc32_folder && other) noexcept : p(other.p) {
+    other.p = nullptr;
+}
+
+llama_persist_crc32_folder & llama_persist_crc32_folder::operator=(llama_persist_crc32_folder && other) noexcept {
+    if (this != &other) {
+        delete p;
+        p = other.p;
+        other.p = nullptr;
+    }
+    return *this;
+}
+
+void llama_persist_crc32_folder::update(const void * data, size_t size) {
+    assert(p != nullptr && !p->finalized);
+    if (size > 0) {
+        crc32_stream_update(p->st, (const uint8_t *) data, size);
+    }
+}
+
+uint32_t llama_persist_crc32_folder::finalize() {
+    assert(p != nullptr && !p->finalized);
+    p->finalized = true;
+    return crc32_stream_final(p->st);
+}
+
 bool llama_persist_crc32_file(const char * path, uint64_t expected_size, uint32_t * crc_out) {
     const int fd = open(path, O_RDONLY);
     if (fd < 0) {

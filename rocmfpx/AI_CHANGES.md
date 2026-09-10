@@ -358,7 +358,85 @@ byte 2: v2[5:4] | v3[5:0]<<2
 | Restore-check | PENDING post-deploy (real restore timing with PCLMUL active) |
 | Deploy | NOT deployed — series prepared only |
 
+## Session 008 — 2026-09-10
+
+**Scope:** T32-b main-park series (branch `t32b-main-park` @`30d2c49be`, 11 commits on top of `optim-w5` @`ae48440e6`; linear reflog, nothing dropped/replaced, no `t32b-full` conservation branch). Park disk-library for the main-agent context: at a task-switch the main task's boundary disk-save is redirected to a dedicated park library (own MiB budget, own persist subdir), and on the next main load the park entry is a restore candidate under the existing cache rules. All behind two new flags, both default OFF.
+
+### `common/common.h` / `common/arg.cpp`
+
+| Change | Detail |
+|--------|--------|
+| New flags | `--cache-disk-park-mib` (default `0` = feature fully off; min 1024 when on) and `--cache-disk-park-heuristic` (default `none`; `none` \| `longest`). |
+
+### `tools/server/llama-park-identity.{h,cpp}` (new)
+
+| Change | Detail |
+|--------|--------|
+| Identity helpers | Pure functions, no server state / no llama runtime: `park_cfg` (mib + heuristic enum), `heur_state` (multiset of seen prompt token counts), `park_enabled`, `park_from_header` (`X-Pi-Role: main`), `park_from_heuristic` (LONGEST: >32768 and the longest seen), `park_task_is_main` (header wins over heuristic), `park_should_redirect` (task-switch redirect predicate, spec step 4.2; caller adds the live-park-instance conjunct). |
+
+### `tools/server/server-context.cpp`
+
+| Change | Detail |
+|--------|--------|
+| Park library instance | Persist subdir parametrized (`main-park`); park instance exists exactly when the disk cache is configured; a boot-failed park instance is fully inert (general library unaffected). |
+| Save redirect at task-switch | Disk half of the boundary save goes to the park library (`persist park: redirect disk-save of main task tokens=N`), with supersede of the previous park entry and a safety-net fallback to the general library if the park save fails (`persist park: fallback to general reason=park-disk-save-failed`). |
+| Park candidates in load() | Park entries are restore candidates under the existing selection rules; owner bookkeeping keeps RAM-cache vs park attribution explicit (who served the main-return). |
+| LONGEST registry | `park_heur.seen` insert gated on (COMPLETION\|\|INFILL) && park_enabled && heuristic==LONGEST (the only reader) — no registry growth without a reader. |
+| Metrics | `park_restore_crc_ms` exposed in the server metrics JSON. |
+
+### `tools/server/server-task.{h,cpp}`
+
+| Change | Detail |
+|--------|--------|
+| X-Pi-Role wiring | `park_main` explicit task-param field (client header `X-Pi-Role: main`); negative gate scoped to the `params_from_json_cmpl` body. |
+| Park budget + logs | Park budget accounting separate from the general persist budget; `persist park:` log family (enabled / disabled:reason=no-persist-budget / save / supersede / fallback). |
+| Gauge | `park_restore_crc_ms` (double) on the task result, fed by the pending park-restore verification. |
+
+### `tests/`
+
+| Change | Detail |
+|--------|--------|
+| 4 new binaries | `test-park-identity` (links `llama-park-identity.cpp` directly; combined header-vs-heuristic cases; source-scan gates surface their skip count in the verdict line instead of masking under ALL PASS), `test-park-library`, `test-park-redirect` (touch/supersede/fallback over two live cache instances), `test-park-load` (park candidate selection + owner routing) — the last three link `server-context`. |
+
+### Validation
+
+| Check | Result |
+|-------|--------|
+| Test binaries (Phase A, container) | 5/5 PASS — 4 new park binaries + pre-existing `test-persist-meta` (regression) |
+| `git am` gate | series re-applied on a detached worktree at `optim-w5` → resulting tree SHA `b5bb20b1cfe961ab6657dd29cbe393840ba52790` identical to `t32b-main-park` |
+| i3 byte-parity | 5 PASS / 0 FAIL — sha256 canone (w5-ref) vs ours identical (`f06d0e1fa…`, timed-gen 600 tok) |
+| Park mechanics live (i1) | redirect + real supersede + save in the server log: `persist park: enabled: … limit_mib=10240`, `redirect disk-save of main task tokens=59161`, `supersede entry=1 new=2`, `save entry=2 bytes=936828332` |
+| i1 / i2-i4 restore gates | NO-PASS (final runs: i1 6 PASS / 2 FAIL; i2/i4 4 PASS / 3 FAIL) — main-return restore hits the pre-existing T23 exact-boundary (lcp-esatto) limit: structural, not a T32-b defect, zero regression vs today (flags off = current behaviour). Details in `docs/t32b-REPORT.md` |
+| Cells driver note | host Mesa 26.0.8 (non-prod): i-cells were functional gates, timings not comparable with prod (container 25.3.6) |
+| Deploy | NOT deployed — default 0 = zero effect; deploy and flag activation = user GO (prerequisites in `docs/t32b-REPORT.md`) |
+
+## Session 009 — 2026-09-10
+
+**Scope:** W6-2 (wave-6 card A1-C1) — eliminate the eliminable CPY/CONT copies from the qwen4exp decode graph, host-side only; P3 fine attribution first.
+
+### `tests/test-copy-elim.cpp` (new) + `tests/CMakeLists.txt`
+
+| Fix | Detail |
+|-----|--------|
+| Attribution harness | Synthetic mini qwen4exp GGUF writer (trunk+MTP and draft-only; GDN + QSA + PLE + hc + MoE gate/up separate) + fixed decode schedule (prefill 8, N×1, one n=3 batch, 3 drafter evals with h input, target n_rs_seq=16) + per-node graph dump via the eval callback (op/name/shape/contiguity/FNV data-hash/src ops/named ancestor) + logits/state hashes for the bit-exact gate. Built via llama_build, not in ctest. |
+
+### `src/models/qwen4exp.cpp`
+
+| Fix | Line(s) | Detail |
+|-----|---------|--------|
+| conv-ring cont | build_conv_state_at | cpy the strided tail view directly (CPY reads through nb; delta-net-base always did); the per-slot `ggml_cont` added K−1 byte-identical CONT dispatches per layer-eval in decode. ~630 CONT/eval-target saved in prod |
+| hc collapse | build_hc_mix | fold the streams straight off their views (ADD already consumed a strided src1); drops the cont of stream 0, 97 CONT/eval-target |
+| QSA pooled | build_qsa_top_k | drop the per-slice cont (ADD reads views; the last ADD/scale yields the contiguous tensor the reshape needs) |
+| QSA q/top_k | build_qsa_top_k | drop cont of already-contiguous fresh tensors ahead of reshapes |
+| PLE tail | build_ple | drop cont of silu's fresh output before reshape_3d |
+| kept (documented) | build_ple | the kernel-column cont is a stride-kern gather (view_1d = row, wrong data — caught by the harness, reverted); shifted/permute/gate conts stay for consumer/matcher layout |
+
+**Verification:** bit-exact vs base `482d84333` (same harness both sides): 10/10 logits hashes + full state hash identical; 6.158/6.169 named tensor instances identical (the 11 diffs are the GDN fused result's never-read unwritten snapshot tail, proven by the matching cache writes). CONT per trunk eval 96→12, drafter 4→1, CPY unchanged (structural ring writes). Artifacts: `logs/wave6/w6m2-attribuzione.txt`, dumps and hashes alongside. VK build rc=0.
+
+
 <!-- TEMPLATE FOR FUTURE AI SESSIONS:
+
+Addendum (post final-review): fix `423a7b59b` — euristica LONGEST nutrita con la size d'ARRIVO del task (task_prev->tokens, spec r3) invece del boundary di slot (che include i generati e rendeva l'eguaglianza irraggiungibile); gate sorgente anti-regressione nel test. Serie finale: 13 commit, tree SHA `808af2282` (gate git-am pari).
 
 ## Session NNN — YYYY-MM-DD
 

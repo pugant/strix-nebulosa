@@ -10,6 +10,7 @@
 #include "llama-mmap.h"
 #include "llama-model.h"
 #include "llama-ext.h"
+#include "llama-persist-meta.h"
 #include "llama.h"
 
 #include <cinttypes>
@@ -2749,10 +2750,17 @@ private:
 
 class llama_io_write_file : public llama_io_write_i {
 public:
-    llama_io_write_file(llama_file * f) : file(f) {}
+    // W6-7 (A3-3): optional CRC sink - every byte that reaches the file is
+    // folded here (write() is the single funnel: write_tensor stages into the
+    // temp buffer and goes through it), so the CRC is over exactly the bytes
+    // on disk without a read-back pass
+    llama_io_write_file(llama_file * f, llama_persist_crc32_folder * crc = nullptr) : file(f), crc(crc) {}
 
     void write(const void * src, size_t size) override {
         file->write_raw(src, size);
+        if (crc != nullptr) {
+            crc->update(src, size);
+        }
         size_written += size;
     }
 
@@ -2768,6 +2776,7 @@ public:
 
 private:
     llama_file * file;
+    llama_persist_crc32_folder * crc = nullptr;
     size_t size_written = 0;
     std::vector<uint8_t> temp_buffer;
 };
@@ -3277,6 +3286,59 @@ bool llama_context::state_load_file(const char * filepath, llama_token * tokens_
     return true;
 }
 
+size_t llama_context::state_seq_load_buffer(llama_seq_id seq_id, const uint8_t * data, size_t size, llama_token * tokens_out, size_t n_token_capacity, size_t * n_token_count_out) {
+    // W6-5 (A3-1 var.B): mirror of state_seq_load_file over a host buffer that
+    // already holds the saved payload - the buffer IO defers the backend
+    // tensor_set calls to destruction exactly like the proven RAM-restore path
+    // (state_seq_set_data), so nothing here changes the restore semantics
+    llama_io_read_host io(data, size);
+
+    // version checks
+    {
+        uint32_t magic   = 0;
+        uint32_t version = 0;
+
+        io.read(&magic,   sizeof(magic));
+        io.read(&version, sizeof(version));
+
+        if (magic != LLAMA_STATE_SEQ_MAGIC || version != LLAMA_STATE_SEQ_VERSION) {
+            LLAMA_LOG_ERROR("%s: unknown (magic, version) for sequence state buffer: %08x, %08x\n", __func__, magic, version);
+            return 0;
+        }
+    }
+
+    // load the prompt
+    {
+        uint32_t n_token_count = 0;
+
+        io.read(&n_token_count, sizeof(n_token_count));
+
+        if (n_token_count > n_token_capacity) {
+            LLAMA_LOG_ERROR("%s: token count in sequence state buffer exceeded capacity! %u > %zu\n", __func__, n_token_count, n_token_capacity);
+            return 0;
+        }
+
+        io.read(tokens_out, sizeof(llama_token) * n_token_count);
+        *n_token_count_out = n_token_count;
+    }
+
+    // restore the context state
+    {
+        // note: state_seq_read_data returns io.n_bytes(), which here includes
+        // the header + token bytes read above (the file variant constructs its
+        // io after the header, so its nread covers the state section only) -
+        // the total must cover the whole buffer for a valid payload
+        const size_t nread = state_seq_read_data(io, seq_id, 0);
+        if (!nread) {
+            LLAMA_LOG_ERROR("%s: failed to restore sequence state\n", __func__);
+            return 0;
+        }
+        GGML_ASSERT(nread == io.n_bytes());
+    }
+
+    return io.n_bytes();
+}
+
 bool llama_context::state_save_file(const char * filepath, const llama_token * tokens, size_t n_token_count) {
     llama_file file(filepath, "wb");
 
@@ -3337,22 +3399,49 @@ size_t llama_context::state_seq_load_file(llama_seq_id seq_id, const char * file
     return file.tell();
 }
 
-size_t llama_context::state_seq_save_file(llama_seq_id seq_id, const char * filepath, const llama_token * tokens, size_t n_token_count) {
+size_t llama_context::state_seq_save_file(llama_seq_id seq_id, const char * filepath, const llama_token * tokens, size_t n_token_count, uint32_t * crc_out) {
+    // W6-7 (A3-3): when crc_out is set, the CRC-32 is folded while the bytes
+    // are written - the io writer covers the state section, and the header +
+    // token bytes written directly below are folded explicitly, so the final
+    // value is the CRC of the whole file (identical to a read-back pass)
+    llama_persist_crc32_folder crc;
+
     llama_file file(filepath, "wb");
 
-    file.write_u32(LLAMA_STATE_SEQ_MAGIC);
-    file.write_u32(LLAMA_STATE_SEQ_VERSION);
+    const uint32_t magic   = LLAMA_STATE_SEQ_MAGIC;
+    const uint32_t version = LLAMA_STATE_SEQ_VERSION;
+
+    file.write_u32(magic);
+    file.write_u32(version);
 
     // save the prompt
     file.write_u32((uint32_t) n_token_count);
     file.write_raw(tokens, sizeof(llama_token) * n_token_count);
 
+    // the CRC fold absorbs the bytes in STREAM ORDER: header + tokens first
+    // (written just above), then the state section as the io writer emits it
+    if (crc_out != nullptr) {
+        crc.update(&magic,   sizeof(magic));
+        crc.update(&version, sizeof(version));
+
+        const uint32_t n_token_count_u32 = (uint32_t) n_token_count;
+        crc.update(&n_token_count_u32, sizeof(n_token_count_u32));
+
+        if (n_token_count > 0) {
+            crc.update(tokens, sizeof(llama_token) * n_token_count);
+        }
+    }
+
     // save the context state using stream saving
-    llama_io_write_file io(&file);
+    llama_io_write_file io(&file, crc_out != nullptr ? &crc : nullptr);
     state_seq_write_data(io, seq_id, 0);
 
     const size_t res = file.tell();
     GGML_ASSERT(res == sizeof(uint32_t) * 3 + sizeof(llama_token) * n_token_count + io.n_bytes());
+
+    if (crc_out != nullptr) {
+        *crc_out = crc.finalize();
+    }
 
     return res;
 }
@@ -4408,6 +4497,17 @@ size_t llama_state_seq_save_file(llama_context * ctx, const char * filepath, lla
     }
 }
 
+size_t llama_state_seq_save_file_crc(llama_context * ctx, const char * filepath, llama_seq_id seq_id, const llama_token * tokens, size_t n_token_count, uint32_t * crc_out) {
+    ctx->synchronize();
+
+    try {
+        return ctx->state_seq_save_file(seq_id, filepath, tokens, n_token_count, crc_out);
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: error saving sequence state file: %s\n", __func__, err.what());
+        return 0;
+    }
+}
+
 size_t llama_state_seq_load_file(llama_context * ctx, const char * filepath, llama_seq_id dest_seq_id, llama_token * tokens_out, size_t n_token_capacity, size_t * n_token_count_out) {
     ctx->synchronize();
 
@@ -4415,6 +4515,17 @@ size_t llama_state_seq_load_file(llama_context * ctx, const char * filepath, lla
         return ctx->state_seq_load_file(dest_seq_id, filepath, tokens_out, n_token_capacity, n_token_count_out);
     } catch (const std::exception & err) {
         LLAMA_LOG_ERROR("%s: error loading sequence state file: %s\n", __func__, err.what());
+        return 0;
+    }
+}
+
+size_t llama_state_seq_load_buffer(llama_context * ctx, const uint8_t * data, size_t size, llama_seq_id dest_seq_id, llama_token * tokens_out, size_t n_token_capacity, size_t * n_token_count_out) {
+    ctx->synchronize();
+
+    try {
+        return ctx->state_seq_load_buffer(dest_seq_id, data, size, tokens_out, n_token_capacity, n_token_count_out);
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: error loading sequence state buffer: %s\n", __func__, err.what());
         return 0;
     }
 }

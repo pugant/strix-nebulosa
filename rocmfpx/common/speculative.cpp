@@ -1728,6 +1728,12 @@ struct common_speculative_state_draft_mtp : public common_speculative_impl {
     // pre-advancement before process() mirrored the verify batch.
     std::vector<uint16_t> last_n_drafted;
     std::vector<uint8_t> drafting;
+    // W6-1 leva-2: one-shot F4 drafting suppression. Set by draft_sync_reset()
+    // after a partial rejection; consumed by the next draft() which skips the
+    // sequence for that single round (the measured H1 benefit) while the
+    // accepted boundary stays valid so process() feeds the plain round's
+    // mirror with the real h instead of the neutral zero row.
+    std::vector<uint8_t> suppress_draft;
     std::vector<int>                i_last;
     std::vector<std::vector<float>> chain_h;
 
@@ -1894,6 +1900,7 @@ struct common_speculative_state_draft_mtp : public common_speculative_impl {
 
         last_n_drafted.assign(n_seq, 0);
         drafting.assign(n_seq, 0);
+        suppress_draft.assign(n_seq, 0);
     }
 
     ~common_speculative_state_draft_mtp() override {
@@ -1917,6 +1924,13 @@ struct common_speculative_state_draft_mtp : public common_speculative_impl {
     }
 
     void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
+        // W6-1 leva-2: a new generation never inherits the previous task's
+        // one-shot F4 suppression (a task ending on a partial rejection would
+        // otherwise burn a plain round at the start of the next one).
+        if (seq_id >= 0 && seq_id < (llama_seq_id) n_seq) {
+            suppress_draft[seq_id] = 0;
+        }
+
         const int32_t N = (int32_t) prompt.size();
         if (N <= 0) {
             return;
@@ -2195,6 +2209,23 @@ struct common_speculative_state_draft_mtp : public common_speculative_impl {
             }
 
             last_n_drafted[seq_id] = 0;
+
+            // W6-1 leva-2: F4 one-shot suppression after a partial rejection.
+            // Skip drafting for exactly this round (the reset's measured H1
+            // benefit - proposing from the just-rejected boundary is
+            // counterproductive) but do NOT invalidate the boundary: the plain
+            // round's process() mirror uses it, so the MTP KV row for the new
+            // position is written with the real accepted h instead of the
+            // neutral zero row that reset_seq_state() used to force here.
+            if (suppress_draft[seq_id]) {
+                suppress_draft[seq_id] = 0;
+
+                SPC_DBG("F4 one-shot draft suppression (seq %d) - boundary kept at pos %d/%d\n",
+                        (int) seq_id, (int) pending_h_pos[seq_id], (int) pending_h_valid[seq_id]);
+
+                dp.drafting = false;
+                continue;
+            }
 
             // Draft positions must be in the target's RoPE space. They coincide
             // with n_past for text-only prompts; after an image chunk they do not,
@@ -2588,6 +2619,9 @@ struct common_speculative_state_draft_mtp : public common_speculative_impl {
         ring_head[seq_id] = 0;
         last_n_drafted[seq_id] = 0;
         drafting[seq_id] = 0;
+        // W6-1 leva-2: a restored/rewound state drafts normally - the one-shot
+        // F4 suppression belongs to the live partial-reject flow only.
+        suppress_draft[seq_id] = 0;
         i_last[seq_id] = -1;
         if (chain_heads) {
             chain_h[seq_id].clear();
@@ -2745,11 +2779,21 @@ struct common_speculative_state_draft_mtp : public common_speculative_impl {
         }
     }
 
-    // F4: reset the draft-sync state the next round would misuse (ghost rows)
-    // while keeping the cache boundary available — snapshot the accepted-
-    // boundary blob (the live state right after accept() is coherent with it)
-    // just before clearing. The live state re-arms on the next process() and
-    // get_state serves fresh data again.
+    // F4 (+ W6-1 leva-2 amendment): suppress the next round's drafting - the
+    // measured H1 intervention (bench 29/08: proposing from the just-rejected
+    // boundary raised p0-reject 0.272 vs 0.099 base; suppression 0.161) - while
+    // keeping the cache boundary available: snapshot the accepted-boundary blob
+    // (the live state right after accept() is coherent with it). The amendment:
+    // the full reset_seq_state() that used to run here also invalidated
+    // pending_h, which forced the next process() into the NEUTRAL resync - the
+    // plain round's mirror row was then written with a zero h and permanently
+    // poisoned one MTP KV cell per partial rejection (the unexplained residual
+    // excess of the F4 bench). accept() has already rewound pending_h to the
+    // accepted boundary, so keeping it valid lets that same mirror row carry
+    // the real h: same round structure as the measured fix, no state
+    // corruption. The boundary re-arms on the plain round's process() and
+    // get_state serves fresh data again (the snapshot only covers the window
+    // where the task ends before the plain round runs).
     void draft_sync_reset(llama_seq_id seq_id) override {
         if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
             return;
@@ -2760,7 +2804,7 @@ struct common_speculative_state_draft_mtp : public common_speculative_impl {
             boundary_snapshot[seq_id] = std::move(snap);
         }
 
-        reset_seq_state(seq_id);
+        suppress_draft[seq_id] = 1;
     }
 
     bool need_embd() const override {

@@ -1,0 +1,529 @@
+From 8320ef94ccf2ee0284910027036d4eb93e437da5 Mon Sep 17 00:00:00 2001
+From: pugant <pugant@localhost>
+Date: Thu, 10 Sep 2026 18:15:53 +0200
+Subject: [PATCH 17/19] vulkan: scope the tracker barrier to the involved
+ buffers (A6-S1 / W6-4)
+
+The dependency tracker's ggml_vk_sync_buffers call now emits a single
+pipelineBarrier with one buffer memory barrier per involved device
+buffer (the enclosing range of each dependency pair, merged per buffer)
+instead of a device-wide memory barrier. Kernels touching none of the
+covered ranges are no longer ordered against each other, so independent
+chains keep overlapping across the barrier and cache flush/invalidation
+is limited to the covered ranges.
+
+Only the regions covered by the barrier are dropped from the tracker;
+everything else stays tracked and fires its own barrier later. The
+prealloc pending-read flags are cleared only when the prealloc buffer
+is included at full extent, which ggml_vk_build_scoped_sync_ranges does
+whenever a flag is set - preserving the exact flag-clear points the
+device-wide barrier provided. Conservative fallbacks keep the
+device-wide barrier when the buffer set cannot be resolved or exceeds
+16 ranges, and GGML_VK_SYNC_SCOPE=0 disables scoping entirely (same
+binary A/B).
+
+Gates (zero GPU):
+- tests/test-vk-sync-tracker.cpp grows a hazard oracle: the scoped
+  path is simulated over randomized node groups and brute-force checked
+  so every inter-group RAW/WAR/WAW pair has a barrier covering the
+  overlap between the accesses - 43372 barrier ranges, 0 missed hazards;
+  a sabotaged over-clearing variant fails with 236901 misses (the
+  oracle has teeth).
+- test-backend-ops on lavapipe (CPU Vulkan), same op set on the
+  baseline, scoped and kill-switch binaries: all cases OK, identical
+  sync decisions (59 = 59 = 59), no global fallback hit on the scoped
+  path.
+
+Co-Authored-By: GLM by z.ai
+---
+ ggml/src/ggml-vulkan/ggml-vulkan.cpp | 251 ++++++++++++++++++++++++---
+ tests/test-vk-sync-tracker.cpp       | 122 +++++++++++++
+ 2 files changed, 350 insertions(+), 23 deletions(-)
+
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+index a69d14aaa..187e8a507 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
++++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+@@ -1827,6 +1827,10 @@ std::mutex vk_memory_logger::log_mutex;
+ static bool vk_perf_logger_enabled = false;
+ static bool vk_perf_logger_concurrent = false;
+ static bool vk_enable_sync_logger = false;
++// W6-4 / A6-S1: emit the tracker-triggered barrier scoped to the involved
++// buffer ranges instead of a device-wide memory barrier. Kill switch:
++// GGML_VK_SYNC_SCOPE=0 reverts to the device-wide barrier.
++static bool vk_sync_scoped_enabled = true;
+ // number of calls between perf logger prints
+ static uint32_t vk_perf_logger_frequency = 1;
+ static std::string vk_pipeline_stats_filter;
+@@ -2030,6 +2034,10 @@ struct ggml_backend_vk_context {
+     // keeps the decision identical while the scan cost no longer grows with the
+     // accesses tracked for every other buffer (W6-4 / A6-S2).
+     ggml_vk::unsynced_tracker unsynced;
++    // Resolves the tracker's buffer identities back to vk_buffer handles for
++    // the scoped barriers, and keeps those buffers alive while a region of
++    // theirs is tracked (W6-4 / A6-S1).
++    std::unordered_map<const void *, vk_buffer> unsynced_buffers;
+     // Track which prealloc buffers have pending reads that need to be synchronized.
+     // These are checked before writing to the buffer (and call ggml_vk_sync_buffers if set),
+     // and set to true after the buffer contents are consumed.
+@@ -3133,6 +3141,178 @@ static void ggml_vk_sync_buffers(ggml_backend_vk_context* ctx, vk_context& subct
+     );
+ }
+ 
++// W6-4 / A6-S1: one buffer range a scoped barrier must cover.
++struct vk_sync_range {
++    vk_buffer buf;
++    uint64_t base;
++    uint64_t size;
++};
++
++// W6-4 / A6-S1: scoped variant of ggml_vk_sync_buffers. Emits a single
++// pipelineBarrier carrying one buffer memory barrier per range instead of a
++// device-wide memory barrier. Kernels that touch none of the covered ranges
++// are not ordered against each other, so independent chains keep overlapping
++// across the barrier. The prealloc pending-read flags are only cleared for
++// the prealloc buffers whose full extent is covered by one of the ranges.
++static void ggml_vk_sync_buffers_scoped(ggml_backend_vk_context * ctx, vk_context & subctx, const std::vector<vk_sync_range> & ranges) {
++    VK_LOG_DEBUG("ggml_vk_sync_buffers_scoped()");
++
++    const bool transfer_queue = subctx->p->q->transfer_only;
++
++    const vk::AccessFlags mask = !transfer_queue
++        ? (vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite | vk::AccessFlagBits::eTransferRead | vk::AccessFlagBits::eTransferWrite)
++        : (vk::AccessFlagBits::eTransferRead | vk::AccessFlagBits::eTransferWrite);
++
++    std::vector<vk::BufferMemoryBarrier> barriers;
++    barriers.reserve(ranges.size());
++    for (const auto & r : ranges) {
++        // The tracked regions come from tensors placed inside the buffer, so
++        // the clamp never bites in practice; it only guards the barrier
++        // against an out-of-bounds range.
++        const uint64_t base = std::min<uint64_t>(r.base, r.buf->size);
++        const uint64_t size = std::min<uint64_t>(r.size, r.buf->size - base);
++        if (size == 0) {
++            continue;
++        }
++        barriers.push_back(vk::BufferMemoryBarrier(
++            mask, mask,
++            VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
++            r.buf->buffer, base, size));
++    }
++
++    if (barriers.empty()) {
++        // Degenerate ranges only; order everything like the device-wide
++        // barrier so no dependency is lost.
++        ggml_vk_sync_buffers(ctx, subctx);
++        return;
++    }
++
++    if (ctx) {
++        const auto fully_covered = [&](const vk_buffer & buf) {
++            if (buf == nullptr) {
++                return false;
++            }
++            for (const auto & r : ranges) {
++                if (r.buf == buf && r.base == 0 && r.size >= buf->size) {
++                    return true;
++                }
++            }
++            return false;
++        };
++        if (fully_covered(ctx->prealloc_x)) {
++            ctx->prealloc_x_need_sync = false;
++        }
++        if (fully_covered(ctx->prealloc_y)) {
++            ctx->prealloc_y_need_sync = false;
++        }
++        if (fully_covered(ctx->prealloc_split_k)) {
++            ctx->prealloc_split_k_need_sync = false;
++        }
++    }
++
++    subctx->s->buffer->buf.pipelineBarrier(
++        subctx->p->q->stage_flags,
++        subctx->p->q->stage_flags,
++        {},
++        {},
++        barriers,
++        {}
++    );
++}
++
++// W6-4 / A6-S1: resolve tracker conflicts into at most one enclosing range
++// per device buffer, and include the prealloc buffers with pending reads at
++// full extent (the device-wide barrier used to clear those flags
++// implicitly). Returns false when the set cannot be built unambiguously, in
++// which case the caller must fall back to the device-wide barrier.
++static bool ggml_vk_build_scoped_sync_ranges(ggml_backend_vk_context * ctx, const std::vector<ggml_vk::sync_conflict> & conflicts, std::vector<vk_sync_range> & ranges) {
++    constexpr size_t kMaxRanges = 16;
++
++    const auto include_full = [&](const vk_buffer & buf) -> bool {
++        if (buf == nullptr) {
++            return true;
++        }
++        for (auto & r : ranges) {
++            if (r.buf == buf) {
++                // Widen to the full buffer extent.
++                if (r.base > 0) {
++                    r.size += r.base;
++                    r.base = 0;
++                }
++                if (r.size < buf->size) {
++                    r.size = buf->size;
++                }
++                return true;
++            }
++        }
++        if (ranges.size() >= kMaxRanges) {
++            return false;
++        }
++        ranges.push_back({ buf, 0, buf->size });
++        return true;
++    };
++
++    for (const auto & c : conflicts) {
++        auto it = ctx->unsynced_buffers.find(c.buf);
++        if (it == ctx->unsynced_buffers.end() || it->second == nullptr) {
++            // Buffer identity cannot be resolved back to a handle: take the
++            // conservative path.
++            return false;
++        }
++        bool merged = false;
++        for (auto & r : ranges) {
++            if (r.buf.get() == c.buf) {
++                const uint64_t new_end = std::max(r.base + r.size, c.base + c.size);
++                r.base = std::min(r.base, c.base);
++                r.size = new_end - r.base;
++                merged = true;
++                break;
++            }
++        }
++        if (!merged) {
++            if (ranges.size() >= kMaxRanges) {
++                return false;
++            }
++            ranges.push_back({ it->second, c.base, c.size });
++        }
++    }
++
++    // The prealloc buffers hold sub-dispatch temporaries the tracker cannot
++    // see; a pending-read flag means a barrier must order those reads before
++    // the next overwrite. Include them here so the flags can be cleared,
++    // exactly like the device-wide barrier did.
++    if (ctx->prealloc_x_need_sync && !include_full(ctx->prealloc_x)) {
++        return false;
++    }
++    if (ctx->prealloc_y_need_sync && !include_full(ctx->prealloc_y)) {
++        return false;
++    }
++    if (ctx->prealloc_split_k_need_sync && !include_full(ctx->prealloc_split_k)) {
++        return false;
++    }
++
++    return true;
++}
++
++// W6-4 / A6-S1: drop the side-map entries for buffers the tracker no longer
++// holds regions for, so resolved vk_buffer handles do not outlive their
++// tracking.
++static void ggml_vk_prune_unsynced_buffers(ggml_backend_vk_context * ctx) {
++    if (ctx->unsynced_buffers.empty()) {
++        return;
++    }
++    const auto tracked = ctx->unsynced.tracked_buffers();
++    std::unordered_map<const void *, vk_buffer> keep;
++    keep.reserve(tracked.size());
++    for (const auto id : tracked) {
++        auto it = ctx->unsynced_buffers.find(id);
++        if (it != ctx->unsynced_buffers.end()) {
++            keep.emplace(id, it->second);
++        }
++    }
++    ctx->unsynced_buffers.swap(keep);
++}
++
+ static void ggml_vk_reset_event(vk_context& ctx, vk::Event& event) {
+     VK_LOG_DEBUG("ggml_vk_set_event()");
+ 
+@@ -6890,6 +7070,10 @@ static void ggml_vk_instance_init() {
+     vk_perf_logger_enabled = getenv("GGML_VK_PERF_LOGGER") != nullptr;
+     vk_perf_logger_concurrent = getenv("GGML_VK_PERF_LOGGER_CONCURRENT") != nullptr;
+     vk_enable_sync_logger = getenv("GGML_VK_SYNC_LOGGER") != nullptr;
++    const char * GGML_VK_SYNC_SCOPE = getenv("GGML_VK_SYNC_SCOPE");
++    if (GGML_VK_SYNC_SCOPE != nullptr) {
++        vk_sync_scoped_enabled = atoi(GGML_VK_SYNC_SCOPE) != 0;
++    }
+     vk_memory_logger_enabled = getenv("GGML_VK_MEMORY_LOGGER") != nullptr;
+     const char* GGML_VK_PIPELINE_STATS = getenv("GGML_VK_PIPELINE_STATS");
+     if (GGML_VK_PIPELINE_STATS != nullptr) {
+@@ -14706,6 +14890,8 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
+         // outside of this logic. When a node uses one of the prealloc buffers for something like
+         // dequantization or split_k, additional synchronization is needed between those passes.
+         bool need_sync = false;
++        // Conflicts of the whole group, collected to size the scoped barrier.
++        std::vector<ggml_vk::sync_conflict> conflicts;
+ 
+         // Check whether "node" requires synchronization. The node requires synchronization if it
+         // overlaps in memory with another unsynchronized access and at least one of them is a write.
+@@ -14714,35 +14900,35 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
+         // same device buffer and the tensor or view ranges overlap. The per-buffer tracker keeps
+         // this decision identical to the previous flat tensor lists while only scanning the regions
+         // of the buffer the tensor actually lives in (W6-4 / A6-S2).
+-        auto const &tensor_sync_region = [&](const ggml_tensor * node, const void * & buf, uint64_t & base, uint64_t & size) {
++        auto const &tensor_sync_region = [&](const ggml_tensor * node, vk_buffer & vbuf, uint64_t & base, uint64_t & size) {
+             ggml_backend_vk_buffer_context * buf_ctx = (ggml_backend_vk_buffer_context *)node->buffer->context;
+-            buf = buf_ctx->dev_buffer.get();
++            vbuf = buf_ctx->dev_buffer;
+             base = vk_tensor_offset(node) + node->view_offs;
+             size = ggml_nbytes(node);
+         };
+ 
+         // For all fused ops, check if the destination node or any of the source
+-        // nodes require synchronization.
+-        for (int32_t i = 0; i < ctx->num_additional_fused_ops + 1 && !need_sync; ++i) {
++        // nodes require synchronization. The whole dependency scope of the
++        // group is collected (no early exit) so a scoped barrier can cover
++        // every hazard of the group at once.
++        for (int32_t i = 0; i < ctx->num_additional_fused_ops + 1; ++i) {
+             const ggml_tensor *cur_node = cgraph->nodes[node_idx + i];
+             // If the node actually writes to memory, then check if it needs to sync
+             if (ctx->fused_ops_write_mask & (1 << i)) {
+-                const void * buf; uint64_t base, size;
+-                tensor_sync_region(cur_node, buf, base, size);
+-                if (ctx->unsynced.find_conflicts(buf, base, size, true, nullptr)) {
++                vk_buffer vbuf; uint64_t base, size;
++                tensor_sync_region(cur_node, vbuf, base, size);
++                if (ctx->unsynced.find_conflicts(vbuf.get(), base, size, true, &conflicts)) {
+                     need_sync = true;
+-                    break;
+                 }
+             }
+             for (uint32_t j = 0; j < GGML_MAX_SRC; ++j) {
+                 if (!cur_node->src[j]) {
+                     continue;
+                 }
+-                const void * buf; uint64_t base, size;
+-                tensor_sync_region(cur_node->src[j], buf, base, size);
+-                if (ctx->unsynced.find_conflicts(buf, base, size, false, nullptr)) {
++                vk_buffer vbuf; uint64_t base, size;
++                tensor_sync_region(cur_node->src[j], vbuf, base, size);
++                if (ctx->unsynced.find_conflicts(vbuf.get(), base, size, false, &conflicts)) {
+                     need_sync = true;
+-                    break;
+                 }
+             }
+         }
+@@ -14751,10 +14937,25 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
+             if (vk_enable_sync_logger) {
+                 std::cerr <<  "sync" << std::endl;
+             }
+-            // The barrier emitted by ggml_vk_sync_buffers is device-wide, so
+-            // every tracked access becomes synchronized.
+-            ctx->unsynced.clear_all();
+-            ggml_vk_sync_buffers(ctx, compute_ctx);
++
++            std::vector<vk_sync_range> ranges;
++            const bool scoped = vk_sync_scoped_enabled && ggml_vk_build_scoped_sync_ranges(ctx, conflicts, ranges);
++            if (scoped) {
++                // Only the covered regions become synchronized; every other
++                // tracked region stays and will fire its own barrier later.
++                ctx->unsynced.clear_covered(conflicts);
++                ggml_vk_sync_buffers_scoped(ctx, compute_ctx, ranges);
++            } else {
++                // The barrier emitted by ggml_vk_sync_buffers is device-wide,
++                // so every tracked access becomes synchronized.
++                ctx->unsynced.clear_all();
++                ggml_vk_sync_buffers(ctx, compute_ctx);
++            }
++            ggml_vk_prune_unsynced_buffers(ctx);
++            if (vk_enable_sync_logger) {
++                std::cerr << "sync scope: " << (scoped ? "buffer" : "global")
++                          << ", " << (scoped ? ranges.size() : 1) << " barrier range(s)" << std::endl;
++            }
+ 
+             if (vk_perf_logger_enabled && vk_perf_logger_concurrent) {
+                 ctx->query_node_idx[ctx->query_idx] = node_idx;
+@@ -14762,22 +14963,25 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
+                 ggml_vk_sync_buffers(ctx, compute_ctx);
+             }
+         }
+-        // Add all fused nodes to the unsynchronized tracker.
++        // Add all fused nodes to the unsynchronized tracker, and keep the
++        // buffer handles resolvable for the scoped barriers.
+         for (int32_t i = 0; i < ctx->num_additional_fused_ops + 1; ++i) {
+             const ggml_tensor *cur_node = cgraph->nodes[node_idx + i];
+             // Multiple outputs could be written, e.g. in topk_moe. Add them all to the list.
+             if (ctx->fused_ops_write_mask & (1 << i)) {
+-                const void * buf; uint64_t base, size;
+-                tensor_sync_region(cur_node, buf, base, size);
+-                ctx->unsynced.record(buf, base, size, true);
++                vk_buffer vbuf; uint64_t base, size;
++                tensor_sync_region(cur_node, vbuf, base, size);
++                ctx->unsynced.record(vbuf.get(), base, size, true);
++                ctx->unsynced_buffers[vbuf.get()] = vbuf;
+             }
+             for (uint32_t j = 0; j < GGML_MAX_SRC; ++j) {
+                 if (!cur_node->src[j]) {
+                     continue;
+                 }
+-                const void * buf; uint64_t base, size;
+-                tensor_sync_region(cur_node->src[j], buf, base, size);
+-                ctx->unsynced.record(buf, base, size, false);
++                vk_buffer vbuf; uint64_t base, size;
++                tensor_sync_region(cur_node->src[j], vbuf, base, size);
++                ctx->unsynced.record(vbuf.get(), base, size, false);
++                ctx->unsynced_buffers[vbuf.get()] = vbuf;
+             }
+         }
+     }
+@@ -15216,6 +15420,7 @@ static void ggml_vk_graph_cleanup(ggml_backend_vk_context * ctx) {
+     ctx->prealloc_y_last_decode_vector_staging = false;
+ 
+     ctx->unsynced.clear_all();
++    ctx->unsynced_buffers.clear();
+     ctx->prealloc_x_need_sync = ctx->prealloc_y_need_sync = ctx->prealloc_split_k_need_sync = false;
+ 
+     ggml_vk_command_pool_cleanup(ctx->device, ctx->compute_cmd_pool);
+diff --git a/tests/test-vk-sync-tracker.cpp b/tests/test-vk-sync-tracker.cpp
+index 4e61a2ddd..0b4cbf0b1 100644
+--- a/tests/test-vk-sync-tracker.cpp
++++ b/tests/test-vk-sync-tracker.cpp
+@@ -272,6 +272,127 @@ static void test_randomized_equivalence() {
+     }
+ }
+ 
++// ---------------------------------------------------------------------------
++// Scoped-clear hazard oracle (A6-S1 gate): simulate the scoped path exactly
++// as production runs it (collect the group's conflicts -> merge into one
++// enclosing range per buffer -> clear_covered -> record), then verify by
++// brute force over the whole access trace that every inter-group RAW/WAR/WAW
++// pair had a barrier covering the overlap between the two accesses. A missed
++// dependency would be a lost barrier: a correctness bug, not a slowdown.
++// ---------------------------------------------------------------------------
++
++struct oracle_access {
++    const void * buf;
++    uint64_t base;
++    uint64_t size;
++    bool write;
++    int group;  // node group the access belongs to
++};
++
++static void test_scoped_hazard_oracle() {
++    int total_barriers = 0;
++    int total_misses = 0;
++
++    for (uint64_t seed = 1; seed <= 25; ++seed) {
++        rng g(seed * 0xD1B54A32D192ED03ULL);
++        const void * bufs[3] = { BUF_A, BUF_B, BUF_C };
++
++        ggml_vk::unsynced_tracker t;
++        std::vector<oracle_access> trace;
++        // Barrier emitted at group boundary: (position = number of accesses
++        // recorded before the group that emitted it, covered range).
++        std::vector<std::pair<int, ggml_vk::sync_conflict>> barriers;
++
++        const int n_groups = 1500;
++        for (int grp = 0; grp < n_groups; ++grp) {
++            // One node group: a destination (mostly writing) plus sources.
++            std::vector<std::tuple<const void *, uint64_t, uint64_t, bool>> group;
++            const uint64_t window = (g.below(4) == 0) ? 4096 : 384;
++            group.push_back({ bufs[g.below(3)], g.below(window), 1 + g.below(192), g.below(8) != 0 });
++            const int n_src = 1 + (int) g.below(3);
++            for (int j = 0; j < n_src; ++j) {
++                group.push_back({ bufs[g.below(3)], g.below(window), 1 + g.below(192), false });
++            }
++
++            bool need_sync = false;
++            std::vector<ggml_vk::sync_conflict> conflicts;
++            for (const auto & a : group) {
++                if (t.find_conflicts(std::get<0>(a), std::get<1>(a), std::get<2>(a), std::get<3>(a), &conflicts)) {
++                    need_sync = true;
++                }
++            }
++
++            if (need_sync) {
++                // Production merge: one enclosing range per buffer.
++                std::vector<ggml_vk::sync_conflict> merged;
++                for (const auto & c : conflicts) {
++                    bool done = false;
++                    for (auto & r : merged) {
++                        if (r.buf == c.buf) {
++                            const uint64_t end = std::max(r.base + r.size, c.base + c.size);
++                            r.base = std::min(r.base, c.base);
++                            r.size = end - r.base;
++                            done = true;
++                            break;
++                        }
++                    }
++                    if (!done) {
++                        merged.push_back(c);
++                    }
++                }
++                for (const auto & m : merged) {
++                    barriers.push_back({ (int) trace.size(), m });
++                }
++                total_barriers += (int) merged.size();
++                t.clear_covered(merged);
++            }
++
++            for (const auto & a : group) {
++                trace.push_back({ std::get<0>(a), std::get<1>(a), std::get<2>(a), std::get<3>(a), grp });
++                t.record(std::get<0>(a), std::get<1>(a), std::get<2>(a), std::get<3>(a));
++            }
++        }
++
++        // Brute-force hazard verification. For every pair of accesses from
++        // DIFFERENT groups (intra-group ordering is a fusion property the
++        // tracker never barriered, before or after this change) that overlap
++        // in the same buffer with at least one write, some barrier emitted
++        // strictly between them must cover the overlapping bytes.
++        for (size_t i = 0; i < trace.size(); ++i) {
++            for (size_t j = i + 1; j < trace.size(); ++j) {
++                const auto & a = trace[i];
++                const auto & b = trace[j];
++                if (a.group == b.group) continue;
++                if (a.buf != b.buf) continue;
++                if (!a.write && !b.write) continue;
++                if (!ggml_vk::sync_ranges_overlap(a.base, a.size, b.base, b.size)) continue;
++
++                const uint64_t lo = std::max(a.base, b.base);
++                const uint64_t hi = std::min(a.base + a.size, b.base + b.size);
++
++                bool covered = false;
++                for (const auto & bar : barriers) {
++                    if (bar.first <= (int) i) continue;          // not after access i
++                    if (bar.first > (int) j) break;              // after access j (vector is position-ordered)
++                    if (bar.second.buf == a.buf &&
++                        bar.second.base <= lo &&
++                        bar.second.base + bar.second.size >= hi) {
++                        covered = true;
++                        break;
++                    }
++                }
++                if (!covered) {
++                    total_misses++;
++                }
++            }
++        }
++    }
++
++    CHECK(total_misses == 0, "scoped clearing never drops an unsynchronized dependency");
++    CHECK(total_barriers > 1000, "oracle run actually emitted barriers");
++    printf("oracle: %d barrier ranges, %d missed hazards\n", total_barriers, total_misses);
++}
++
+ // ---------------------------------------------------------------------------
+ // main
+ // ---------------------------------------------------------------------------
+@@ -279,6 +400,7 @@ static void test_randomized_equivalence() {
+ int main() {
+     test_hazard_patterns();
+     test_randomized_equivalence();
++    test_scoped_hazard_oracle();
+ 
+     if (g_failures == 0) {
+         printf("test-vk-sync-tracker: OK (%d checks)\n", g_checks);
+-- 
+2.53.0
+

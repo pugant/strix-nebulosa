@@ -2190,9 +2190,21 @@ const slot_info_vec_t *   sinfos_in) {
 void llama_kv_cache::state_write_meta(llama_io_write_i & io, const cell_ranges_t & cr, llama_seq_id seq_id) const {
     const auto & cells = v_cells[cr.strm];
 
+    // W6-5 (A3-4): the per-cell record head {pos, n_seq_id[, ext]} is
+    // contiguous in the stream - stage it once and emit a single io.write
+    // instead of two/three per cell, and hoist the seq_ids vector out of the
+    // loop (one allocation per save instead of one per cell). The byte
+    // sequence is identical to the per-field writes it replaces.
+    const bool has_ext = hparams.n_pos_per_embd() > 1;
+
+    std::vector<llama_seq_id> seq_ids;
+    seq_ids.reserve(n_seq_max);
+
+    uint8_t head[sizeof(llama_pos) + sizeof(uint32_t) + sizeof(llama_kv_cell_ext)];
+
     for (const auto & range : cr.data) {
         for (uint32_t i = range.first; i < range.second; ++i) {
-            std::vector<llama_seq_id> seq_ids;
+            seq_ids.clear();
 
             for (llama_seq_id cur = 0; cur < (int) n_seq_max; ++cur) {
                 if (cur == seq_id || seq_id == -1) {
@@ -2205,16 +2217,18 @@ void llama_kv_cache::state_write_meta(llama_io_write_i & io, const cell_ranges_t
             const llama_pos pos     = cells.pos_get(i);
             const uint32_t n_seq_id = seq_ids.size();
 
-            io.write(&pos,      sizeof(pos));
-            io.write(&n_seq_id, sizeof(n_seq_id));
+            memcpy(head + 0, &pos,      sizeof(pos));
+            memcpy(head + sizeof(pos), &n_seq_id, sizeof(n_seq_id));
 
-            if (hparams.n_pos_per_embd() > 1) {
+            if (has_ext) {
                 const llama_kv_cell_ext ext = cells.ext_get(i);
-                io.write(&ext, sizeof(ext));
+                memcpy(head + sizeof(pos) + sizeof(n_seq_id), &ext, sizeof(ext));
             }
 
-            for (const auto & seq_id : seq_ids) {
-                io.write(&seq_id, sizeof(seq_id));
+            io.write(head, has_ext ? sizeof(head) : sizeof(pos) + sizeof(n_seq_id));
+
+            if (!seq_ids.empty()) {
+                io.write(seq_ids.data(), seq_ids.size() * sizeof(llama_seq_id));
             }
         }
     }
@@ -2333,31 +2347,42 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
 
         ubatch.seq_id_unq[0] = dest_seq_id;
 
+        // W6-5 (A3-4): a single-sequence record is FIXED-SIZE - {pos,
+        // n_seq_id, [ext], seq_id} with n_seq_id == 1 (validated below, the
+        // only other value is an error) - so the whole meta block is read with
+        // ONE io.read and parsed from memory instead of 3-4 reads per cell.
+        // Field order and byte layout are unchanged.
+        const bool has_ext = hparams.n_pos_per_embd() > 1;
+        const size_t rec_size = sizeof(llama_pos) + sizeof(uint32_t)
+            + (has_ext ? sizeof(llama_kv_cell_ext) : 0) + sizeof(llama_seq_id);
+
+        std::vector<uint8_t> meta((size_t) cell_count * rec_size);
+        io.read(meta.data(), meta.size());
+
         for (uint32_t i = 0; i < cell_count; ++i) {
+            const uint8_t * rec = meta.data() + (size_t) i * rec_size;
+
             llama_pos pos;
             uint32_t n_seq_id;
 
-            io.read(&pos,      sizeof(pos));
-            io.read(&n_seq_id, sizeof(n_seq_id));
+            memcpy(&pos,      rec, sizeof(pos));
+            memcpy(&n_seq_id, rec + sizeof(pos), sizeof(n_seq_id));
 
             if (n_seq_id != 1) {
                 LLAMA_LOG_ERROR("%s: invalid seq_id-agnostic kv cell\n", __func__);
                 return false;
             }
 
-            if (hparams.n_pos_per_embd() > 1) {
+            if (has_ext) {
                 llama_kv_cell_ext ext;
-                io.read(&ext, sizeof(ext));
+                memcpy(&ext, rec + sizeof(pos) + sizeof(n_seq_id), sizeof(ext));
 
                 ubatch.pos[i + ubatch.n_tokens]   = ext.y;
                 ubatch.pos[i + ubatch.n_tokens*2] = ext.x;
             }
 
-            // read the sequence id, but directly discard it - we will use dest_seq_id instead
-            {
-                llama_seq_id seq_id;
-                io.read(&seq_id, sizeof(seq_id));
-            }
+            // the record's sequence id is read but directly discarded - we use
+            // dest_seq_id instead
 
             ubatch.pos[i]      = pos;
             ubatch.n_seq_id[i] = n_seq_id;
@@ -2426,18 +2451,26 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
             return false;
         }
 
+        // W6-5 (A3-4): the fixed-size record head {pos, n_seq_id[, ext]} is
+        // read with one io.read per cell instead of 2-3; the seq_id tail stays
+        // per-value (its length is data-dependent and each value is validated
+        // as before)
+        const bool has_ext_whole = hparams.n_pos_per_embd() > 1;
+        uint8_t head_whole[sizeof(llama_pos) + sizeof(uint32_t) + sizeof(llama_kv_cell_ext)];
+
         for (uint32_t i = 0; i < cell_count; ++i) {
             llama_pos pos;
             uint32_t  n_seq_id;
 
-            io.read(&pos,      sizeof(pos));
-            io.read(&n_seq_id, sizeof(n_seq_id));
+            io.read(head_whole, has_ext_whole ? sizeof(head_whole) : sizeof(pos) + sizeof(n_seq_id));
+            memcpy(&pos,      head_whole, sizeof(pos));
+            memcpy(&n_seq_id, head_whole + sizeof(pos), sizeof(n_seq_id));
 
             cells.pos_set(i, pos);
 
-            if (hparams.n_pos_per_embd() > 1) {
+            if (has_ext_whole) {
                 llama_kv_cell_ext ext;
-                io.read(&ext, sizeof(ext));
+                memcpy(&ext, head_whole + sizeof(pos) + sizeof(n_seq_id), sizeof(ext));
                 cells.ext_set(i, ext);
             }
 

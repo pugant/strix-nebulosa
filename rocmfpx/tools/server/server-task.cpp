@@ -2165,6 +2165,68 @@ static bool server_prompt_cache_disk_read_file(const fs::path & path, size_t max
     return true;
 }
 
+// W6-5 (A3-1 var.B): stream a payload file into a host buffer EXACTLY ONCE,
+// folding the CRC-32 over the same pass, so the restore can verify the sidecar
+// CRC and then consume the buffer without ever returning to the disk (the old
+// verify-then-load did two full cold reads: the CRC pass dropped the pages
+// with POSIX_FADV_DONTNEED right before the load pass wanted them).
+// Same size contract as llama_persist_crc32_file: the file must hold exactly
+// expected_size bytes - shorter OR longer is corruption. May throw
+// std::bad_alloc from the buffer resize; the caller decides the fallback.
+static bool server_prompt_cache_disk_read_payload(const std::string & path, size_t expected_size, std::vector<uint8_t> & out, uint32_t * crc_out) {
+    const int fd = open(path.c_str(), O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        SRV_ERR("prompt cache disk open failed: path=%s error=%s\n", path.c_str(), std::strerror(errno));
+        return false;
+    }
+
+    out.resize(expected_size);
+
+    llama_persist_crc32_folder crc;
+    size_t total = 0;
+    bool   ok    = true;
+
+    while (total < expected_size) {
+        ssize_t n;
+        do {
+            n = read(fd, out.data() + total, expected_size - total);
+        } while (n < 0 && errno == EINTR);
+        if (n < 0) {
+            SRV_ERR("prompt cache disk read failed: path=%s error=%s\n", path.c_str(), std::strerror(errno));
+            ok = false; // IO error
+            break;
+        }
+        if (n == 0) {
+            break; // EOF: shorter than declared
+        }
+        crc.update(out.data() + total, (size_t) n);
+        total += (size_t) n;
+    }
+
+    if (ok && total == expected_size) {
+        // a longer file is corruption too - one extra byte must not be there
+        char extra = 0;
+        ssize_t n;
+        do {
+            n = read(fd, &extra, 1);
+        } while (n < 0 && errno == EINTR);
+        if (n != 0) {
+            ok = false;
+        }
+    }
+
+    close(fd);
+
+    if (!ok || total != expected_size) {
+        out.clear();
+        out.shrink_to_fit();
+        return false;
+    }
+
+    *crc_out = crc.finalize();
+    return true;
+}
+
 // llama_state_seq_save_file() closes the file before returning. Reopen it to
 // force dirty pages to stable storage and immediately mark the cold state as
 // reclaimable. This avoids replacing anonymous cache pressure with several GiB
@@ -2239,10 +2301,18 @@ server_prompt_cache::server_prompt_cache(
         int32_t disk_limit_size_mib,
    const uint8_t        fingerprint[16],
         int32_t persist_mib,
-        int32_t persist_min_tokens) {
+        int32_t persist_min_tokens,
+    const std::string & persist_subdir,
+         bool park,
+         size_t park_ram_mirror_bytes) {
     ram_enabled       = limit_size_mib != 0;
     limit_size        = 1024ull*1024ull*(limit_size_mib < 0 ? 0 : limit_size_mib);
     this->limit_tokens = limit_tokens;
+    park_library      = park;
+
+    // W6-8 (A3-5): mirror budget - meaningful (and read) only on a park
+    // instance; 0 keeps the T32-b RAM-disabled park untouched
+    park_ram_mirror_limit = park ? park_ram_mirror_bytes : 0;
 
     if (disk_base_path.empty() || disk_limit_size_mib <= 0) {
         return;
@@ -2271,144 +2341,171 @@ server_prompt_cache::server_prompt_cache(
         throw std::runtime_error("unable to secure prompt cache namespace '" + server_prompt_cache_disk_path_utf8(cache_root) + "': " + ec.message());
     }
 
-    // An OOM/SIGKILL cannot run the destructor. Each run therefore holds an
-    // advisory lock in a magic-marked directory. A later server removes only
-    // marked run-* directories whose lock is no longer held.
-    for (const auto & entry : fs::directory_iterator(cache_root, ec)) {
+    if (park_library) {
+        // T32-b: persist-only park library. The per-run machinery below is
+        // spurious for it (no run directory, no run lock, no .owner manifest,
+        // no stale run-dir cleanup - the run lifecycle belongs to the general
+        // instance on this cache root), so none of it runs. With a persist
+        // budget, the owned path names the park directory itself (save_disk's
+        // first guard rejects empty owned paths); the entries live below
+        // <subdir>/entry-* exactly like in any persist library, and the
+        // destructor knows never to remove it.
+        const fs::path park_dir = cache_root / persist_subdir;
+        this->disk_base_path = server_prompt_cache_disk_path_utf8(base);
+        if (persist_mib > 0) {
+            this->disk_owned_path = server_prompt_cache_disk_path_utf8(park_dir);
+
+            SRV_INF("persist park: enabled: path=%s limit_mib=%d\n",
+                    this->disk_owned_path.c_str(), disk_limit_size_mib);
+        } else {
+            // T32-b (Task 3 review ride-along): without a persist budget
+            // boot_persist never runs, so there is no library directory -
+            // keeping the owned path set would leave save_disk's guard open on
+            // a path nothing owns (per-run-layout state files littering the
+            // park dir). The instance comes out fully inert instead, exactly
+            // like a boot-failed park.
+            SRV_WRN("persist park: disabled: reason=no-persist-budget persist_mib=%d\n", persist_mib);
+        }
+    } else {
+        // An OOM/SIGKILL cannot run the destructor. Each run therefore holds an
+        // advisory lock in a magic-marked directory. A later server removes only
+        // marked run-* directories whose lock is no longer held.
+        for (const auto & entry : fs::directory_iterator(cache_root, ec)) {
+            if (ec) {
+                break;
+            }
+            const auto name = server_prompt_cache_disk_path_utf8(entry.path().filename());
+            const bool is_run_dir      = name.rfind("run-", 0) == 0;
+            const bool is_deleting_dir = name.rfind(".deleting-run-", 0) == 0;
+            if (!entry.is_directory() || (!is_run_dir && !is_deleting_dir) || !server_prompt_cache_disk_owned(entry.path())) {
+                continue;
+            }
+
+    #if !defined(_WIN32)
+            const fs::path lock_path = entry.path() / ".lock";
+            const int fd = open(lock_path.c_str(), O_RDWR | O_CLOEXEC);
+            if (fd < 0) {
+                continue;
+            }
+            const bool stale = flock(fd, LOCK_EX | LOCK_NB) == 0;
+            if (stale) {
+                flock(fd, LOCK_UN);
+            }
+            close(fd);
+            if (!stale) {
+                continue;
+            }
+    #else
+            // Without an advisory-lock primitive, preserve old directories rather
+            // than risk deleting a live cache owned by another process.
+            continue;
+    #endif
+
+            const auto stale_path = server_prompt_cache_disk_path_utf8(entry.path());
+            std::error_code rm_ec;
+            const auto removed = fs::remove_all(entry.path(), rm_ec);
+            if (!rm_ec) {
+                SRV_INF("prompt cache disk stale cleanup: path=%s files=%zu\n", stale_path.c_str(), (size_t) removed);
+            }
+        }
+
+        const auto stamp = (uint64_t) std::chrono::high_resolution_clock::now().time_since_epoch().count();
+    #if !defined(_WIN32)
+        const auto pid = (uint64_t) getpid();
+    #else
+        const uint64_t pid = 0;
+    #endif
+
+        fs::path owned;
+        for (uint32_t suffix = 0; suffix < 1000; ++suffix) {
+            owned = cache_root / ("run-" + std::to_string(pid) + "-" + std::to_string(stamp) + "-" + std::to_string(suffix));
+            if (fs::create_directory(owned, ec)) {
+                break;
+            }
+            if (ec && ec != std::errc::file_exists) {
+                throw std::runtime_error("unable to create owned prompt cache directory '" + server_prompt_cache_disk_path_utf8(owned) + "': " + ec.message());
+            }
+            ec.clear();
+            owned.clear();
+        }
+        if (owned.empty() || !fs::is_directory(owned)) {
+            throw std::runtime_error("unable to allocate a unique prompt cache run directory below '" + server_prompt_cache_disk_path_utf8(cache_root) + "'");
+        }
+
+        fs::permissions(owned, fs::perms::owner_all, fs::perm_options::replace, ec);
         if (ec) {
-            break;
-        }
-        const auto name = server_prompt_cache_disk_path_utf8(entry.path().filename());
-        const bool is_run_dir      = name.rfind("run-", 0) == 0;
-        const bool is_deleting_dir = name.rfind(".deleting-run-", 0) == 0;
-        if (!entry.is_directory() || (!is_run_dir && !is_deleting_dir) || !server_prompt_cache_disk_owned(entry.path())) {
-            continue;
-        }
-
-#if !defined(_WIN32)
-        const fs::path lock_path = entry.path() / ".lock";
-        const int fd = open(lock_path.c_str(), O_RDWR | O_CLOEXEC);
-        if (fd < 0) {
-            continue;
-        }
-        const bool stale = flock(fd, LOCK_EX | LOCK_NB) == 0;
-        if (stale) {
-            flock(fd, LOCK_UN);
-        }
-        close(fd);
-        if (!stale) {
-            continue;
-        }
-#else
-        // Without an advisory-lock primitive, preserve old directories rather
-        // than risk deleting a live cache owned by another process.
-        continue;
-#endif
-
-        const auto stale_path = server_prompt_cache_disk_path_utf8(entry.path());
-        std::error_code rm_ec;
-        const auto removed = fs::remove_all(entry.path(), rm_ec);
-        if (!rm_ec) {
-            SRV_INF("prompt cache disk stale cleanup: path=%s files=%zu\n", stale_path.c_str(), (size_t) removed);
-        }
-    }
-
-    const auto stamp = (uint64_t) std::chrono::high_resolution_clock::now().time_since_epoch().count();
-#if !defined(_WIN32)
-    const auto pid = (uint64_t) getpid();
-#else
-    const uint64_t pid = 0;
-#endif
-
-    fs::path owned;
-    for (uint32_t suffix = 0; suffix < 1000; ++suffix) {
-        owned = cache_root / ("run-" + std::to_string(pid) + "-" + std::to_string(stamp) + "-" + std::to_string(suffix));
-        if (fs::create_directory(owned, ec)) {
-            break;
-        }
-        if (ec && ec != std::errc::file_exists) {
-            throw std::runtime_error("unable to create owned prompt cache directory '" + server_prompt_cache_disk_path_utf8(owned) + "': " + ec.message());
-        }
-        ec.clear();
-        owned.clear();
-    }
-    if (owned.empty() || !fs::is_directory(owned)) {
-        throw std::runtime_error("unable to allocate a unique prompt cache run directory below '" + server_prompt_cache_disk_path_utf8(cache_root) + "'");
-    }
-
-    fs::permissions(owned, fs::perms::owner_all, fs::perm_options::replace, ec);
-    if (ec) {
-        fs::remove_all(owned);
-        throw std::runtime_error("unable to secure owned prompt cache directory '" + server_prompt_cache_disk_path_utf8(owned) + "': " + ec.message());
-    }
-
-#if !defined(_WIN32)
-    // Publish and hold the lock before publishing .owner. Stale cleanup only
-    // considers magic-marked directories, so another startup can never see an
-    // owned directory in the window before this process has acquired its lock.
-    const fs::path lock_path = owned / ".lock";
-    disk_lock_fd = open(lock_path.c_str(), O_CREAT | O_RDWR | O_CLOEXEC, 0600);
-    if (disk_lock_fd < 0 || flock(disk_lock_fd, LOCK_EX | LOCK_NB) != 0) {
-        if (disk_lock_fd >= 0) {
-            close(disk_lock_fd);
-            disk_lock_fd = -1;
-        }
-        fs::remove_all(owned);
-        throw std::runtime_error("unable to lock owned prompt cache directory '" + server_prompt_cache_disk_path_utf8(owned) + "'");
-    }
-#else
-    {
-        std::ofstream lock(owned / ".lock", std::ios::out | std::ios::trunc);
-        if (!lock.good()) {
             fs::remove_all(owned);
-            throw std::runtime_error("unable to create prompt cache lock file in '" + server_prompt_cache_disk_path_utf8(owned) + "'");
+            throw std::runtime_error("unable to secure owned prompt cache directory '" + server_prompt_cache_disk_path_utf8(owned) + "': " + ec.message());
         }
-    }
-#endif
 
-    {
-        std::ofstream owner(owned / ".owner", std::ios::out | std::ios::trunc);
-        owner << SERVER_PROMPT_CACHE_OWNER_MAGIC << '\n'
-              << "pid=" << pid << '\n'
-              << "created=" << stamp << '\n';
-        owner.flush();
-        if (!owner.good()) {
-#if !defined(_WIN32)
+    #if !defined(_WIN32)
+        // Publish and hold the lock before publishing .owner. Stale cleanup only
+        // considers magic-marked directories, so another startup can never see an
+        // owned directory in the window before this process has acquired its lock.
+        const fs::path lock_path = owned / ".lock";
+        disk_lock_fd = open(lock_path.c_str(), O_CREAT | O_RDWR | O_CLOEXEC, 0600);
+        if (disk_lock_fd < 0 || flock(disk_lock_fd, LOCK_EX | LOCK_NB) != 0) {
+            if (disk_lock_fd >= 0) {
+                close(disk_lock_fd);
+                disk_lock_fd = -1;
+            }
+            fs::remove_all(owned);
+            throw std::runtime_error("unable to lock owned prompt cache directory '" + server_prompt_cache_disk_path_utf8(owned) + "'");
+        }
+    #else
+        {
+            std::ofstream lock(owned / ".lock", std::ios::out | std::ios::trunc);
+            if (!lock.good()) {
+                fs::remove_all(owned);
+                throw std::runtime_error("unable to create prompt cache lock file in '" + server_prompt_cache_disk_path_utf8(owned) + "'");
+            }
+        }
+    #endif
+
+        {
+            std::ofstream owner(owned / ".owner", std::ios::out | std::ios::trunc);
+            owner << SERVER_PROMPT_CACHE_OWNER_MAGIC << '\n'
+                  << "pid=" << pid << '\n'
+                  << "created=" << stamp << '\n';
+            owner.flush();
+            if (!owner.good()) {
+    #if !defined(_WIN32)
+                flock(disk_lock_fd, LOCK_UN);
+                close(disk_lock_fd);
+                disk_lock_fd = -1;
+    #endif
+                fs::remove_all(owned);
+                throw std::runtime_error("unable to write prompt cache ownership manifest in '" + server_prompt_cache_disk_path_utf8(owned) + "'");
+            }
+        }
+        fs::permissions(owned / ".owner", fs::perms::owner_read | fs::perms::owner_write, fs::perm_options::replace, ec);
+        if (ec) {
+    #if !defined(_WIN32)
             flock(disk_lock_fd, LOCK_UN);
             close(disk_lock_fd);
             disk_lock_fd = -1;
-#endif
+    #endif
             fs::remove_all(owned);
-            throw std::runtime_error("unable to write prompt cache ownership manifest in '" + server_prompt_cache_disk_path_utf8(owned) + "'");
+            throw std::runtime_error("unable to secure prompt cache ownership manifest in '" + server_prompt_cache_disk_path_utf8(owned) + "': " + ec.message());
         }
-    }
-    fs::permissions(owned / ".owner", fs::perms::owner_read | fs::perms::owner_write, fs::perm_options::replace, ec);
-    if (ec) {
-#if !defined(_WIN32)
-        flock(disk_lock_fd, LOCK_UN);
-        close(disk_lock_fd);
-        disk_lock_fd = -1;
-#endif
-        fs::remove_all(owned);
-        throw std::runtime_error("unable to secure prompt cache ownership manifest in '" + server_prompt_cache_disk_path_utf8(owned) + "': " + ec.message());
-    }
 
-    this->disk_base_path  = server_prompt_cache_disk_path_utf8(base);
-    this->disk_owned_path = server_prompt_cache_disk_path_utf8(owned);
+        this->disk_base_path  = server_prompt_cache_disk_path_utf8(base);
+        this->disk_owned_path = server_prompt_cache_disk_path_utf8(owned);
 
-    SRV_INF("prompt cache disk enabled: path=%s owned_path=%s limit_mib=%d\n",
-            this->disk_base_path.c_str(), this->disk_owned_path.c_str(), disk_limit_size_mib);
+        SRV_INF("prompt cache disk enabled: path=%s owned_path=%s limit_mib=%d\n",
+                this->disk_base_path.c_str(), this->disk_owned_path.c_str(), disk_limit_size_mib);
+    }
 
     if (persist_mib > 0) {
         // T23: the library budget is computed here; boot_persist points every
         // existing size check at it only once the library lock is held
         this->persist_limit_size = 1024ull*1024ull*(uint64_t) persist_mib;
         this->persist_min_tokens = persist_min_tokens < 0 ? 0 : persist_min_tokens;
-        boot_persist(server_prompt_cache_disk_path_utf8(cache_root), fingerprint);
+        boot_persist(server_prompt_cache_disk_path_utf8(cache_root), persist_subdir, fingerprint);
     }
 }
 
-void server_prompt_cache::boot_persist(const std::string & cache_root_utf8, const uint8_t * fingerprint) {
+void server_prompt_cache::boot_persist(const std::string & cache_root_utf8, const std::string & subdir_utf8, const uint8_t * fingerprint) {
     const auto disable = [this]() {
 #if !defined(_WIN32)
         if (persist_lock_fd >= 0) {
@@ -2418,11 +2515,25 @@ void server_prompt_cache::boot_persist(const std::string & cache_root_utf8, cons
         }
 #endif
         persist_path.clear();
+        // T32-b: a boot-failed park instance must become FULLY inert. With
+        // persist_path cleared but the owned path still set, save_disk would
+        // fall back to the per-run layout and write state-<id>-*.bin directly
+        // into the park library directory: no entry dir, invisible to boot
+        // scans, never reclaimed - and reported as success. Clearing the
+        // owned path instead makes save() skip the disk path entirely and
+        // return false, the observable failure the caller keys on.
+        if (park_library) {
+            disk_owned_path.clear();
+        }
     };
 
-    // 1. persistent library directory, never removed by any run
+    // 1. persistent library directory, never removed by any run. T32-b: the
+    //    subdir names the library ("persist" for the general one, the park's
+    //    own name for a park instance) - every step below, from the advisory
+    //    lock to the entry scan, is already per-directory and therefore
+    //    follows the instance
     std::error_code ec;
-    const fs::path persist_dir = fs::u8path(cache_root_utf8) / "persist";
+    const fs::path persist_dir = fs::u8path(cache_root_utf8) / subdir_utf8;
     fs::create_directories(persist_dir, ec);
     if (ec || !fs::is_directory(persist_dir, ec)) {
         ec.clear();
@@ -2798,6 +2909,13 @@ server_prompt_cache::~server_prompt_cache() {
 #endif
     }
 
+    if (park_library) {
+        // T32-b: a park library is persist-only - disk_owned_path names the
+        // library directory itself, which must survive this run (its advisory
+        // lock was released above). No per-run directory exists to clean up.
+        return;
+    }
+
     if (disk_owned_path.empty()) {
         return;
     }
@@ -2881,6 +2999,7 @@ persist_stats server_prompt_cache::get_persist_stats() const {
     res.last_restore_ms       = persist_last_restore_ms;
     res.last_tokens_restored  = persist_last_tokens_restored;
     res.last_tokens_prefilled = persist_last_tokens_prefilled;
+    res.park_restore_crc_ms   = persist_park_restore_crc_ms;
 
     return res;
 }
@@ -2907,15 +3026,51 @@ bool server_prompt_cache::save(
               llama_context * ctx_drft,
                llama_seq_id   id_slot,
         const std::vector<uint8_t> & state_spec,
-        common_speculative_type drafter) {
+        common_speculative_type drafter,
+        server_prompt_cache * park) {
+    if (park != nullptr) {
+        // T32-b (spec t32-b step 4.1): redirected boundary save of a
+        // main-agent state - TWO separate saves with distinct rc. The RAM
+        // half stays on this (the general) instance exactly as today; the
+        // disk half goes to the park library, whose RAM is disabled, so its
+        // disk rc is park->save_disk alone.
+        const bool ram_ok = save_ram(prompt, ctx_main, ctx_drft, id_slot, state_spec, drafter);
+        bool disk_ok = park->save_disk(prompt, ctx_main, ctx_drft, id_slot, state_spec, drafter);
+        if (!disk_ok && !prompt.tokens.has_media()) {
+            // T32-b safety-net (step 4.2): the state must never be dropped
+            // because the park was chosen. Real park ERRORS - an inert
+            // instance (boot conflict), a write failure - land here, and the
+            // general library takes the entry exactly as it did before the
+            // redirect existed. A media-carrying prompt is EXCLUDED on
+            // purpose: its park skip above is a declared, permanent gate (a
+            // multimodal state is never disk-saved anywhere), and the retry
+            // would hit the identical T23 media check on the general library
+            // and fail the same way - one declared skip line is the whole
+            // signal, not two always-failing warnings.
+            SRV_WRN("%s", "persist park: fallback to general reason=park-disk-save-failed\n");
+            disk_ok = save_disk(prompt, ctx_main, ctx_drft, id_slot, state_spec, drafter);
+        }
+        return disk_ok || ram_ok;
+    }
+
     bool saved = false;
 
     if (!disk_owned_path.empty()) {
         saved = save_disk(prompt, ctx_main, ctx_drft, id_slot, state_spec, drafter) || saved;
     }
 
+    return save_ram(prompt, ctx_main, ctx_drft, id_slot, state_spec, drafter) || saved;
+}
+
+bool server_prompt_cache::save_ram(
+        const server_prompt & prompt,
+              llama_context * ctx_main,
+              llama_context * ctx_drft,
+               llama_seq_id   id_slot,
+        const std::vector<uint8_t> & state_spec,
+        common_speculative_type drafter) {
     if (!ram_enabled) {
-        return saved;
+        return false;
     }
 
     const size_t state_size_main = llama_state_seq_get_size_ext(ctx_main, id_slot, LLAMA_STATE_SEQ_FLAGS_NONE);
@@ -2923,7 +3078,7 @@ bool server_prompt_cache::save(
 
     auto * cur = alloc(prompt, state_size_main, state_size_drft, state_spec, drafter);
     if (cur == nullptr) {
-        return saved;
+        return false;
     }
 
     const size_t n_main = llama_state_seq_get_data_ext(
@@ -2931,7 +3086,7 @@ bool server_prompt_cache::save(
     if (n_main != state_size_main) {
         SRV_ERR("failed to save RAM prompt cache target state: expected=%zu saved=%zu\n", state_size_main, n_main);
         states.pop_back();
-        return saved;
+        return false;
     }
 
     if (ctx_drft) {
@@ -2940,7 +3095,7 @@ bool server_prompt_cache::save(
         if (n_drft != state_size_drft) {
             SRV_ERR("failed to save RAM prompt cache draft state: expected=%zu saved=%zu\n", state_size_drft, n_drft);
             states.pop_back();
-            return saved;
+            return false;
         }
     }
 
@@ -2962,8 +3117,19 @@ bool server_prompt_cache::save_disk(
     // (has_mtmd alone) disabled every disk save on multimodal servers because
     // slots are born with has_mtmd = (mctx != nullptr) even for pure-text prompts.
     if (prompt.tokens.has_media()) {
-        SRV_WRN("prompt cache disk skip: reason=multimodal tokens=%zu path=%s\n",
-                prompt.tokens.size(), disk_owned_path.c_str());
+        if (park_library) {
+            // T32-b: the park never holds multimodal states. The false rc is
+            // a DECLARED skip, not an error: the caller's safety-net does NOT
+            // retry it (the general save would run into this same media gate
+            // and fail identically), so this one line is the whole signal -
+            // a multimodal state is never disk-saved anywhere, exactly like
+            // today.
+            SRV_WRN("park skip: multimodal tokens=%zu path=%s\n",
+                    prompt.tokens.size(), disk_owned_path.c_str());
+        } else {
+            SRV_WRN("prompt cache disk skip: reason=multimodal tokens=%zu path=%s\n",
+                    prompt.tokens.size(), disk_owned_path.c_str());
+        }
         return false;
     }
 
@@ -3115,42 +3281,92 @@ bool server_prompt_cache::save_disk(
 
     // T23: CRC of the persisted bytes, computed on the durable tmp file BEFORE
     // the rename; an unreadable/short/long file right after writing it means
-    // the storage is broken - a save failure like any other
+    // the storage is broken - a save failure like any other.
+    // W6-7 (A3-3): the CRC is now folded DURING the write (stream CRC over the
+    // exact bytes handed to write_raw, header included) instead of re-reading
+    // the whole tmp file after fdatasync+DONTNEED dropped it from the page
+    // cache - the size_exact stat still guards the on-disk length.
     uint32_t crc_main = 0;
     uint32_t crc_drft = 0;
 
-    const size_t n_main = llama_state_seq_save_file(
-        ctx_main, path_main_tmp_utf8.c_str(), id_slot, tokens.data(), tokens.size());
+    // W6-8 (A3-5): park RAM mirror capture (flag-gated, default off). The
+    // read-back happens right after the save closed the tmp file and BEFORE
+    // flush_and_drop drops it from the page cache, so it is a RAM-speed copy
+    // of bytes this process just wrote; the folded CRC is compared against
+    // the stream CRC so the mirror is VERIFIED equal to the sidecar at birth
+    // (this is the integrity check that lets the mirror restore skip the
+    // per-restore CRC pass). predicted_total equals the actual byte count of
+    // both state files, so the admission test is exact.
+    bool mirror_ok = park_library && park_ram_mirror_limit > 0 && persist_on &&
+        server_prompt_cache_park_mirror_admits(park_ram_mirror_limit, predicted_total);
+    std::vector<uint8_t> mirror_main, mirror_drft;
+
+    const size_t n_main = llama_state_seq_save_file_crc(
+        ctx_main, path_main_tmp_utf8.c_str(), id_slot, tokens.data(), tokens.size(),
+        persist_on ? &crc_main : nullptr);
     size_t actual_main = 0;
     if (n_main == 0 ||
-        !server_prompt_cache_disk_size_exact(path_main_tmp_utf8, n_main, &actual_main) ||
-        !server_prompt_cache_disk_flush_and_drop(path_main_tmp_utf8, true)) {
+        !server_prompt_cache_disk_size_exact(path_main_tmp_utf8, n_main, &actual_main)) {
         SRV_ERR("prompt cache disk save failed: entry=%" PRIu64 " component=target path=%s\n",
                 entry_id, path_main_tmp_utf8.c_str());
         return fail_io("target-save", path_main_tmp_utf8);
     }
-    if (persist_on && !llama_persist_crc32_file(path_main_tmp_utf8.c_str(), (uint64_t) n_main, &crc_main)) {
-        SRV_ERR("persist crc failed: entry=%" PRIu64 " component=target bytes=%zu path=%s\n",
-                entry_id, n_main, path_main_tmp_utf8.c_str());
-        return fail_io("target-crc", path_main_tmp_utf8);
+    if (mirror_ok) {
+        try {
+            uint32_t crc_check = 0;
+            if (!server_prompt_cache_disk_read_payload(path_main_tmp_utf8, n_main, mirror_main, &crc_check) ||
+                    crc_check != crc_main) {
+                mirror_ok = false;
+                SRV_WRN("persist park: mirror capture skipped: entry=%" PRIu64 " component=target bytes=%zu reason=crc-or-read\n",
+                        entry_id, n_main);
+            }
+        } catch (const std::bad_alloc &) {
+            // the mirror is an optimization: a failed capture must never fail
+            // the save itself
+            mirror_ok = false;
+            mirror_main = std::vector<uint8_t>();
+            mirror_drft = std::vector<uint8_t>();
+            SRV_WRN("persist park: mirror capture skipped: entry=%" PRIu64 " reason=alloc\n", entry_id);
+        }
+    }
+    if (!server_prompt_cache_disk_flush_and_drop(path_main_tmp_utf8, true)) {
+        SRV_ERR("prompt cache disk save failed: entry=%" PRIu64 " component=target path=%s\n",
+                entry_id, path_main_tmp_utf8.c_str());
+        return fail_io("target-save", path_main_tmp_utf8);
     }
 
     size_t n_drft = 0;
     if (ctx_drft) {
-        n_drft = llama_state_seq_save_file(
-            ctx_drft, path_drft_tmp_utf8.c_str(), id_slot, tokens.data(), tokens.size());
+        n_drft = llama_state_seq_save_file_crc(
+            ctx_drft, path_drft_tmp_utf8.c_str(), id_slot, tokens.data(), tokens.size(),
+            persist_on ? &crc_drft : nullptr);
         size_t actual_drft = 0;
         if (n_drft == 0 ||
-            !server_prompt_cache_disk_size_exact(path_drft_tmp_utf8, n_drft, &actual_drft) ||
-            !server_prompt_cache_disk_flush_and_drop(path_drft_tmp_utf8, true)) {
+            !server_prompt_cache_disk_size_exact(path_drft_tmp_utf8, n_drft, &actual_drft)) {
             SRV_ERR("prompt cache disk save failed: entry=%" PRIu64 " component=draft path=%s\n",
                     entry_id, path_drft_tmp_utf8.c_str());
             return fail_io("draft-save", path_drft_tmp_utf8);
         }
-        if (persist_on && !llama_persist_crc32_file(path_drft_tmp_utf8.c_str(), (uint64_t) n_drft, &crc_drft)) {
-            SRV_ERR("persist crc failed: entry=%" PRIu64 " component=draft bytes=%zu path=%s\n",
-                    entry_id, n_drft, path_drft_tmp_utf8.c_str());
-            return fail_io("draft-crc", path_drft_tmp_utf8);
+        if (mirror_ok) {
+            try {
+                uint32_t crc_check = 0;
+                if (!server_prompt_cache_disk_read_payload(path_drft_tmp_utf8, n_drft, mirror_drft, &crc_check) ||
+                        crc_check != crc_drft) {
+                    mirror_ok = false;
+                    SRV_WRN("persist park: mirror capture skipped: entry=%" PRIu64 " component=draft bytes=%zu reason=crc-or-read\n",
+                            entry_id, n_drft);
+                }
+            } catch (const std::bad_alloc &) {
+                mirror_ok = false;
+                mirror_main = std::vector<uint8_t>();
+                mirror_drft = std::vector<uint8_t>();
+                SRV_WRN("persist park: mirror capture skipped: entry=%" PRIu64 " reason=alloc\n", entry_id);
+            }
+        }
+        if (!server_prompt_cache_disk_flush_and_drop(path_drft_tmp_utf8, true)) {
+            SRV_ERR("prompt cache disk save failed: entry=%" PRIu64 " component=draft path=%s\n",
+                    entry_id, path_drft_tmp_utf8.c_str());
+            return fail_io("draft-save", path_drft_tmp_utf8);
         }
     }
 
@@ -3281,6 +3497,21 @@ bool server_prompt_cache::save_disk(
 
     auto new_entry = std::prev(disk_states.end());
     bool reclaim_ok = true;
+    bool supersede_ok = true;
+
+    // T32-b: a park library holds at most ONE LIVE entry - the just-committed
+    // state supersedes whatever the park held before (same boundary -> the
+    // touch path above; grown boundary -> new entry + supersession here). The
+    // erase runs strictly AFTER the new entry is fully committed (bins + meta
+    // sidecar + entry-dir fsync above), so a crash in between never leaves a
+    // missing entry - but the crash window CAN leave a stale second entry on
+    // disk: a later save at the same boundary is a touch and does not reach
+    // supersede, so the two entries may coexist under budget until the
+    // boundary grows again or a boot eviction drops the stale one.
+    if (park_library && !persist_park_supersede(entry_id)) {
+        reclaim_ok = false;
+        supersede_ok = false;
+    }
 
     // Stateless entries can supersede shorter prefixes. Stateful MTP blobs
     // remain independently useful exact-boundary states.
@@ -3342,8 +3573,34 @@ bool server_prompt_cache::save_disk(
     }
 
     if (!reclaim_ok) {
-        SRV_WRN("prompt cache disk committed over limit: entry=%" PRIu64 " accounted_bytes=%zu limit_bytes=%zu save_disabled=true path=%s\n",
-                entry_id, disk_size_total, disk_limit_size, disk_owned_path.c_str());
+        if (!supersede_ok) {
+            // T32-b: the commit itself SUCCEEDED - what failed is the park
+            // supersede erase (the real IO error and the circuit-breaker
+            // disable log inside that path, just above); "over limit" would
+            // misstate the cause. The just-committed entry stays, the stale
+            // one is reclaimed by the next successful write or at boot.
+            SRV_WRN("persist park: supersede failed: entry=%" PRIu64 " accounted_bytes=%zu limit_bytes=%zu save_disabled=true path=%s\n",
+                    entry_id, disk_size_total, disk_limit_size, disk_owned_path.c_str());
+        } else {
+            SRV_WRN("prompt cache disk committed over limit: entry=%" PRIu64 " accounted_bytes=%zu limit_bytes=%zu save_disabled=true path=%s\n",
+                    entry_id, disk_size_total, disk_limit_size, disk_owned_path.c_str());
+        }
+    }
+
+    // W6-8 (A3-5): install the mirror for the just-committed entry. Strictly
+    // AFTER the park supersede/reclaim sweeps above, so the invalidation those
+    // erases perform on the PREVIOUS entry's mirror cannot clobber this one
+    // (entry ids differ); a supersede failure leaves the stale entry live on
+    // disk, and its mirror - if any - stays equally live, which is coherent.
+    if (mirror_ok) {
+        park_mirror.valid    = true;
+        park_mirror.entry_id = entry_id;
+        park_mirror.crc_main = crc_main;
+        park_mirror.crc_drft = crc_drft;
+        park_mirror.main     = std::move(mirror_main);
+        park_mirror.drft     = std::move(mirror_drft);
+        SRV_INF("persist park: mirror entry=%" PRIu64 " bytes=%zu limit_bytes=%zu\n",
+                entry_id, park_mirror.main.size() + park_mirror.drft.size(), park_ram_mirror_limit);
     }
 
     const double t_ms = (ggml_time_us() - t_start)/1000.0;
@@ -3352,9 +3609,41 @@ bool server_prompt_cache::save_disk(
     if (persist_on) {
         SRV_INF("persist save: entry=%" PRIu64 " tokens=%zu bytes=%zu save_ms=%.1f\n",
                 entry_id, tokens.size(), actual_total, t_ms);
+        // T32-b (task 6): the park's own save marker. Granularity mirrors the
+        // general library: a NEW-ENTRY commit logs "save" (this line), a
+        // same-boundary dedup above logs only the shared "persist touch"
+        // line - a park touch is bookkeeping, not a landing.
+        if (park_library) {
+            SRV_INF("persist park: save entry=%" PRIu64 " bytes=%zu\n",
+                    entry_id, actual_total);
+        }
     }
     log_disk_state();
 
+    return true;
+}
+
+// T32-b: see the declaration in server-task.h. Erases in disk_states order -
+// LRU-first (the boot scan sorts by last_used, touches splice to the back),
+// not chronological creation - so the supersession log reads
+// least-recently-used-first; a failed erase stops the sweep (the remaining
+// stale entries are reclaimed by the next successful save or at boot) instead
+// of risking repeated failures on a broken filesystem.
+bool server_prompt_cache::persist_park_supersede(uint64_t keep_id) {
+    for (auto it = disk_states.begin(); it != disk_states.end();) {
+        if (it->id == keep_id) {
+            ++it;
+            continue;
+        }
+
+        const uint64_t old_id = it->id;
+        auto old = it++;
+        if (!erase_disk_state(old, false, "park-supersede")) {
+            disable_disk_saves("park-supersede", disk_owned_path);
+            return false;
+        }
+        SRV_INF("persist park: supersede entry=%" PRIu64 " new=%" PRIu64 "\n", old_id, keep_id);
+    }
     return true;
 }
 
@@ -3469,7 +3758,8 @@ bool server_prompt_cache::load_disk(
         common_speculative_type drafter_active,
               bool * tag_mismatch,
               double * load_ms_out,
-              size_t * n_tokens_main_out) {
+              size_t * n_tokens_main_out,
+              double * crc_ms_out) {
     if (entry_id_out != nullptr) {
         *entry_id_out = 0;
     }
@@ -3481,6 +3771,9 @@ bool server_prompt_cache::load_disk(
     }
     if (n_tokens_main_out != nullptr) {
         *n_tokens_main_out = 0;
+    }
+    if (crc_ms_out != nullptr) {
+        *crc_ms_out = 0.0;
     }
 
     // spec-route: an entry tagged with a different (concrete) drafter still has
@@ -3510,6 +3803,48 @@ bool server_prompt_cache::load_disk(
         return false;
     };
 
+    // W6-8 (A3-5): park hot-hit. A mirror verified at capture time (read-back
+    // CRC == sidecar CRC, see save_disk) answers for its entry: the restore is
+    // served straight from RAM - no disk read, no CRC pass - and the size
+    // validation below is not needed (the mirror's byte counts were matched
+    // against the entry record in server_prompt_cache_park_mirror_matches). A
+    // non-matching or absent mirror simply falls through to the ordinary
+    // restore, byte-for-byte as before (the mirror is inert unless the park
+    // was built with a mirror budget).
+    const bool drft_wanted  = !path_drft.empty() && tag_match;
+    const bool drft_present = !path_drft.empty();
+
+    // draft gate, shared by BOTH restore paths: when this load will not
+    // restore the draft component - no draft file at all, or a drafter-tag
+    // mismatch while a drafter context IS active - the entry is not servable
+    // at all. W6-8 review-fix (lead decision): the mirror is a pure
+    // optimization, never a semantic, so this rejection runs BEFORE any
+    // mirror serve - the mirror path must produce the same outcome (reject +
+    // erase, and the mirror dies with the entry) as the file path in every
+    // case.
+    if (!drft_wanted && (ctx_dft != nullptr || draft_bytes != 0)) {
+        SRV_ERR("prompt cache disk load failed: entry=%" PRIu64 " component=draft reason=missing-draft-file expected_bytes=%zu path=%s\n",
+                entry_id, draft_bytes, disk_owned_path.c_str());
+        return reject_entry("missing-draft-file");
+    }
+
+    // the explicit limit/park gates keep default-off verifiable in the serve
+    // path itself: with no mirror budget the branch is dead code
+    const bool mirror_hit = park_library && park_ram_mirror_limit > 0 &&
+        server_prompt_cache_park_mirror_matches(
+            park_mirror, entry_id, target_bytes, drft_wanted, draft_bytes, drft_present);
+
+    // payload sources for the restore below: a host buffer when one holds the
+    // verified bytes (W6-8 mirror or the W6-5 read-once buffer), the file
+    // otherwise
+    std::vector<uint8_t> buf_main_own, buf_drft_own;
+    const uint8_t * buf_main = nullptr;
+    const uint8_t * buf_drft = nullptr;
+
+    if (mirror_hit) {
+        buf_main = park_mirror.main.data();
+        buf_drft = park_mirror.drft.data();
+    } else {
     // Validate the entire pair before mutating either context.
     size_t actual_main = 0;
     size_t actual_drft = 0;
@@ -3519,17 +3854,13 @@ bool server_prompt_cache::load_disk(
                 entry_id, target_bytes, actual_main, path_main.c_str());
         return reject_entry("target-size-mismatch");
     }
-    if (!path_drft.empty() && tag_match) {
+    if (drft_wanted) {
         if (ctx_dft == nullptr || draft_bytes == 0 ||
             !server_prompt_cache_disk_size_exact(path_drft, draft_bytes, &actual_drft)) {
             SRV_ERR("prompt cache disk load failed: entry=%" PRIu64 " component=draft reason=size-mismatch expected_bytes=%zu actual_bytes=%zu path=%s\n",
                     entry_id, draft_bytes, actual_drft, path_drft.c_str());
             return reject_entry("draft-size-mismatch");
         }
-    } else if (ctx_dft != nullptr || draft_bytes != 0) {
-        SRV_ERR("prompt cache disk load failed: entry=%" PRIu64 " component=draft reason=missing-draft-file expected_bytes=%zu path=%s\n",
-                entry_id, draft_bytes, disk_owned_path.c_str());
-        return reject_entry("missing-draft-file");
     }
 
     // T23: verify-then-load. A persisted entry is fed into the contexts only
@@ -3537,54 +3868,131 @@ bool server_prompt_cache::load_disk(
     // unreadable file, which counts as one - is corruption, so the whole entry
     // is discarded instead. The draft is verified only when it is about to be
     // loaded (a tag mismatch skips its restoration by design).
+    // T32-b: the verification wall time is measured here (park_restore_crc_ms
+    // gauge) - it is pure file reading, no context involved.
+    //
+    // W6-5 (A3-1 var.B): single cold read. The whole payload is streamed into
+    // a host buffer ONCE with the CRC folded during that same pass; after the
+    // sidecar comparison the restore consumes the buffer, so the load pass
+    // never returns to the disk (previously the CRC pass's trailing
+    // POSIX_FADV_DONTNEED turned the load into a second full cold read).
+    // BOTH components are still verified before either context is mutated.
+    // If the host buffers cannot be allocated the two-pass disk path below
+    // serves the restore unchanged - memory pressure must not become a failed
+    // restore.
+    bool use_buffers = !persist_path.empty();
     if (!persist_path.empty()) {
+        const int64_t t_crc_start = ggml_time_us();
         const uint32_t crc_main_expected = it->crc_main;
         const uint32_t crc_drft_expected = it->crc_drft;
-        uint32_t crc = 0;
-        if (!llama_persist_crc32_file(path_main.c_str(), (uint64_t) target_bytes, &crc) || crc != crc_main_expected) {
-            SRV_WRN("persist reject: entry=%" PRIu64 " reason=crc-mismatch-target\n", entry_id);
-            return reject_entry("crc-mismatch-target");
-        }
-        if (!path_drft.empty() && tag_match) {
-            crc = 0;
-            if (!llama_persist_crc32_file(path_drft.c_str(), (uint64_t) draft_bytes, &crc) || crc != crc_drft_expected) {
-                SRV_WRN("persist reject: entry=%" PRIu64 " reason=crc-mismatch-draft\n", entry_id);
-                return reject_entry("crc-mismatch-draft");
+        try {
+            uint32_t crc = 0;
+            if (!server_prompt_cache_disk_read_payload(path_main, target_bytes, buf_main_own, &crc) || crc != crc_main_expected) {
+                SRV_WRN("persist reject: entry=%" PRIu64 " reason=crc-mismatch-target\n", entry_id);
+                return reject_entry("crc-mismatch-target");
+            }
+            if (drft_wanted) {
+                crc = 0;
+                if (!server_prompt_cache_disk_read_payload(path_drft, draft_bytes, buf_drft_own, &crc) || crc != crc_drft_expected) {
+                    SRV_WRN("persist reject: entry=%" PRIu64 " reason=crc-mismatch-draft\n", entry_id);
+                    return reject_entry("crc-mismatch-draft");
+                }
+            }
+        } catch (const std::bad_alloc &) {
+            use_buffers = false;
+            buf_main_own = std::vector<uint8_t>();
+            buf_drft_own = std::vector<uint8_t>();
+            SRV_WRN("persist restore: entry=%" PRIu64 " host-buffer alloc failed (target_bytes=%zu draft_bytes=%zu) - falling back to the two-pass disk path\n",
+                    entry_id, target_bytes, draft_bytes);
+            uint32_t crc = 0;
+            if (!llama_persist_crc32_file(path_main.c_str(), (uint64_t) target_bytes, &crc) || crc != crc_main_expected) {
+                SRV_WRN("persist reject: entry=%" PRIu64 " reason=crc-mismatch-target\n", entry_id);
+                return reject_entry("crc-mismatch-target");
+            }
+            if (drft_wanted) {
+                crc = 0;
+                if (!llama_persist_crc32_file(path_drft.c_str(), (uint64_t) draft_bytes, &crc) || crc != crc_drft_expected) {
+                    SRV_WRN("persist reject: entry=%" PRIu64 " reason=crc-mismatch-draft\n", entry_id);
+                    return reject_entry("crc-mismatch-draft");
+                }
             }
         }
+        if (crc_ms_out != nullptr) {
+            *crc_ms_out = (ggml_time_us() - t_crc_start)/1000.0;
+        }
     }
+
+    if (use_buffers) {
+        buf_main = buf_main_own.data();
+        buf_drft = buf_drft_own.data();
+    }
+    } // !mirror_hit
+
+    const char * read_path = mirror_hit ? "ram-mirror" : (buf_main != nullptr ? "host-buffer" : "file");
 
     const int64_t t_start = ggml_time_us();
 
     llama_tokens tokens_main(n_tokens_expected);
     size_t n_tokens_main = 0;
-    const size_t nread_main = llama_state_seq_load_file(
-        ctx_tgt, path_main.c_str(), id_slot,
-        tokens_main.data(), tokens_main.size(), &n_tokens_main);
+    const size_t nread_main = buf_main != nullptr
+        ? llama_state_seq_load_buffer(
+            ctx_tgt, buf_main, target_bytes, id_slot,
+            tokens_main.data(), tokens_main.size(), &n_tokens_main)
+        : llama_state_seq_load_file(
+            ctx_tgt, path_main.c_str(), id_slot,
+            tokens_main.data(), tokens_main.size(), &n_tokens_main);
     tokens_main.resize(n_tokens_main);
-    server_prompt_cache_disk_flush_and_drop(path_main, false);
+    if (!mirror_hit) {
+        server_prompt_cache_disk_flush_and_drop(path_main, false);
+    }
+    if (buf_main == buf_main_own.data()) {
+        // the read-once buffer owns the payload now; release the ~2 GiB before
+        // the draft component restores (the pair was already fully verified
+        // above). The mirror is NOT released - it serves the next hot hit.
+        buf_main_own = std::vector<uint8_t>();
+        buf_main = nullptr;
+    }
 
     if (nread_main != target_bytes || !server_prompt_cache_tokens_equal(it->tokens, tokens_main)) {
         SRV_ERR("prompt cache disk load failed: entry=%" PRIu64 " component=target expected_bytes=%zu read_bytes=%zu expected_tokens=%zu restored_tokens=%zu path=%s\n",
                 entry_id, target_bytes, nread_main, n_tokens_expected, n_tokens_main, path_main.c_str());
+        if (mirror_hit) {
+            // the RAM copy no longer agrees with its entry: drop it (the
+            // entry itself was erase-rejected by the same corruption rule as
+            // any disk payload failure)
+            park_mirror.reset();
+        }
         return reject_entry("corrupt-target");
     }
 
     size_t nread_drft = 0;
-    if (!path_drft.empty() && tag_match) {
+    if (drft_wanted) {
         llama_tokens tokens_drft(n_tokens_expected);
         size_t n_tokens_drft = 0;
-        nread_drft = llama_state_seq_load_file(
-            ctx_dft, path_drft.c_str(), id_slot,
-            tokens_drft.data(), tokens_drft.size(), &n_tokens_drft);
+        nread_drft = buf_drft != nullptr
+            ? llama_state_seq_load_buffer(
+                ctx_dft, buf_drft, draft_bytes, id_slot,
+                tokens_drft.data(), tokens_drft.size(), &n_tokens_drft)
+            : llama_state_seq_load_file(
+                ctx_dft, path_drft.c_str(), id_slot,
+                tokens_drft.data(), tokens_drft.size(), &n_tokens_drft);
         tokens_drft.resize(n_tokens_drft);
-        server_prompt_cache_disk_flush_and_drop(path_drft, false);
+        if (!mirror_hit) {
+            server_prompt_cache_disk_flush_and_drop(path_drft, false);
+        }
+        if (buf_drft == buf_drft_own.data()) {
+            buf_drft_own = std::vector<uint8_t>();
+            buf_drft = nullptr;
+        }
 
         if (nread_drft != draft_bytes ||
             !server_prompt_cache_tokens_equal(it->tokens, tokens_drft) ||
             tokens_drft != tokens_main) {
             SRV_ERR("prompt cache disk load failed: entry=%" PRIu64 " component=draft expected_bytes=%zu read_bytes=%zu expected_tokens=%zu restored_tokens=%zu path=%s\n",
                     entry_id, draft_bytes, nread_drft, n_tokens_expected, n_tokens_drft, path_drft.c_str());
+            if (mirror_hit) {
+                park_mirror.reset();
+            }
             return reject_entry("corrupt-draft");
         }
     }
@@ -3606,9 +4014,9 @@ bool server_prompt_cache::load_disk(
     }
 
     const double t_ms = (ggml_time_us() - t_start)/1000.0;
-    SRV_INF("prompt cache disk load: entry=%" PRIu64 " lcp=%zu tokens=%zu checkpoints=%zu target_bytes=%zu draft_bytes=%zu spec_bytes=%zu total_bytes=%zu read_bytes=%zu load_ms=%.2f path=%s\n",
+    SRV_INF("prompt cache disk load: entry=%" PRIu64 " lcp=%zu tokens=%zu checkpoints=%zu target_bytes=%zu draft_bytes=%zu spec_bytes=%zu total_bytes=%zu read_bytes=%zu read_path=%s load_ms=%.2f path=%s\n",
             entry_id, lcp, n_tokens_expected, n_checkpoints, target_bytes, draft_bytes, spec_bytes, total_bytes,
-            nread_main + nread_drft, t_ms, disk_owned_path.c_str());
+            nread_main + nread_drft, read_path, t_ms, disk_owned_path.c_str());
 
     if (entry_id_out != nullptr) {
         *entry_id_out = entry_id;
@@ -3638,6 +4046,13 @@ bool server_prompt_cache::erase_disk_state(
     // Quarantine before touching either component. If only one unlink works,
     // retain the full conservative accounting and metadata for a later retry.
     it->usable = false;
+
+    // W6-8 (A3-5): a RAM mirror dies with its entry - supersede, budget
+    // eviction, boot GC and post-restore rejection all land here
+    if (park_mirror.valid && park_mirror.entry_id == entry_id) {
+        park_mirror.reset();
+        SRV_INF("persist park: mirror dropped: entry=%" PRIu64 " reason=%s\n", entry_id, reason);
+    }
     if (!persist_path.empty()) {
         // T23: a library entry owns a whole entry-<id>/ directory (bins +
         // sidecar): remove it entire so no meta-only husk survives on disk
@@ -3726,6 +4141,20 @@ void server_prompt_cache::accept_disk_load(uint64_t entry_id) {
                 ? pending.prompt_tokens_total - pending.lcp : 0;
             SRV_INF("persist load: entry=%" PRIu64 " restored=%zu prefilled=%zu ms=%.1f\n",
                     entry_id, persist_last_tokens_restored, persist_last_tokens_prefilled, pending.load_ms);
+
+            // T32-b: a park-library restore publishes its own marker - this is
+            // the delta-token counter line the park ROI derives from (delta =
+            // requested - cached) - and its CRC gauge. The general instance's
+            // gauges are untouched: this accept runs on the OWNING (park)
+            // instance, routed there by server_slot::prompt_load.
+            if (park_library) {
+                persist_park_restore_crc_ms = pending.crc_ms;
+                SRV_INF("persist restore: park entry=%" PRIu64 " cached=%zu delta=%zu crc_ms=%.2f\n",
+                        entry_id, pending.lcp,
+                        (pending.prompt_tokens_total > pending.lcp)
+                            ? pending.prompt_tokens_total - pending.lcp : 0,
+                        pending.crc_ms);
+            }
         }
         log_disk_state();
         return;
@@ -3822,7 +4251,9 @@ bool server_prompt_cache::load(
                        bool * cache_hit,
                    uint64_t * disk_entry_id,
               common_speculative_type drafter_active,
-                    bool * tag_mismatch) {
+                    bool * tag_mismatch,
+              server_prompt_cache * park,
+              server_prompt_cache ** disk_entry_owner) {
     if (cache_hit != nullptr) {
         *cache_hit = false;
     }
@@ -3832,6 +4263,9 @@ bool server_prompt_cache::load(
     if (tag_mismatch != nullptr) {
         *tag_mismatch = false;
     }
+    if (disk_entry_owner != nullptr) {
+        *disk_entry_owner = this;
+    }
 
     const int lcp_best = prompt.tokens.get_common_prefix(tokens_new);
 
@@ -3840,25 +4274,26 @@ bool server_prompt_cache::load(
     // conversation) can still be salvaged when the target and draft memories
     // support removing the diverging tail: the slot code then performs a bounded
     // trailing rollback and reprocesses only the new tokens.
+    // T32-b: the rule itself lives in the pure helper (shared by every
+    // candidate source, unit-tested without a llama runtime); the memories'
+    // RS capacities - the only context-dependent input - are read here, and
+    // only when a trailing rollback is genuinely on the table.
     const auto spec_boundary_valid = [&](size_t cached_tokens, int lcp) {
-        if (!spec_state_required || lcp == (int) cached_tokens) {
-            return true;
-        }
-        if (!spec_trailing_rm || lcp < 0 || cached_tokens <= (size_t) lcp) {
-            return false;
-        }
-        const size_t delta = cached_tokens - (size_t) lcp;
-        // dense KV (n_rs_seq == 0) supports removing any tail; bounded RS state only up to the snapshot bound
         uint32_t n_rs_min = UINT32_MAX;
-        if (const uint32_t n_rs = llama_n_rs_seq(ctx_tgt); n_rs > 0) {
-            n_rs_min = std::min(n_rs_min, n_rs);
-        }
-        if (ctx_dft) {
-            if (const uint32_t n_rs = llama_n_rs_seq(ctx_dft); n_rs > 0) {
+        if (spec_state_required && lcp != (int) cached_tokens && spec_trailing_rm &&
+            lcp >= 0 && cached_tokens > (size_t) lcp) {
+            // dense KV (n_rs_seq == 0) supports removing any tail; bounded RS state only up to the snapshot bound
+            if (const uint32_t n_rs = llama_n_rs_seq(ctx_tgt); n_rs > 0) {
                 n_rs_min = std::min(n_rs_min, n_rs);
             }
+            if (ctx_dft) {
+                if (const uint32_t n_rs = llama_n_rs_seq(ctx_dft); n_rs > 0) {
+                    n_rs_min = std::min(n_rs_min, n_rs);
+                }
+            }
         }
-        return n_rs_min == UINT32_MAX || delta <= (size_t) n_rs_min;
+        return server_prompt_cache_spec_boundary_valid(spec_state_required, spec_trailing_rm,
+                cached_tokens, lcp, n_rs_min);
     };
 
     const bool base_boundary_valid = spec_boundary_valid(prompt.tokens.size(), lcp_best);
@@ -3873,7 +4308,8 @@ bool server_prompt_cache::load(
     SRV_INF(" - looking for better prompt, base f_keep = %.3f, sim = %.3f\n", f_keep_best, sim_best);
 
     auto it_best_ram  = states.end();
-    auto it_best_disk = disk_states.end();
+    auto it_best_disk = disk_states.end();            // into the WINNING library's list (owner below)
+    server_prompt_cache * disk_best_owner = nullptr;  // T32-b: owning instance of it_best_disk (this or the park)
     size_t lcp_selected = 0;
     size_t spec_boundary_best = base_boundary_valid ? prompt.tokens.size() : 0;
     bool ram_loaded = false;
@@ -3900,88 +4336,89 @@ bool server_prompt_cache::load(
             continue;
         }
 
-        const float f_keep_cur = float(lcp_cur) / std::max<size_t>(1, it->tokens.size());
-        const float sim_cur    = float(lcp_cur) / std::max<size_t>(1, tokens_new.size());
-
-        // don't trash large prompts
-        if (f_keep_cur < 0.25f) {
-            continue;
-        }
-
-        const bool is_better = spec_state_required
-            ? it->tokens.size() > spec_boundary_best
-            : f_keep_best < f_keep_cur && sim_best < sim_cur;
-        if (is_better) {
-            f_keep_best = f_keep_cur;
-            sim_best    = sim_cur;
-            spec_boundary_best = it->tokens.size();
-
+        if (server_prompt_cache_candidate_better(spec_state_required, tokens_new.size(),
+                    lcp_cur, it->tokens.size(), f_keep_best, sim_best, spec_boundary_best)) {
             it_best_ram  = it;
-            it_best_disk = disk_states.end();
+            disk_best_owner = nullptr;
             lcp_selected = lcp_cur;
         }
     }
 
-    for (auto it = disk_states.begin(); it != disk_states.end(); ++it) {
-        if (!it->usable) {
-            continue;
+    // T32-b: the disk-candidate scan, shared by BOTH libraries - the general
+    // one and (when the caller passed it) the park. One implementation means
+    // the park's candidates obey literally the same admission and ranking as
+    // the general library's: same spec-boundary rule, same spec-state
+    // requirement, same f_keep floor. The scan order (general first, park
+    // last) plus the strictly-better ranking keep today's preferences at
+    // parity: RAM copy, then general disk, park only when strictly better.
+    const auto scan_disk_library = [&](server_prompt_cache & owner, const char * source) {
+        for (auto it = owner.disk_states.begin(); it != owner.disk_states.end(); ++it) {
+            if (!it->usable) {
+                continue;
+            }
+
+            const int lcp_cur = it->tokens.get_common_prefix(tokens_new);
+
+            if (!spec_boundary_valid(it->tokens.size(), lcp_cur)) {
+                SRV_INF("prompt cache skip: reason=spec-boundary-mismatch source=%s entry=%" PRIu64 " lcp=%d cached_tokens=%zu request_tokens=%zu spec_bytes=%zu\n",
+                        source, it->id, lcp_cur, it->tokens.size(), tokens_new.size(), it->spec.size());
+                continue;
+            }
+            if (spec_state_required && it->spec.empty()) {
+                SRV_INF("prompt cache skip: reason=spec-state-missing source=%s entry=%" PRIu64 " cached_tokens=%zu request_tokens=%zu\n",
+                        source, it->id, it->tokens.size(), tokens_new.size());
+                continue;
+            }
+
+            if (server_prompt_cache_candidate_better(spec_state_required, tokens_new.size(),
+                        lcp_cur, it->tokens.size(), f_keep_best, sim_best, spec_boundary_best)) {
+                it_best_ram  = states.end();
+                it_best_disk = it;
+                disk_best_owner = &owner;
+                lcp_selected = lcp_cur;
+            }
         }
+    };
 
-        const int lcp_cur = it->tokens.get_common_prefix(tokens_new);
-
-        if (!spec_boundary_valid(it->tokens.size(), lcp_cur)) {
-            SRV_INF("prompt cache skip: reason=spec-boundary-mismatch source=disk entry=%" PRIu64 " lcp=%d cached_tokens=%zu request_tokens=%zu spec_bytes=%zu\n",
-                    it->id, lcp_cur, it->tokens.size(), tokens_new.size(), it->spec.size());
-            continue;
-        }
-        if (spec_state_required && it->spec.empty()) {
-            SRV_INF("prompt cache skip: reason=spec-state-missing source=disk entry=%" PRIu64 " cached_tokens=%zu request_tokens=%zu\n",
-                    it->id, it->tokens.size(), tokens_new.size());
-            continue;
-        }
-
-        const float f_keep_cur = float(lcp_cur) / std::max<size_t>(1, it->tokens.size());
-        const float sim_cur    = float(lcp_cur) / std::max<size_t>(1, tokens_new.size());
-
-        if (f_keep_cur < 0.25f) {
-            continue;
-        }
-
-        const bool is_better = spec_state_required
-            ? it->tokens.size() > spec_boundary_best
-            : f_keep_best < f_keep_cur && sim_best < sim_cur;
-        if (is_better) {
-            f_keep_best = f_keep_cur;
-            sim_best    = sim_cur;
-            spec_boundary_best = it->tokens.size();
-
-            it_best_ram  = states.end();
-            it_best_disk = it;
-            lcp_selected = lcp_cur;
-        }
+    scan_disk_library(*this, "disk");
+    if (park != nullptr && park != this) {
+        scan_disk_library(*park, "park");
     }
 
-    if (it_best_disk != disk_states.end()) {
+    if (disk_best_owner != nullptr) {
+        // T32-b: the winning disk candidate may live in the PARK library. The
+        // physical restore works from any instance (the entries' file paths
+        // are absolute), but every piece of bookkeeping below runs on the
+        // OWNING instance - the load counters and a rejection's erase here,
+        // the pending-load stash (so the later accept/reject, which the caller
+        // also routes to `owner` via disk_entry_owner, updates the park's
+        // hits/LRU order and sidecar on the park's paths and budget).
+        server_prompt_cache & owner = *disk_best_owner;
+        if (disk_entry_owner != nullptr) {
+            *disk_entry_owner = &owner;
+        }
         SRV_INF(" - found better disk prompt with f_keep = %.3f, sim = %.3f, lcp = %zu\n",
                 f_keep_best, sim_best, lcp_selected);
         double load_ms = 0.0;
+        double crc_ms = 0.0;
         size_t n_tokens_main = 0;
-        const bool loaded = load_disk(it_best_disk, prompt, ctx_tgt, ctx_dft, id_slot, lcp_selected, disk_entry_id, drafter_active, tag_mismatch, &load_ms, &n_tokens_main);
+        const bool loaded = owner.load_disk(it_best_disk, prompt, ctx_tgt, ctx_dft, id_slot, lcp_selected, disk_entry_id, drafter_active, tag_mismatch, &load_ms, &n_tokens_main, &crc_ms);
         if (loaded) {
             if (cache_hit != nullptr) {
                 *cache_hit = true;
             }
-            if (!persist_path.empty()) {
+            if (!owner.persist_path.empty()) {
                 // T23: stash the restore measurements here - this is the only
                 // place that knows the full new-prompt token count; the caller
                 // hands the entry id back to accept_disk_load/reject_disk_load,
                 // which consume the stash on this same thread
-                pending_load.entry_id            = disk_entry_id != nullptr ? *disk_entry_id : 0;
-                pending_load.load_ms             = load_ms;
-                pending_load.n_tokens_main       = n_tokens_main;
-                pending_load.lcp                 = lcp_selected;
-                pending_load.prompt_tokens_total = tokens_new.size();
-                pending_load.valid               = true;
+                owner.pending_load.entry_id            = disk_entry_id != nullptr ? *disk_entry_id : 0;
+                owner.pending_load.load_ms             = load_ms;
+                owner.pending_load.crc_ms              = crc_ms;
+                owner.pending_load.n_tokens_main       = n_tokens_main;
+                owner.pending_load.lcp                 = lcp_selected;
+                owner.pending_load.prompt_tokens_total = tokens_new.size();
+                owner.pending_load.valid               = true;
             }
         }
         return loaded;

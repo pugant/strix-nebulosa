@@ -907,6 +907,20 @@ extern "C" {
                const llama_token * tokens,
                           size_t   n_token_count);
 
+    // W6-7 (A3-3): like llama_state_seq_save_file, but the CRC-32 of the
+    // written bytes is folded while the file is being written (crc_out is
+    // always the CRC of every byte that reached the file, header and token
+    // section included) instead of requiring a whole-file read-back pass.
+    // The produced file is byte-identical to llama_state_seq_save_file's.
+    // crc_out may be NULL, which makes this exactly the plain save.
+    LLAMA_API size_t llama_state_seq_save_file_crc(
+            struct llama_context * ctx,
+                      const char * filepath,
+                    llama_seq_id   seq_id,
+               const llama_token * tokens,
+                          size_t   n_token_count,
+                      uint32_t *   crc_out);
+
     LLAMA_API size_t llama_state_seq_load_file(
             struct llama_context * ctx,
                       const char * filepath,
@@ -914,6 +928,22 @@ extern "C" {
                      llama_token * tokens_out,
                           size_t   n_token_capacity,
                           size_t * n_token_count_out);
+
+    // W6-5 (A3-1 var.B): like llama_state_seq_load_file, but the sequence
+    // state payload - the exact bytes llama_state_seq_save_file wrote - is
+    // consumed from a host memory buffer instead of a file, so a caller that
+    // already holds the payload in RAM (single disk read + CRC verify) can
+    // restore without reading the file again. `data` stays owned by the caller
+    // and must remain valid for the duration of the call. Returns the number
+    // of bytes consumed (0 on failure, like the file variant).
+    LLAMA_API size_t llama_state_seq_load_buffer(
+            struct llama_context * ctx,
+                    const uint8_t * data,
+                           size_t   size,
+                     llama_seq_id   dest_seq_id,
+                      llama_token * tokens_out,
+                           size_t   n_token_capacity,
+                           size_t * n_token_count_out);
 
 #define LLAMA_STATE_SEQ_FLAGS_NONE 0
 

@@ -20,6 +20,9 @@
 #include <ctime>
 #include <exception>
 #include <functional>
+#include <algorithm>
+#include <cstring>
+#include <mutex>
 
 #include <optional>
 #include <sstream>
@@ -226,6 +229,38 @@ struct common_chat_templates {
     bool has_explicit_template;  // Model had builtin template or template overridden was specified.
     std::unique_ptr<common_chat_template> template_default;  // always set (defaults to chatml)
     std::unique_ptr<common_chat_template> template_tool_use;
+
+    // W6-6 / A4-S2: per-instance caches. common_chat_templates_apply() runs once
+    // per chat request (prod uses --jinja), but the autoparser analysis, the PEG
+    // parser generation and the generation-prompt diff depend only on the template
+    // and on the non-message inputs - recomputing them for every request is pure
+    // overhead. Disable with LLAMA_CHAT_TEMPLATE_CACHE=0.
+    struct request_cache {
+        mutable std::mutex mtx;
+
+        // differential analysis of the template source (autoparser):
+        // a pure function of the template, computed once per template object
+        std::map<const common_chat_template *, autoparser::autoparser> analyses;
+
+        struct gen_entry {
+            std::string key;         // template + every non-message render input
+            std::string gen_prompt;  // suffix diff between agp=true/false renders
+        };
+        std::vector<gen_entry> gen_lru;
+
+        struct parser_entry {
+            std::string key;          // template + gen_prompt + tool/schema inputs
+            common_chat_params params;  // prompt / generation_prompt always overwritten
+        };
+        std::vector<parser_entry> parser_lru;
+
+        uint64_t n_gen_hits = 0;
+        uint64_t n_gen_miss = 0;
+        uint64_t n_gen_verify_fail = 0;
+        uint64_t n_parser_hits = 0;
+        uint64_t n_parser_miss = 0;
+    };
+    mutable request_cache w6_cache;
 };
 
 common_chat_tool_choice common_chat_tool_choice_parse_oaicompat(const std::string & tool_choice) {
@@ -2182,6 +2217,140 @@ static std::string common_chat_templates_generation_prompt(const common_chat_tem
     return gen_prompt.substr(prefix_len);
 }
 
+//
+// W6-6 / A4-S2: request caches for the jinja path (analysis, generation prompt,
+// generated parser). all keyed on the template + non-message inputs only.
+//
+
+static bool chat_template_cache_enabled() {
+    static const bool enabled = []() {
+        const char * env = std::getenv("LLAMA_CHAT_TEMPLATE_CACHE");
+        return env == nullptr || std::strcmp(env, "0") != 0;
+    }();
+    return enabled;
+}
+
+// mirrors the dispatch conditions of common_chat_try_specialized_template: the
+// generation-prompt cache is only verified on the generic (autoparser) path, so
+// specialized templates must not consume it (keep the two lists in sync)
+static bool chat_template_is_specialized(const std::string & src) {
+    return (src.find("[SYSTEM_PROMPT]") != std::string::npos && src.find("[TOOL_CALLS]") != std::string::npos &&
+            src.find("[ARGS]") != std::string::npos && src.find("[CALL_ID]") == std::string::npos) ||
+           src.find("<|channel|>") != std::string::npos ||
+           (src.find(">>>all") != std::string::npos && src.find(">>>${recipient}") != std::string::npos) ||
+           (src.find("<|tool_calls_section_begin|>") != std::string::npos &&
+            src.find("<|tool_call_begin|>") != std::string::npos) ||
+           is_lfm2_template(src) ||
+           (src.find("List of tools: [") != std::string::npos &&
+            src.find("<|tool_list_start|>") == std::string::npos) ||
+           (src.find("<|role_sep|>") != std::string::npos && src.find("<|message_sep|>") != std::string::npos &&
+            src.find("<|function_call|>") == std::string::npos) ||
+           (src.find("dsml_token") != std::string::npos && src.find("function_calls") != std::string::npos &&
+            src.find("DSML") != std::string::npos) ||
+           src.find("'<|tool_call>call:'") != std::string::npos;
+}
+
+// differential analysis is a pure function of the template source: compute once
+static const autoparser::autoparser & cached_template_analysis(const struct common_chat_templates * tmpls,
+                                                               const common_chat_template &          tmpl) {
+    auto & cache = tmpls->w6_cache;
+    std::lock_guard<std::mutex> lock(cache.mtx);
+    auto & analysis = cache.analyses[&tmpl];
+    if (!analysis.analysis_complete) {
+        analysis.analyze_template(tmpl);
+    }
+    return analysis;
+}
+
+// key of the two diff renders used by common_chat_templates_generation_prompt:
+// template + every render input except the messages
+static std::string gen_prompt_cache_key(const common_chat_template & tmpl, const autoparser::generation_params & params) {
+    return tmpl.source() + "\x01" + tmpl.bos_token() + "\x01" + tmpl.eos_token() + "\x01" +
+           std::to_string((int) params.enable_thinking) + "\x01" + params.tools.dump() + "\x01" +
+           std::to_string((int) params.add_bos) + "\x01" + std::to_string((int) params.add_eos);
+}
+
+static bool gen_prompt_cache_lookup(const common_chat_templates * tmpls, const std::string & key, std::string & out) {
+    auto & cache = tmpls->w6_cache;
+    std::lock_guard<std::mutex> lock(cache.mtx);
+    for (const auto & e : cache.gen_lru) {
+        if (e.key == key) {
+            out = e.gen_prompt;
+            cache.n_gen_hits++;
+            return true;
+        }
+    }
+    cache.n_gen_miss++;
+    return false;
+}
+
+static void gen_prompt_cache_store(const common_chat_templates * tmpls, const std::string & key, std::string gen_prompt) {
+    auto & cache = tmpls->w6_cache;
+    std::lock_guard<std::mutex> lock(cache.mtx);
+    for (auto & e : cache.gen_lru) {
+        if (e.key == key) {
+            e.gen_prompt = std::move(gen_prompt);
+            return;
+        }
+    }
+    cache.gen_lru.push_back({ key, std::move(gen_prompt) });
+    if (cache.gen_lru.size() > 8) {
+        cache.gen_lru.erase(cache.gen_lru.begin());
+    }
+}
+
+static void gen_prompt_cache_invalidate(const common_chat_templates * tmpls, const std::string & key) {
+    auto & cache = tmpls->w6_cache;
+    std::lock_guard<std::mutex> lock(cache.mtx);
+    cache.gen_lru.erase(std::remove_if(cache.gen_lru.begin(), cache.gen_lru.end(),
+                            [&](const auto & e) { return e.key == key; }),
+                        cache.gen_lru.end());
+    cache.n_gen_verify_fail++;
+}
+
+// key of peg_generator::generate_parser: template + generation_prompt + the
+// tool/schema inputs the parser and its grammar depend on (messages are NOT used)
+static std::string parser_cache_key(const common_chat_template & tmpl, const autoparser::generation_params & params) {
+    return tmpl.source() + "\x02" + params.generation_prompt + "\x02" + params.tools.dump() + "\x02" +
+           std::to_string((int) params.tool_choice) + "\x02" + params.json_schema.dump() + "\x02" +
+           std::to_string((int) params.parallel_tool_calls) + "\x02" +
+           std::to_string((int) params.reasoning_format);
+}
+
+static bool parser_cache_lookup(const common_chat_templates * tmpls, const std::string & key, common_chat_params & out) {
+    auto & cache = tmpls->w6_cache;
+    std::lock_guard<std::mutex> lock(cache.mtx);
+    for (auto & e : cache.parser_lru) {
+        if (e.key == key) {
+            out = e.params;
+            cache.n_parser_hits++;
+            return true;
+        }
+    }
+    cache.n_parser_miss++;
+    return false;
+}
+
+static void parser_cache_store(const common_chat_templates * tmpls, const std::string & key, const common_chat_params & params) {
+    auto copy          = params;
+    copy.prompt.clear();
+    copy.prompt.shrink_to_fit();
+    copy.generation_prompt.clear();
+    copy.generation_prompt.shrink_to_fit();
+    auto & cache = tmpls->w6_cache;
+    std::lock_guard<std::mutex> lock(cache.mtx);
+    for (auto & e : cache.parser_lru) {
+        if (e.key == key) {
+            e.params = std::move(copy);
+            return;
+        }
+    }
+    cache.parser_lru.push_back({ key, std::move(copy) });
+    if (cache.parser_lru.size() > 8) {
+        cache.parser_lru.erase(cache.parser_lru.begin());
+    }
+}
+
 static common_chat_params common_chat_templates_apply_jinja(const struct common_chat_templates *        tmpls,
                                                             const struct common_chat_templates_inputs & inputs) {
     autoparser::generation_params params;
@@ -2220,7 +2389,28 @@ static common_chat_params common_chat_templates_apply_jinja(const struct common_
         workaround::func_args_not_string(params.messages);
     }
 
-    params.generation_prompt = common_chat_templates_generation_prompt(tmpl, params);
+    // generation prompt (the suffix diff between two full renders). W6-6/A4-S2:
+    // cached across requests keyed on the non-message render inputs - the two
+    // renders inside the diff are the dominant per-request template cost. the
+    // cached value is verified below against the final render (the prompt must
+    // end with it); a template whose agp suffix depends on the messages fails
+    // the verification and falls back to the recompute path.
+    bool        gen_from_cache = false;
+    std::string gen_key;
+    {
+        const bool cacheable = chat_template_cache_enabled() && inputs.add_generation_prompt &&
+                               !chat_template_is_specialized(src);
+        if (cacheable) {
+            gen_key = gen_prompt_cache_key(tmpl, params);
+            gen_from_cache = gen_prompt_cache_lookup(tmpls, gen_key, params.generation_prompt);
+        }
+        if (!gen_from_cache) {
+            params.generation_prompt = common_chat_templates_generation_prompt(tmpl, params);
+            if (cacheable) {
+                gen_prompt_cache_store(tmpls, gen_key, params.generation_prompt);
+            }
+        }
+    }
 
     params.extra_context = common_chat_extra_context();
     for (auto el : inputs.chat_template_kwargs) {
@@ -2267,18 +2457,76 @@ static common_chat_params common_chat_templates_apply_jinja(const struct common_
 
     try {
         LOG_DBG("%s: using differential autoparser\n", __func__);
-        struct autoparser::autoparser autoparser;
-        autoparser.analyze_template(tmpl);
-        auto auto_params = autoparser::peg_generator::generate_parser(tmpl, params, autoparser);
-        auto_params.supports_thinking = autoparser.reasoning.mode != autoparser::reasoning_mode::NONE;
-        if (auto_params.supports_thinking) {
-            auto_params.thinking_start_tag = trim_whitespace(autoparser.reasoning.start);
-            auto_params.thinking_end_tag   = trim_whitespace(autoparser.reasoning.end);
+        // W6-6/A4-S2: with LLAMA_CHAT_TEMPLATE_CACHE=0 all three caches stay off
+        // and the original per-request path is reproduced exactly (analysis,
+        // parser, generation prompt - and the debug arena below)
+        autoparser::autoparser fresh_analysis;
+        const bool cache_on = chat_template_cache_enabled();
+        if (!cache_on) {
+            fresh_analysis.analyze_template(tmpl);
         }
-        auto_params.generation_prompt = params.generation_prompt;
-        common_peg_arena arena;
-        arena.load(auto_params.parser);
-        LOG_DBG("%s: generated parser:\n%s\n\nparser generation prompt: %s\n", __func__, arena.dump(arena.root()).c_str(), auto_params.generation_prompt.c_str());
+        const auto & analysis = cache_on ? cached_template_analysis(tmpls, tmpl) : fresh_analysis;
+
+        // the formatted prompt always depends on the messages: render it fresh
+        std::string prompt = common_chat_template_direct_apply_impl(tmpl, params);
+
+        auto finalize = [&](common_chat_params & auto_params) {
+            auto_params.supports_thinking = analysis.reasoning.mode != autoparser::reasoning_mode::NONE;
+            if (auto_params.supports_thinking) {
+                auto_params.thinking_start_tag = trim_whitespace(analysis.reasoning.start);
+                auto_params.thinking_end_tag   = trim_whitespace(analysis.reasoning.end);
+            }
+            auto_params.generation_prompt = params.generation_prompt;
+            auto_params.prompt            = prompt;
+        };
+
+        // the PEG parser and its grammar depend only on the template + the
+        // generation prompt + tools/schema inputs: reuse them across requests
+        common_chat_params auto_params;
+        const std::string pkey = parser_cache_key(tmpl, params);
+        const bool parser_hit = chat_template_cache_enabled() && parser_cache_lookup(tmpls, pkey, auto_params);
+        if (!parser_hit) {
+            auto_params = autoparser::peg_generator::generate_parser(tmpl, params, analysis);
+        }
+        finalize(auto_params);
+        if (!parser_hit && chat_template_cache_enabled()) {
+            parser_cache_store(tmpls, pkey, auto_params);
+        }
+
+        // verify the cached generation prompt against the fresh render. the cold
+        // path computes the diff BEFORE extra_context (kwargs) is applied, so a
+        // mismatch is resolved by recomputing under the same conditions: if the
+        // recomputed value matches the cached one the mismatch was an artifact
+        // (kwargs changed the render suffix but not the cached diff) and the
+        // cache is trusted; otherwise the entry was genuinely stale
+        if (gen_from_cache) {
+            const std::string & gen = params.generation_prompt;
+            const bool ok = gen.empty() ||
+                (auto_params.prompt.size() >= gen.size() &&
+                 auto_params.prompt.compare(auto_params.prompt.size() - gen.size(), gen.size(), gen) == 0);
+            if (!ok) {
+                auto saved_extra = params.extra_context;
+                params.extra_context = json();
+                const std::string fresh = common_chat_templates_generation_prompt(tmpl, params);
+                params.extra_context = saved_extra;
+                if (fresh != gen) {
+                    LOG_WRN("%s: cached generation prompt was stale, recomputed%s\n", __func__, "");
+                    gen_prompt_cache_invalidate(tmpls, gen_key);
+                    params.generation_prompt = fresh;
+                    gen_prompt_cache_store(tmpls, gen_key, fresh);
+                    auto_params = autoparser::peg_generator::generate_parser(tmpl, params, analysis);
+                    finalize(auto_params);
+                    parser_cache_store(tmpls, parser_cache_key(tmpl, params), auto_params);
+                }
+            }
+        }
+
+        // with the cache off, reproduce the original always-on arena load
+        if (!cache_on || common_log_get_verbosity_thold() >= LOG_LEVEL_DEBUG) {
+            common_peg_arena arena;
+            arena.load(auto_params.parser);
+            LOG_DBG("%s: generated parser:\n%s\n\nparser generation prompt: %s\n", __func__, arena.dump(arena.root()).c_str(), auto_params.generation_prompt.c_str());
+        }
         return auto_params;
     } catch (const std::exception & e) {
         throw std::invalid_argument(std::string("Unable to generate parser for this template. Automatic parser generation failed: ") + e.what());

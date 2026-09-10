@@ -1,0 +1,92 @@
+From 17758a543caa91f190f8d70c080da376040f42fa Mon Sep 17 00:00:00 2001
+From: pugant <pugant@localhost>
+Date: Thu, 10 Sep 2026 18:30:54 +0200
+Subject: [PATCH 18/19] test: reproducible negative control for the
+ sync-tracker hazard oracle
+
+Add a "negctl" mode to test-vk-sync-tracker that runs the scoped-clear
+hazard oracle with a deliberately over-clearing step (clear-all instead
+of clear-covered). The sabotage lives only in the test's simulation
+stub - the production header is untouched. The mode must fail with
+missed hazards > 0, proving the oracle detects a lost-dependency bug:
+236901 missed hazards, exit code 1, vs 43372 ranges / 0 misses in the
+normal run. The ctest invocation (no arguments) is unchanged.
+
+Persists the negative-control evidence that was previously only
+claimed in the W6-4 report (logs/wave6/w6b4-negctl-oracle.log).
+
+Co-Authored-By: GLM by z.ai
+---
+ tests/test-vk-sync-tracker.cpp | 30 ++++++++++++++++++++++++------
+ 1 file changed, 24 insertions(+), 6 deletions(-)
+
+diff --git a/tests/test-vk-sync-tracker.cpp b/tests/test-vk-sync-tracker.cpp
+index 0b4cbf0b1..df125c1e5 100644
+--- a/tests/test-vk-sync-tracker.cpp
++++ b/tests/test-vk-sync-tracker.cpp
+@@ -19,6 +19,7 @@
+ 
+ #include <cstdio>
+ #include <cstdint>
++#include <cstring>
+ #include <vector>
+ 
+ static int g_failures = 0;
+@@ -289,7 +290,7 @@ struct oracle_access {
+     int group;  // node group the access belongs to
+ };
+ 
+-static void test_scoped_hazard_oracle() {
++static void test_scoped_hazard_oracle(bool sabotage_clear_all = false) {
+     int total_barriers = 0;
+     int total_misses = 0;
+ 
+@@ -344,7 +345,15 @@ static void test_scoped_hazard_oracle() {
+                     barriers.push_back({ (int) trace.size(), m });
+                 }
+                 total_barriers += (int) merged.size();
+-                t.clear_covered(merged);
++                if (sabotage_clear_all) {
++                    // Negative control: simulate the over-clearing bug
++                    // (drop every tracked region on every barrier, not just
++                    // the covered ones) and let the oracle below prove it
++                    // counts as lost dependencies.
++                    t.clear_all();
++                } else {
++                    t.clear_covered(merged);
++                }
+             }
+ 
+             for (const auto & a : group) {
+@@ -397,15 +406,24 @@ static void test_scoped_hazard_oracle() {
+ // main
+ // ---------------------------------------------------------------------------
+ 
+-int main() {
++int main(int argc, char ** argv) {
++    // Negative-control mode ("negctl"): runs the scoped-clear hazard oracle
++    // with a deliberately over-clearing clear step (simulated in THIS test's
++    // stub, never in the production header) and must fail with missed
++    // hazards > 0. Exit code 1 in this mode is the expected, successful
++    // outcome of the control; the normal ctest invocation (no arguments)
++    // is unaffected.
++    const bool negctl = argc > 1 && strcmp(argv[1], "negctl") == 0;
++
+     test_hazard_patterns();
+     test_randomized_equivalence();
+-    test_scoped_hazard_oracle();
++    test_scoped_hazard_oracle(negctl);
+ 
+     if (g_failures == 0) {
+-        printf("test-vk-sync-tracker: OK (%d checks)\n", g_checks);
++        printf("test-vk-sync-tracker: OK (%d checks)%s\n", g_checks, negctl ? " [NEGCTL: UNEXPECTED]" : "");
+         return 0;
+     }
+-    printf("test-vk-sync-tracker: %d FAILURES out of %d checks\n", g_failures, g_checks);
++    printf("test-vk-sync-tracker: %d FAILURES out of %d checks%s\n", g_failures, g_checks,
++           negctl ? " [NEGCTL: expected - the oracle caught the sabotage]" : "");
+     return 1;
+ }
+-- 
+2.53.0
+

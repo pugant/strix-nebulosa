@@ -700,6 +700,10 @@ struct common_params {
     int32_t cache_disk_persist_mib     = 16384; // persistent library budget (min 1024)
     int32_t cache_disk_persist_min_tokens = 1024; // do not save shorter prompts to the library
 
+    int32_t     cache_disk_park_mib       = 0;     // T32-b: park library budget in MiB, 0 = off (min 1024 when on)
+    int32_t     cache_disk_park_ram_mirror_mib = 0; // W6-8 (A3-5): park RAM-mirror budget in MiB, 0 = off (min 1024 when on)
+    std::string cache_disk_park_heuristic = "none"; // T32-b: main-task detection for the park library: none | longest
+
     bool    ple_disk       = false; // T25: keep the qwen4exp PLE n-gram table on disk
     int32_t ple_cache_mib  = 4096;  // T25: PLE block-cache budget (MiB), requires --ple-disk
 

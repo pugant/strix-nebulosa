@@ -1,0 +1,46 @@
+From 641fa056cb18936ad227314fc2c2d3fd9a88bbe7 Mon Sep 17 00:00:00 2001
+From: pugant <pugant@localhost>
+Date: Thu, 10 Sep 2026 18:17:49 +0200
+Subject: [PATCH 13/19] qwen4exp: collapse the hc streams straight off their
+ views [w6-2]
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+build_hc_mix() contiguized stream 0 before folding the hyper-connection
+streams into their mean, but every ADD of the chain already consumed a
+strided view of `gated` as src1 — dropping the leading cont just removes
+one dispatch per mixer call (two per layer plus the output/head mixers,
+97 per trunk eval in prod) while producing the same values element-wise.
+
+With hc == 1 the loop body never runs and `mixed` stays a view of `gated`
+until the closing scale allocates, which is the same fresh tensor the old
+cont produced. Bit-exact per the w6-2 harness (hc_mixed-* hashes, logits
+and state identical).
+
+Co-Authored-By: GLM by z.ai <glm@z.ai>
+---
+ src/models/qwen4exp.cpp | 5 ++++-
+ 1 file changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
+index a37da0bb5..5412f82e9 100644
+--- a/src/models/qwen4exp.cpp
++++ b/src/models/qwen4exp.cpp
+@@ -294,9 +294,12 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
+     gated = ggml_reshape_3d(ctx0, gated, n_embd, hc, nt);
+ 
+     // collapse the streams by their mean
++    // [w6-2] the streams are consumed straight as strided views: ADD reads through nb
++    // (its src1 was already a strided view here), so the leading cont of stream 0 only
++    // materialized data the first ADD would re-read anyway. With hc == 1 the loop body
++    // never runs and `mixed` stays a view of `gated` until the scale allocates.
+     ggml_tensor * mixed = ggml_view_2d(ctx0, gated, n_embd, nt,
+             ggml_row_size(gated->type, n_embd) * hc, 0);
+-    mixed = ggml_cont(ctx0, mixed);
+     for (int64_t c = 1; c < hc; ++c) {
+         ggml_tensor * s = ggml_view_2d(ctx0, gated, n_embd, nt,
+                 ggml_row_size(gated->type, n_embd) * hc,
+-- 
+2.53.0
+

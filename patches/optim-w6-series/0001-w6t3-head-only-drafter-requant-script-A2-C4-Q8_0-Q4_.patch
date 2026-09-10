@@ -1,0 +1,78 @@
+From 279cadb0e1e1880b30c395dcfd4c0461265cf979 Mon Sep 17 00:00:00 2001
+From: pugant <pugant@localhost>
+Date: Thu, 10 Sep 2026 15:09:11 +0200
+Subject: [PATCH 01/19] =?UTF-8?q?w6t3:=20head-only=20drafter=20requant=20s?=
+ =?UTF-8?q?cript=20(A2-C4)=20=E2=80=94=20Q8=5F0=20->=20Q4=5F0=5FROCMFP4=20?=
+ =?UTF-8?q?on=20output.weight=20only?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+No source patch: llama-quantize --pure + --output-tensor-type +
+--allow-requantize with base ftype Q8_0 already yields a bit-exact
+copy of every non-head tensor and converts only tensor_category::OUTPUT
+(the drafter ships no nextn.shared_head_head, so the MTP head is
+output.weight, 83% of the draft per-step bytes). Script runs the
+dry-run perimeter gate, the quantization, and prints sizes; HEAD_TYPE
+env selects an alternative arm (e.g. Q2_0_ROCMFPX).
+
+Wave-6 W6-3 / A2-C4. Verified: regenerates sha256
+fa30a89fa06cd1bcc40810dcf1fed73d69c5ff33afb2a08b76333c6f9629ea34
+bit-identical; 33/33 non-head tensors sha256-identical; loader maps
+1 q4_0_rocmfp4 + 22 q8_0 + 11 f32.
+
+Co-Authored-By: GLM by z.ai
+---
+ scripts/w6t3-drafter-head-requant.sh | 40 ++++++++++++++++++++++++++++
+ 1 file changed, 40 insertions(+)
+ create mode 100755 scripts/w6t3-drafter-head-requant.sh
+
+diff --git a/scripts/w6t3-drafter-head-requant.sh b/scripts/w6t3-drafter-head-requant.sh
+new file mode 100755
+index 000000000..61da828d9
+--- /dev/null
++++ b/scripts/w6t3-drafter-head-requant.sh
+@@ -0,0 +1,40 @@
++#!/usr/bin/env bash
++# W6-3 (A2-C4): head-only requant of the qwen4exp MTP drafter.
++#
++# Requantizes ONLY the drafter LM head (output.weight, 83% of the per-step
++# bytes read by the draft chain) from Q8_0 to Q4_0_ROCMFP4 (4.5 bpw, dual
++# UE4M3 half-block scales) while every other tensor is copied bit-exact.
++#
++# No source patch is needed: llama-quantize already supports this via
++#   --pure                    -> no recipe remixing: each tensor keeps its
++#                                current type (same type == verbatim copy,
++#                                no Q8_0 -> Q8_0 round trip, see
++#                                src/llama-quant.cpp "quantize = cur_type != new_type")
++#   --output-tensor-type T    -> applies to tensor_category::OUTPUT
++#                                (output.weight and nextn.shared_head_head),
++#                                honored before the --pure branch
++#   --allow-requantize        -> Q8_0 is not in the NVFP4/Q4_0 whitelist of
++#                                llama_tensor_allows_requantize_to_rocmfp4()
++#   base ftype Q8_0           -> default type == current type for the rest
++#
++# The fork flag convention applies: all flags BEFORE the positional args.
++#
++# Usage:
++#   scripts/w6t3-drafter-head-requant.sh <in.gguf> <out.gguf> [llama-quantize]
++# Env:
++#   HEAD_TYPE   (default Q4_0_ROCMFP4) - e.g. Q2_0_ROCMFPX for an FP2 arm
++
++set -euo pipefail
++
++IN="${1:?usage: $0 <in.gguf> <out.gguf> [llama-quantize]}"
++OUT="${2:?usage: $0 <in.gguf> <out.gguf> [llama-quantize]}"
++QUANTIZE="${3:-llama-quantize}"
++HEAD_TYPE="${HEAD_TYPE:-Q4_0_ROCMFP4}"
++
++# pre-flight: dry-run shows the selector perimeter (only output.weight converts)
++"$QUANTIZE" --dry-run --allow-requantize --pure --output-tensor-type "$HEAD_TYPE" "$IN" "${OUT}.dryrun" Q8_0
++
++"$QUANTIZE" --allow-requantize --pure --output-tensor-type "$HEAD_TYPE" "$IN" "$OUT" Q8_0
++
++stat -c 'IN : %n %s bytes' "$IN"
++stat -c 'OUT: %n %s bytes' "$OUT"
+-- 
+2.53.0
+

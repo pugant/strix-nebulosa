@@ -9,6 +9,7 @@
 #include "build-info.h"
 #include "common.h"
 #include "diffusion.h"
+#include "llama-park-identity.h"
 #include "llama.h"
 #include "../../src/llama-ext.h"
 #include "../../src/llama-model.h" // t25: model_tgt->get_ple_stats() needs the full llama_model
@@ -21,6 +22,7 @@
 #include "mtmd-helper.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cstdlib>
 #include <cstring>
 #include <cstddef>
@@ -155,7 +157,13 @@ struct server_slot {
         return name;
     }
 
-    bool prompt_save(server_prompt_cache & prompt_cache) const {
+    // T32-b: park (optional, default nullptr = today's flow EXACTLY - the
+    // safe_to_clear call site below never passes it and stays outside the
+    // redirect). When set, the disk half of this save is redirected to the
+    // park library; the plumbing - RAM half on the general instance, distinct
+    // park disk rc, general-library safety-net - lives in
+    // server_prompt_cache::save.
+    bool prompt_save(server_prompt_cache & prompt_cache, server_prompt_cache * park = nullptr) const {
         if (prompt.tokens.size() == 0) {
             return false;
         }
@@ -186,18 +194,33 @@ struct server_slot {
 
         // spec-route (spec §4.1): save the KV of the drafter that produced this
         // state (ctx_dft points at it since the task launch) and tag the entry
-        // with it - the bytes are only restorable into that drafter's context
-        return prompt_cache.save(prompt, ctx_tgt, ctx_dft, id, state_spec, spec_drafter_active);
+        // with it - the bytes are only restorable into that drafter's context.
+        // T32-b: the trailing park pointer defaults to nullptr = the
+        // historical combined save on the general instance, byte-for-byte.
+        return prompt_cache.save(prompt, ctx_tgt, ctx_dft, id, state_spec, spec_drafter_active, park);
     }
 
+    // T32-b: park (optional, default nullptr = today's flow EXACTLY - the one
+    // other restore path, /slots/restore, is not a cache load at all: it
+    // reloads a user-provided slot save file straight via
+    // llama_state_seq_load_file and never touches the prompt cache, so it
+    // stays outside the park by construction). When set, the
+    // park library's disk entries join the candidate selection inside load();
+    // a winning park entry restores through the SAME wrapper code, with the
+    // accept/reject bookkeeping routed to the owning instance (see below).
     bool prompt_load(server_prompt_cache & prompt_cache, const server_tokens & tokens, bool spec_trailing_rm,
-            std::string * rebuild_kind = nullptr) {
+            std::string * rebuild_kind = nullptr, server_prompt_cache * park = nullptr) {
         const bool spec_state_required = common_speculative_state_required(spec);
         bool cache_hit = false;
         uint64_t disk_entry_id = 0;
         bool tag_mismatch = false;
+        // T32-b: which instance owns the disk entry this load selected (the
+        // general one, or the park when a park candidate won) - the
+        // accept/reject below MUST run on the owner, or the hits/LRU/sidecar
+        // of the wrong library would be mutated
+        server_prompt_cache * disk_entry_owner = &prompt_cache;
         bool res = prompt_cache.load(prompt, tokens, ctx_tgt, ctx_dft, id, spec_state_required, spec_trailing_rm,
-                &cache_hit, &disk_entry_id, spec_drafter_active, &tag_mismatch);
+                &cache_hit, &disk_entry_id, spec_drafter_active, &tag_mismatch, park, &disk_entry_owner);
         if (res && cache_hit) {
             if (tag_mismatch) {
                 // spec-route (spec §4.1-4.3): the entry's draft/spec payload belongs to
@@ -247,10 +270,14 @@ struct server_slot {
             prompt.data.spec.shrink_to_fit();
         }
         if (disk_entry_id != 0) {
+            // T32-b: route to the OWNING instance - for a park entry the
+            // hits++/last_used/LRU splice/sidecar rewrite (accept) or the
+            // entry erase (reject) belong to the park library, not this
+            // general one
             if (res) {
-                prompt_cache.accept_disk_load(disk_entry_id);
+                disk_entry_owner->accept_disk_load(disk_entry_id);
             } else {
-                prompt_cache.reject_disk_load(disk_entry_id, "spec-state-rejected");
+                disk_entry_owner->reject_disk_load(disk_entry_id, "spec-state-rejected");
             }
         }
         if (!res) {
@@ -888,6 +915,11 @@ public:
     mtmd_context * mctx = nullptr;
     const llama_vocab * vocab = nullptr;
 
+    // W6-6 / A4-S1: reuses the tokenized conversation prefix across requests
+    // (stateless clients resend the whole history; only the tail is new).
+    // Thread-safe: HTTP worker threads tokenize concurrently.
+    std::unique_ptr<server_token_prefix_cache> token_prefix_cache;
+
     server_queue    queue_tasks;
     server_response queue_results;
 
@@ -964,6 +996,23 @@ private:
 
     std::unique_ptr<server_prompt_cache> prompt_cache;
 
+    // T32-b: the park library - a second, persist-only (RAM-disabled) library
+    // below the same cache root where the main-agent context is parked while
+    // subagent traffic keeps using prompt_cache. Null when the feature is off
+    // (default --cache-disk-park-mib 0: no directory, no log, no effects).
+    std::unique_ptr<server_prompt_cache> park_cache;
+
+    // T32-b: the resolved park configuration (flags -> park_cfg, hoisted out
+    // of load_model so the task-switch save redirect can read it back) and
+    // the arrival registry backing the LONGEST heuristic. park_heur is
+    // maintained by process_single_task on the server task loop - the same
+    // thread that reads it back in get_available_slot, so the multiset needs
+    // no locking. It stays permanently empty with the default
+    // --cache-disk-park-mib 0 and with heuristic none (the insert is gated to
+    // feature-on AND LONGEST, the only mode that reads the registry).
+    park_cfg   park_base;
+    heur_state park_heur;
+
     server_metrics metrics;
 
     json json_webui_settings = json::object();
@@ -1034,6 +1083,13 @@ private:
         }
 
         vocab = llama_model_get_vocab(model_tgt);
+
+        token_prefix_cache = std::make_unique<server_token_prefix_cache>(vocab);
+        {
+            const auto cache_stats = token_prefix_cache->get_stats();
+            SRV_INF("tokenizer prefix cache %s (vocab type %d)\n",
+                    cache_stats.enabled ? "enabled" : "disabled", (int) llama_vocab_type(vocab));
+        }
 
         n_ctx = llama_n_ctx(ctx_tgt);
 
@@ -1491,12 +1547,32 @@ private:
 
         const bool cache_disk_enabled = !params_base.cache_disk_path.empty() && params_base.cache_disk_limit_mib > 0;
 
+        // T32-b: park library configuration mapped inline from the flags (the
+        // pure park_cfg helper of llama-park-identity.h, no new abstraction).
+        // The park lives below the SAME cache root as the general disk cache,
+        // so it only exists when the disk cache is configured. Resolved into
+        // the park_base member: the task-switch save redirect
+        // (get_available_slot) reads it back.
+        park_base.mib       = params_base.cache_disk_park_mib;
+        park_base.heuristic = params_base.cache_disk_park_heuristic == "longest" ? park_cfg::LONGEST : park_cfg::NONE;
+        const bool park_cache_enabled = cache_disk_enabled && park_enabled(park_base);
+        // W6-8 (A3-5): the mirror budget follows the park (inert without it).
+        // Default 0 = off = the T32-b RAM-disabled park, unchanged.
+        const size_t park_mirror_bytes = params_base.cache_disk_park_ram_mirror_mib > 0
+            ? 1024ull*1024ull*(size_t) params_base.cache_disk_park_ram_mirror_mib
+            : 0;
+        if (park_mirror_bytes > 0 && !park_cache_enabled) {
+            SRV_WRN("%s", "--cache-disk-park-ram-mirror ignored: the park library needs --cache-disk-park-mib and --cache-disk-park-heuristic\n");
+        }
+
         // T23: the persistent library is keyed by the model/drafter/KV-type
         // identity; entries written by a different config are never adopted
         // (they stay on disk as orphans, subject only to budget-driven GC)
         const bool cache_persist_enabled = cache_disk_enabled && params_base.cache_disk_persist;
+        // T32-b: the park library is keyed by the same identity fingerprint
+        // as the persist library, so it must be computed for either consumer
         uint8_t cache_persist_fingerprint[16] = {0};
-        if (cache_persist_enabled) {
+        if (cache_persist_enabled || park_cache_enabled) {
             std::error_code fs_ec;
             uint64_t model_size = 0;
             if (!params_base.model.path.empty()) {
@@ -1547,6 +1623,35 @@ private:
                 cache_persist_enabled ? params_base.cache_disk_persist_min_tokens : 0);
         } else {
             SRV_INF("%s", "prompt cache is disabled - use `--cache-ram N` or `--cache-disk PATH` to enable it\n");
+        }
+
+        // T32-b: the park library instance. RAM is disabled (ram 0), park_mib
+        // is both the disk and the persist budget of this instance, the
+        // identity fingerprint is the same one the persist library uses, and
+        // its library directory is the "main-park" subdir below the shared
+        // cache root. The boot scan (dir + per-dir lock + fingerprint +
+        // entry adoption) is inherited from the ctor. persist_min_tokens is 0:
+        // what ends up in the park is selected explicitly by the main-agent
+        // identity, not by a token-count floor.
+        if (park_cache_enabled) {
+            park_cache = std::make_unique<server_prompt_cache>(
+                0,                            // RAM disabled: ram_enabled = (limit_mib != 0)
+                n_ctx,
+                params_base.cache_disk_path,  // same cache root as the general instance
+                park_base.mib,                // disk budget of the park library
+                cache_persist_fingerprint,
+                park_base.mib,                // persist budget: same MiB figure
+                0,
+                "main-park",
+                /*park=*/ true,
+                // W6-8 (A3-5): RAM mirror of the live entry behind its own
+                // flag; 0 (default) keeps the T32-b RAM-disabled park as is
+                park_mirror_bytes);
+        } else if (params_base.cache_disk_park_mib > 0) {
+            SRV_WRN("%s", "--cache-disk-park-mib ignored: the park library needs --cache-disk PATH and a positive --cache-disk-limit-mib\n");
+        }
+        if (park_cache_enabled && park_mirror_bytes > 0) {
+            SRV_INF("prompt cache park RAM mirror enabled: limit_mib=%d\n", params_base.cache_disk_park_ram_mirror_mib);
         }
         SRV_INF("%s", "for more info see https://github.com/ggml-org/llama.cpp/pull/16391\n");
 
@@ -1763,7 +1868,35 @@ private:
                 // spec-route: the save must happen BEFORE the repoint below - it
                 // stores the previous task's state, which lives in the drafter that
                 // task was routed to (slot.ctx_dft / spec_drafter_active still hold it)
-                ret->prompt_save(*prompt_cache);
+
+                // T32-b (spec step 4.2): redirect the DISK half of this
+                // boundary save to the park library when the slot was last
+                // serving the main agent's task. The X-Pi-Role header
+                // (task_prev->params.park_main, Task 2) is authoritative; with
+                // --cache-disk-park-heuristic longest the task is also checked
+                // against park_heur, the arrival registry maintained by
+                // process_single_task earlier in this same loop thread. The
+                // heuristic input is the task's ARRIVAL size
+                // (task_prev->tokens, what the registry recorded), NOT the
+                // slot boundary: the boundary always includes the tokens the
+                // task generated while it ran, so a strict-equality check
+                // against the arrival registry could never fire (final-review
+                // fix; spec r3 defines identity by prompt tokens observed at
+                // arrival).
+                // park_cache != nullptr adds the one conjunct the pure helper
+                // cannot see: a live park library, built exactly when the disk
+                // cache is configured and the park is on.
+                server_prompt_cache * park_redirect = nullptr;
+                if (park_cache && park_should_redirect(park_base, park_heur,
+                            ret->task_prev != nullptr,
+                            ret->task_prev ? ret->task_prev->params.park_main : false,
+                            (uint64_t) (ret->task_prev ? ret->task_prev->tokens.size() : 0))) {
+                    park_redirect = park_cache.get();
+                    SLT_INF(*ret, "persist park: redirect disk-save of main task tokens=%zu\n",
+                            ret->prompt.tokens.size());
+                }
+
+                ret->prompt_save(*prompt_cache, park_redirect);
 
                 // spec-route: switch the slot to the incoming task's drafter BEFORE
                 // the load, so a tag-matching entry restores its draft KV into the
@@ -1784,7 +1917,10 @@ private:
                      dft_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS);
 
                 std::string rebuild_kind;
-                if (!ret->prompt_load(*prompt_cache, task.tokens, spec_trailing_rm, &rebuild_kind)) {
+                // T32-b: the park library's entries join this load's candidate
+                // selection (park candidates follow all existing rules inside
+                // load(); a park winner's bookkeeping runs on the park)
+                if (!ret->prompt_load(*prompt_cache, task.tokens, spec_trailing_rm, &rebuild_kind, park_cache.get())) {
                     ret->prompt_clear(false);
                     SRV_INF("prompt cache cold fallback: slot=%d reason=target-draft-restore-rejected target_and_draft_cleared=true\n",
                             ret->id);
@@ -2657,6 +2793,34 @@ private:
                         }
                     }
 
+                    // T32-b (task 6): register the arriving prompt in the
+                    // LONGEST-heuristic registry - at task ARRIVAL on this loop,
+                    // never at save time, so the task-switch redirect below can
+                    // ask "is the boundary I am about to save the biggest context
+                    // this server has ever seen". handle_completions_impl (where
+                    // the task object is built, tokens already materialized)
+                    // cannot host the insert: HTTP worker threads hold a CONST
+                    // view of this context and run concurrently with the loop,
+                    // while impl state is mutated only here - process_single_task
+                    // is the arrival point ON the loop thread, and it strictly
+                    // precedes the get_available_slot evaluation that reads the
+                    // registry. A task deferred for slot pressure re-enters this
+                    // function and inserts twice: the registry is max-read only,
+                    // duplicates are inert. Embedding/rerank traffic is excluded -
+                    // only conversational completion/infill prompts may shape the
+                    // "who is the main" signal. The feature gate keeps the
+                    // registry empty (and the multiset ungrown) with the default
+                    // --cache-disk-park-mib 0, and so does heuristic none: the
+                    // registry is consulted ONLY in LONGEST mode (park_task_is_main
+                    // short-circuits - header true, non-LONGEST false - before
+                    // ever reading seen), so with mib > 0 and no heuristic the
+                    // insert would grow the multiset with no reader.
+                    if ((task.type == SERVER_TASK_TYPE_COMPLETION || task.type == SERVER_TASK_TYPE_INFILL) &&
+                            park_enabled(park_base) &&
+                            park_base.heuristic == park_cfg::LONGEST) {
+                        park_heur.seen.insert((uint64_t) task.tokens.size());
+                    }
+
                     const int id_slot = task.id_slot;
                     const int id_task = task.id;
 
@@ -2814,6 +2978,11 @@ private:
                     res->persist_last_restore_ms       = persist_st.last_restore_ms;
                     res->persist_last_tokens_restored  = persist_st.last_tokens_restored;
                     res->persist_last_tokens_prefilled = persist_st.last_tokens_prefilled;
+
+                    // T32-b: park-library gauge - the park's own measurement,
+                    // read from the park instance (zeros when the park is off)
+                    const persist_stats park_st = park_cache ? park_cache->get_persist_stats() : persist_stats{};
+                    res->park_restore_crc_ms = park_st.park_restore_crc_ms;
 
                     // PI F4 follow-up (29/08): speculative state reset counter
                     res->spec_state_resets_total = metrics.spec_state_resets_total;
@@ -4974,6 +5143,20 @@ void server_context::on_sleeping_changed(std::function<void(bool)> callback) {
 // server_routes
 //
 
+// T32-b park: header names are case-insensitive on the wire, but
+// server_http_req::headers is a plain map keyed by the exact spelling the
+// client sent, so the X-Pi-Role lookup has to compare lowercased
+static std::string get_pi_role_header(const std::map<std::string, std::string> & headers) {
+    for (const auto & [name, value] : headers) {
+        std::string lowered(name.size(), '\0');
+        std::transform(name.begin(), name.end(), lowered.begin(), [](unsigned char c) { return std::tolower(c); });
+        if (lowered == "x-pi-role") {
+            return value;
+        }
+    }
+    return "";
+}
+
 std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
             const server_http_req & req,
             server_task_type type,
@@ -5009,10 +5192,17 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
             inputs.push_back(process_mtmd_prompt(ctx_server.mctx, prompt.get<std::string>(), files));
         } else {
             // Everything else, including multimodal completions.
-            inputs = tokenize_input_prompts(ctx_server.vocab, ctx_server.mctx, prompt, true, true);
+            inputs = tokenize_input_prompts(ctx_server.vocab, ctx_server.mctx, prompt, true, true,
+                                            ctx_server.token_prefix_cache.get());
         }
 
         // tasks.reserve(inputs.size()); // TODO: this is inaccurate due to child tasks
+
+        // T32-b park (spec §4): the main-agent identity is decided only here, at
+        // the convergence point of every completions/chat/infill route, and only
+        // from the X-Pi-Role header - the request JSON is never consulted for
+        // it, so a client body with "park_main": true has no effect
+        const bool park_main = park_header_value(get_pi_role_header(req.headers));
 
         for (size_t i = 0; i < inputs.size(); i++) {
             server_task task = server_task(type);
@@ -5032,6 +5222,9 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
             task.params.res_type          = res_type;
             task.params.oaicompat_cmpl_id = completion_id;
             task.params.oaicompat_model   = meta->model_name;
+
+            // T32-b park: explicit field from the caller (header), see above
+            task.params.park_main = park_main;
 
             // prepare child tasks
             if (task.params.n_cmpl > 1) {
@@ -5496,6 +5689,15 @@ void server_routes::init_routes() {
                 {"name",  "persist_last_tokens_prefilled"},
                 {"help",  "Tokens the last persistent-library restore still had to prefill (the non-common suffix)."},
                 {"value", res_task->persist_last_tokens_prefilled},
+            });
+
+            // T32-b: park-library restore gauge (zeros until a park restore
+            // happened); the persist_* family above stays the general
+            // library's, the park's measurements are never folded into it
+            gauge_defs.push_back({
+                {"name",  "park_restore_crc_ms"},
+                {"help",  "CRC-verification wall time of the last park-library restore, in milliseconds (0 until one happened)."},
+                {"value", res_task->park_restore_crc_ms},
             });
         }
 

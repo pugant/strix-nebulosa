@@ -82,6 +82,8 @@ What is merged where:
 | Reasoning-budget forced-newline, prepared for ggml-org | Upstream PR **archived, not sent** — story in [`patches/upstream-llamacpp/README.md`](patches/upstream-llamacpp/README.md) |
 | Everything else (drafter routing, DFlash2 port, verify-log, remaining cache patches) | **Included in this repo**: full source in [`rocmfpx/`](rocmfpx/), plus the `git am`-able series in `patches/` |
 
+| **optim-w6-series** (19 patches, deployed 2026-09-10 as `qwen4exp-mtp-vk-optim-w6`) — boundary-keep through the F4 reset (+5.4%), head-only drafter requant (+4.5%), decode-graph copy elimination, single-read restore, in-stream save CRC, token-prefix/template caches, park RAM-mirror flag, memoized backend verdicts, scoped-barrier tracker (default OFF) | [`patches/optim-w6-series/`](patches/optim-w6-series/) |
+
 > History note: our pull requests to the fork (incl. #69, merged; #80, open at
 > the time) went through the now-removed GitHub fork; the patches and this
 > snapshot preserve everything.

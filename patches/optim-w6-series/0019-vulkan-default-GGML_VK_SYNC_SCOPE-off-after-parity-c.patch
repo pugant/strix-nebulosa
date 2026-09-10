@@ -1,0 +1,38 @@
+From f37da5c0cb716ea69a98b186880540297c4eb058 Mon Sep 17 00:00:00 2001
+From: pugant <pugant@localhost>
+Date: Thu, 10 Sep 2026 19:22:58 +0200
+Subject: [PATCH 19/19] vulkan: default GGML_VK_SYNC_SCOPE off after parity
+ cells [w6-4 flip]
+
+The scoped-barrier path measured tg parity (+0.3%, well inside replica
+spread) against the kill-switch arm on the W6 interleaved cells
+(logs/wave6/w6b4-ab.rc, activation verified via sync-scope logger in
+w6b4-verify.rc: 46273 buffer-scoped vs 29286 global). Ship the tracker
+and scoped emitter inert by default; opt in with GGML_VK_SYNC_SCOPE=1.
+
+Co-Authored-By: GLM by z.ai <glm@z.ai>
+---
+ ggml/src/ggml-vulkan/ggml-vulkan.cpp | 7 ++++---
+ 1 file changed, 4 insertions(+), 3 deletions(-)
+
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+index 187e8a507..780f2f6c0 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
++++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+@@ -1828,9 +1828,10 @@ static bool vk_perf_logger_enabled = false;
+ static bool vk_perf_logger_concurrent = false;
+ static bool vk_enable_sync_logger = false;
+ // W6-4 / A6-S1: emit the tracker-triggered barrier scoped to the involved
+-// buffer ranges instead of a device-wide memory barrier. Kill switch:
+-// GGML_VK_SYNC_SCOPE=0 reverts to the device-wide barrier.
+-static bool vk_sync_scoped_enabled = true;
++// buffer ranges instead of a device-wide memory barrier. Default OFF after
++// the W6 interleaved cells measured tg parity (+0.3% << sigma, w6b4-ab.rc):
++// the infrastructure ships inert and opt-in via GGML_VK_SYNC_SCOPE=1.
++static bool vk_sync_scoped_enabled = false;
+ // number of calls between perf logger prints
+ static uint32_t vk_perf_logger_frequency = 1;
+ static std::string vk_pipeline_stats_filter;
+-- 
+2.53.0
+

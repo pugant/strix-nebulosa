@@ -1440,6 +1440,41 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CACHE_DISK_PERSIST_MIN_TOKENS").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--cache-disk-park-mib"}, "N",
+        string_format("park library budget in MiB for the main-agent context (default: %d, 0 - disable, minimum: 1024)",
+            params.cache_disk_park_mib),
+        [](common_params & params, int value) {
+            if (value != 0 && value < 1024) {
+                throw std::invalid_argument("park library budget must be 0 (disabled) or at least 1024 MiB");
+            }
+            params.cache_disk_park_mib = value;
+        }
+    ).set_env("LLAMA_ARG_CACHE_DISK_PARK_MIB").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--cache-disk-park-ram-mirror"}, "N",
+        string_format("keep a RAM mirror of the park library's live entry up to N MiB so the hot park restore skips the disk entirely (default: %d, 0 - disable, minimum: 1024)",
+            params.cache_disk_park_ram_mirror_mib),
+        [](common_params & params, int value) {
+            if (value != 0 && value < 1024) {
+                throw std::invalid_argument("park RAM-mirror budget must be 0 (disabled) or at least 1024 MiB");
+            }
+            params.cache_disk_park_ram_mirror_mib = value;
+        }
+    ).set_env("LLAMA_ARG_CACHE_DISK_PARK_RAM_MIRROR").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--cache-disk-park-heuristic"}, "MODE",
+        string_format("how the server detects the main-agent task for the park library, one of:\n"
+            "- none: only an explicit main header parks the context\n"
+            "- longest: the task with the longest prompt seen so far is the main one\n"
+            "(default: %s)", params.cache_disk_park_heuristic.c_str()),
+        [](common_params & params, const std::string & value) {
+            if (value != "none" && value != "longest") {
+                throw std::invalid_argument("invalid value for argument --cache-disk-park-heuristic: must be none or longest");
+            }
+            params.cache_disk_park_heuristic = value;
+        }
+    ).set_env("LLAMA_ARG_CACHE_DISK_PARK_HEURISTIC").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"-kvu", "--kv-unified"},
         {"-no-kvu", "--no-kv-unified"},
         "use single unified KV buffer shared across all sequences (default: enabled if number of slots is auto)",

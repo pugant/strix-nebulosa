@@ -1,0 +1,687 @@
+From 07be7db9f2de53f23b9b6bcf562fff5956a7db1e Mon Sep 17 00:00:00 2001
+From: pugant <pugant@localhost>
+Date: Thu, 10 Sep 2026 17:45:52 +0200
+Subject: [PATCH 16/19] vulkan: track unsynchronized accesses per buffer (A6-S2
+ / W6-4)
+
+Replace the flat unsynced_nodes_written/read tensor lists with a
+per-buffer tracker (ggml-vulkan-sync.hpp). The hazard test only ever
+compares accesses inside the same device buffer, so grouping regions by
+buffer keeps every sync decision identical while the scan cost no longer
+grows with the accesses tracked for the other buffers (the weight-buffer
+read list no longer taxes every destination check).
+
+The sync decision is proven identical to the previous semantics by
+tests/test-vk-sync-tracker.cpp: a reference implementation of the old
+flat-list predicate runs in lockstep over randomized node-group
+sequences (20 seeds x 2000 groups, dst + up to 4 srcs each), plus
+pattern tests for RAW/WAR/WAW per buffer, cross-buffer independence,
+adjacent/disjoint ranges and the zero-size edges of the original
+strict-inequality predicate.
+
+Prerequisite for the scoped barriers of A6-S1 (follow-up commit).
+
+Co-Authored-By: GLM by z.ai
+---
+ ggml/src/ggml-vulkan/ggml-vulkan-sync.hpp | 190 ++++++++++++++
+ ggml/src/ggml-vulkan/ggml-vulkan.cpp      |  74 +++---
+ tests/CMakeLists.txt                      |   6 +
+ tests/test-vk-sync-tracker.cpp            | 289 ++++++++++++++++++++++
+ 4 files changed, 521 insertions(+), 38 deletions(-)
+ create mode 100644 ggml/src/ggml-vulkan/ggml-vulkan-sync.hpp
+ create mode 100644 tests/test-vk-sync-tracker.cpp
+
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan-sync.hpp b/ggml/src/ggml-vulkan/ggml-vulkan-sync.hpp
+new file mode 100644
+index 000000000..d7984428b
+--- /dev/null
++++ b/ggml/src/ggml-vulkan/ggml-vulkan-sync.hpp
+@@ -0,0 +1,190 @@
++#pragma once
++
++// W6-4 / A6-S2: per-buffer tracker of unsynchronized device-buffer accesses.
++//
++// The Vulkan backend does not emit a barrier per dispatch. Instead it tracks,
++// per device buffer, which byte regions have been accessed since the last
++// barrier that covered them, split into reads and writes. Before a node group
++// is recorded, its destination and sources are checked against this state
++// (hazard test below); on a hazard a barrier is emitted and the covered
++// regions are dropped from the tracker.
++//
++// This header is deliberately free of Vulkan types so the hazard logic can be
++// unit-tested without a device (tests/test-vk-sync-tracker.cpp): a buffer is
++// identified by an opaque pointer, a region is a byte range within it. The
++// production adapter in ggml-vulkan.cpp derives (buffer, base, size) from
++// ggml_tensor exactly like the previous flat unsynced_nodes_written/read
++// lists did:
++//   base = vk_tensor_offset(t) + t->view_offs
++//   size = ggml_nbytes(t)
++//   buffer identity = the ggml_backend_vk_buffer_context::dev_buffer.
++//
++// Hazard rules (identical to the previous implementation):
++//  - a WRITE conflicts with a prior unsynced READ (WAR) or WRITE (WAW)
++//    overlapping it in the same buffer;
++//  - a READ conflicts only with a prior unsynced WRITE (RAW);
++//  - READ vs READ never conflicts;
++//  - two accesses conflict only within the same device buffer;
++//  - ranges overlap per the strict-inequality test of the original
++//    overlaps_unsynced() (touching-but-disjoint ranges do NOT conflict).
++
++#include <cstdint>
++#include <unordered_map>
++#include <vector>
++
++namespace ggml_vk {
++
++// A byte range [base, base + size) inside one device buffer.
++struct sync_region {
++    uint64_t base;
++    uint64_t size;
++
++    uint64_t end() const { return base + size; }
++};
++
++// A resolved hazard: the barrier must order the tracked access and the new
++// access against each other, so the covered range is the enclosing range of
++// the two overlapping accesses.
++struct sync_conflict {
++    const void * buf;  // opaque identity of the device buffer
++    uint64_t base;     // enclosing range of the tracked region and the query
++    uint64_t size;
++};
++
++// Exact overlap semantics of the previous per-tensor check:
++//   (o_base <= n_base && n_base < o_base + o_size) ||
++//   (n_base <= o_base && o_base < n_base + n_size)
++// Note the asymmetry this implies for zero-size regions (empty tensors):
++// a zero-size QUERY only conflicts when its base falls strictly inside a
++// tracked range (first clause), while a zero-size TRACKED region conflicts
++// whenever a later access strictly contains its base (second clause). Both
++// behaviors are preserved.
++inline bool sync_ranges_overlap(uint64_t a_base, uint64_t a_size, uint64_t b_base, uint64_t b_size) {
++    return (b_base <= a_base && a_base < b_base + b_size) ||
++           (a_base <= b_base && b_base < a_base + a_size);
++}
++
++class unsynced_tracker {
++  public:
++    // Does an access of `size` bytes at `base` in buffer `buf` conflict with
++    // unsynchronized accesses? When `out` is non-null, append one
++    // sync_conflict per conflicting tracked region (the enclosing range of
++    // the tracked region and the queried range). Returns whether any
++    // conflict was found.
++    bool find_conflicts(const void * buf, uint64_t base, uint64_t size, bool is_write,
++                        std::vector<sync_conflict> * out) const {
++        auto it = per_buffer.find(buf);
++        if (it == per_buffer.end()) {
++            return false;
++        }
++        bool found = false;
++        // A write conflicts with prior reads and writes; a read only with
++        // prior writes.
++        if (check_list(it->second.written, base, size, buf, out)) {
++            found = true;
++        }
++        if (is_write && check_list(it->second.read, base, size, buf, out)) {
++            found = true;
++        }
++        return found;
++    }
++
++    // Register an access as unsynchronized. Zero-size regions are kept: the
++    // strict-inequality overlap test still reports a conflict when a later
++    // access strictly contains their base.
++    void record(const void * buf, uint64_t base, uint64_t size, bool is_write) {
++        auto & regions = is_write ? per_buffer[buf].written : per_buffer[buf].read;
++        regions.push_back({base, size});
++    }
++
++    // Drop all tracked state (a device-wide barrier makes every prior access
++    // synchronized).
++    void clear_all() { per_buffer.clear(); }
++
++    // Drop every tracked region fully covered by one of `covered`. Regions
++    // only partially covered are kept: keeping a region that was in fact
++    // synchronized is conservative (it can only cause a later barrier),
++    // dropping one that was not is a correctness bug.
++    void clear_covered(const std::vector<sync_conflict> & covered) {
++        for (const auto & c : covered) {
++            auto it = per_buffer.find(c.buf);
++            if (it == per_buffer.end()) {
++                continue;
++            }
++            drop_covered(it->second.written, c);
++            drop_covered(it->second.read, c);
++            if (it->second.written.empty() && it->second.read.empty()) {
++                per_buffer.erase(it);
++            }
++        }
++    }
++
++    bool empty() const {
++        for (const auto & kv : per_buffer) {
++            if (!kv.second.written.empty() || !kv.second.read.empty()) {
++                return false;
++            }
++        }
++        return true;
++    }
++
++    // Total number of tracked accesses (diagnostics / tests).
++    size_t region_count() const {
++        size_t n = 0;
++        for (const auto & kv : per_buffer) {
++            n += kv.second.written.size() + kv.second.read.size();
++        }
++        return n;
++    }
++
++    // Buffers that still have at least one tracked region (used to prune
++    // side tables that resolve buffer identities to vk_buffer handles).
++    std::vector<const void *> tracked_buffers() const {
++        std::vector<const void *> bufs;
++        for (const auto & kv : per_buffer) {
++            if (!kv.second.written.empty() || !kv.second.read.empty()) {
++                bufs.push_back(kv.first);
++            }
++        }
++        return bufs;
++    }
++
++  private:
++    struct buffer_state {
++        std::vector<sync_region> written;
++        std::vector<sync_region> read;
++    };
++
++    static bool check_list(const std::vector<sync_region> & regions, uint64_t base, uint64_t size,
++                           const void * buf, std::vector<sync_conflict> * out) {
++        bool found = false;
++        for (const auto & r : regions) {
++            if (!sync_ranges_overlap(r.base, r.size, base, size)) {
++                continue;
++            }
++            if (out != nullptr) {
++                const uint64_t lo  = r.base < base ? r.base : base;
++                const uint64_t hi  = r.end() > base + size ? r.end() : base + size;
++                out->push_back({buf, lo, hi - lo});
++            }
++            found = true;
++        }
++        return found;
++    }
++
++    static void drop_covered(std::vector<sync_region> & regions, const sync_conflict & covered) {
++        size_t keep = 0;
++        for (size_t i = 0; i < regions.size(); ++i) {
++            const bool is_covered = regions[i].base >= covered.base &&
++                                    regions[i].end() <= covered.base + covered.size;
++            if (!is_covered) {
++                regions[keep++] = regions[i];
++            }
++        }
++        regions.resize(keep);
++    }
++
++    std::unordered_map<const void *, buffer_state> per_buffer;
++};
++
++}  // namespace ggml_vk
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+index 9fb3a386f..a69d14aaa 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
++++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+@@ -94,6 +94,7 @@ typedef struct VkPhysicalDeviceCooperativeMatrixDecodeVectorFeaturesNV {
+ #include "ggml-backend-impl.h"
+ 
+ #include "ggml-vulkan-shaders.hpp"
++#include "ggml-vulkan-sync.hpp"
+ 
+ // remove this once it's more widely available in the SDK
+ #if !defined(VK_NV_cooperative_matrix_decode_vector)
+@@ -2022,9 +2023,13 @@ struct ggml_backend_vk_context {
+     // If false, then it's contiguous.
+     bool prealloc_y_last_decode_vector_staging {};
+ 
+-    // Track which nodes have been used since the last sync, and whether they were written to
+-    std::vector<const ggml_tensor *> unsynced_nodes_written;
+-    std::vector<const ggml_tensor *> unsynced_nodes_read;
++    // Track which buffer regions have been accessed (read or written) since the
++    // last barrier covering them, per device buffer. Replaces the previous flat
++    // unsynced_nodes_written/read tensor lists: the hazard test only ever
++    // compares accesses inside the same device buffer, so grouping by buffer
++    // keeps the decision identical while the scan cost no longer grows with the
++    // accesses tracked for every other buffer (W6-4 / A6-S2).
++    ggml_vk::unsynced_tracker unsynced;
+     // Track which prealloc buffers have pending reads that need to be synchronized.
+     // These are checked before writing to the buffer (and call ggml_vk_sync_buffers if set),
+     // and set to true after the buffer contents are consumed.
+@@ -14703,32 +14708,17 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
+         bool need_sync = false;
+ 
+         // Check whether "node" requires synchronization. The node requires synchronization if it
+-        // overlaps in memory with another unsynchronized node and at least one of them is a write.
+-        // Destination nodes are checked against both the written/read lists. Source nodes are only
+-        // checked against the written list. Two nodes overlap in memory if they come from the same
+-        // buffer and the tensor or view ranges overlap.
+-        auto const &overlaps_unsynced = [&](const ggml_tensor *node, const std::vector<const ggml_tensor *> &unsynced_nodes) -> bool {
+-            if (unsynced_nodes.size() == 0) {
+-                return false;
+-            }
+-            auto n_base = vk_tensor_offset(node) + node->view_offs;
+-            auto n_size = ggml_nbytes(node);
+-            ggml_backend_vk_buffer_context * a_buf_ctx = (ggml_backend_vk_buffer_context *)node->buffer->context;
+-            vk_buffer a_buf = a_buf_ctx->dev_buffer;
+-            for (auto &other : unsynced_nodes) {
+-                ggml_backend_vk_buffer_context * o_buf_ctx = (ggml_backend_vk_buffer_context *)other->buffer->context;
+-                vk_buffer o_buf = o_buf_ctx->dev_buffer;
+-                if (a_buf == o_buf) {
+-                    auto o_base = vk_tensor_offset(other) + other->view_offs;
+-                    auto o_size = ggml_nbytes(other);
+-
+-                    if ((o_base <= n_base && n_base < o_base + o_size) ||
+-                        (n_base <= o_base && o_base < n_base + n_size)) {
+-                        return true;
+-                    }
+-                }
+-            }
+-            return false;
++        // overlaps in memory with another unsynchronized access and at least one of them is a write.
++        // Destination nodes are checked against both the written/read regions. Source nodes are only
++        // checked against the written regions. Two accesses overlap in memory if they come from the
++        // same device buffer and the tensor or view ranges overlap. The per-buffer tracker keeps
++        // this decision identical to the previous flat tensor lists while only scanning the regions
++        // of the buffer the tensor actually lives in (W6-4 / A6-S2).
++        auto const &tensor_sync_region = [&](const ggml_tensor * node, const void * & buf, uint64_t & base, uint64_t & size) {
++            ggml_backend_vk_buffer_context * buf_ctx = (ggml_backend_vk_buffer_context *)node->buffer->context;
++            buf = buf_ctx->dev_buffer.get();
++            base = vk_tensor_offset(node) + node->view_offs;
++            size = ggml_nbytes(node);
+         };
+ 
+         // For all fused ops, check if the destination node or any of the source
+@@ -14737,7 +14727,9 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
+             const ggml_tensor *cur_node = cgraph->nodes[node_idx + i];
+             // If the node actually writes to memory, then check if it needs to sync
+             if (ctx->fused_ops_write_mask & (1 << i)) {
+-                if (overlaps_unsynced(cur_node, ctx->unsynced_nodes_read) || overlaps_unsynced(cur_node, ctx->unsynced_nodes_written)) {
++                const void * buf; uint64_t base, size;
++                tensor_sync_region(cur_node, buf, base, size);
++                if (ctx->unsynced.find_conflicts(buf, base, size, true, nullptr)) {
+                     need_sync = true;
+                     break;
+                 }
+@@ -14746,7 +14738,9 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
+                 if (!cur_node->src[j]) {
+                     continue;
+                 }
+-                if (overlaps_unsynced(cur_node->src[j], ctx->unsynced_nodes_written)) {
++                const void * buf; uint64_t base, size;
++                tensor_sync_region(cur_node->src[j], buf, base, size);
++                if (ctx->unsynced.find_conflicts(buf, base, size, false, nullptr)) {
+                     need_sync = true;
+                     break;
+                 }
+@@ -14757,8 +14751,9 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
+             if (vk_enable_sync_logger) {
+                 std::cerr <<  "sync" << std::endl;
+             }
+-            ctx->unsynced_nodes_written.clear();
+-            ctx->unsynced_nodes_read.clear();
++            // The barrier emitted by ggml_vk_sync_buffers is device-wide, so
++            // every tracked access becomes synchronized.
++            ctx->unsynced.clear_all();
+             ggml_vk_sync_buffers(ctx, compute_ctx);
+ 
+             if (vk_perf_logger_enabled && vk_perf_logger_concurrent) {
+@@ -14767,18 +14762,22 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
+                 ggml_vk_sync_buffers(ctx, compute_ctx);
+             }
+         }
+-        // Add all fused nodes to the unsynchronized lists.
++        // Add all fused nodes to the unsynchronized tracker.
+         for (int32_t i = 0; i < ctx->num_additional_fused_ops + 1; ++i) {
+             const ggml_tensor *cur_node = cgraph->nodes[node_idx + i];
+             // Multiple outputs could be written, e.g. in topk_moe. Add them all to the list.
+             if (ctx->fused_ops_write_mask & (1 << i)) {
+-                ctx->unsynced_nodes_written.push_back(cur_node);
++                const void * buf; uint64_t base, size;
++                tensor_sync_region(cur_node, buf, base, size);
++                ctx->unsynced.record(buf, base, size, true);
+             }
+             for (uint32_t j = 0; j < GGML_MAX_SRC; ++j) {
+                 if (!cur_node->src[j]) {
+                     continue;
+                 }
+-                ctx->unsynced_nodes_read.push_back(cur_node->src[j]);
++                const void * buf; uint64_t base, size;
++                tensor_sync_region(cur_node->src[j], buf, base, size);
++                ctx->unsynced.record(buf, base, size, false);
+             }
+         }
+     }
+@@ -15216,8 +15215,7 @@ static void ggml_vk_graph_cleanup(ggml_backend_vk_context * ctx) {
+     ctx->prealloc_y_last_tensor_used = nullptr;
+     ctx->prealloc_y_last_decode_vector_staging = false;
+ 
+-    ctx->unsynced_nodes_written.clear();
+-    ctx->unsynced_nodes_read.clear();
++    ctx->unsynced.clear_all();
+     ctx->prealloc_x_need_sync = ctx->prealloc_y_need_sync = ctx->prealloc_split_k_need_sync = false;
+ 
+     ggml_vk_command_pool_cleanup(ctx->device, ctx->compute_cmd_pool);
+diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
+index aa4c6f429..310f651ac 100644
+--- a/tests/CMakeLists.txt
++++ b/tests/CMakeLists.txt
+@@ -286,6 +286,12 @@ llama_build_and_test(test-ple-dequant-parity.cpp)
+ # not a ctest because a run only asserts finiteness, while the bit-exact gate is
+ # a diff between a baseline and a patched build's outputs.
+ llama_build(test-copy-elim.cpp)
++# W6-4 (A6-S2): host-side unit test of the per-buffer unsynced-access tracker.
++# Header-only logic, no Vulkan device needed at build or run time.
++if (GGML_VULKAN)
++    llama_build_and_test(test-vk-sync-tracker.cpp)
++    target_include_directories(test-vk-sync-tracker PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../ggml/src/ggml-vulkan)
++endif()
+ llama_build_and_test(test-backend-ops.cpp)
+ 
+ llama_build_and_test(test-model-load-cancel.cpp LABEL "model")
+diff --git a/tests/test-vk-sync-tracker.cpp b/tests/test-vk-sync-tracker.cpp
+new file mode 100644
+index 000000000..4e61a2ddd
+--- /dev/null
++++ b/tests/test-vk-sync-tracker.cpp
+@@ -0,0 +1,289 @@
++// Unit tests for the per-buffer unsynchronized-access tracker of the Vulkan
++// backend (W6-4 / A6-S2), ggml-vulkan-sync.hpp.
++//
++// Two layers:
++//  1. Pattern tests for the hazard rules (RAW/WAR/WAW per buffer, cross-buffer
++//     independence, disjoint/adjacent ranges, zero-size edges).
++//  2. A randomized equivalence run against a reference implementation of the
++//     PREVIOUS global flat-list semantics (unsynced_nodes_written/read scanned
++//     linearly for dst and srcs of every node group). The per-buffer tracker
++//     must take the identical sync decision on every node group: this is the
++//     no-semantic-drift gate for the restructure.
++//
++// The tracker is header-only and free of Vulkan types, so this test needs no
++// device: buffer identity is an opaque pointer. It does NOT exercise the
++// Vulkan barrier emission itself (that is device-side; the numeric bit-exact
++// proof runs on the GPU cells).
++
++#include "ggml-vulkan-sync.hpp"
++
++#include <cstdio>
++#include <cstdint>
++#include <vector>
++
++static int g_failures = 0;
++static int g_checks = 0;
++
++#define CHECK(cond, msg) do { \
++    g_checks++; \
++    if (!(cond)) { printf("FAIL: %s\n", msg); g_failures++; } \
++} while (0)
++
++// Distinct fake device buffers.
++static const void * BUF_A = (const void *) 0x1000;
++static const void * BUF_B = (const void *) 0x2000;
++static const void * BUF_C = (const void *) 0x3000;
++
++// ---------------------------------------------------------------------------
++// Reference implementation: the previous flat-list semantics.
++// ---------------------------------------------------------------------------
++
++struct ref_access {
++    const void * buf;
++    uint64_t base;
++    uint64_t size;
++    bool write;
++};
++
++struct ref_tracker {
++    // The previous code kept one "written" list and one "read" list; dst was
++    // checked against both, srcs only against "written".
++    std::vector<ref_access> written;
++    std::vector<ref_access> read;
++
++    bool conflicts(const void * buf, uint64_t base, uint64_t size, bool is_write) const {
++        if (overlaps_any(written, buf, base, size)) return true;
++        if (is_write && overlaps_any(read, buf, base, size)) return true;
++        return false;
++    }
++
++    void record(const void * buf, uint64_t base, uint64_t size, bool is_write) {
++        if (is_write) written.push_back({buf, base, size, true});
++        else          read.push_back({buf, base, size, false});
++    }
++
++    void clear_all() { written.clear(); read.clear(); }
++
++  private:
++    static bool overlaps_any(const std::vector<ref_access> & list, const void * buf,
++                             uint64_t base, uint64_t size) {
++        for (const auto & e : list) {
++            if (e.buf != buf) continue;
++            if ((e.base <= base && base < e.base + e.size) ||
++                (base <= e.base && e.base < base + size)) {
++                return true;
++            }
++        }
++        return false;
++    }
++};
++
++// ---------------------------------------------------------------------------
++// Pattern tests.
++// ---------------------------------------------------------------------------
++
++static void test_hazard_patterns() {
++    {
++        // RAW: write then read the same region in the same buffer.
++        ggml_vk::unsynced_tracker t;
++        t.record(BUF_A, 100, 50, true);
++        std::vector<ggml_vk::sync_conflict> conflicts;
++        CHECK(t.find_conflicts(BUF_A, 120, 10, false, &conflicts), "RAW same buffer fires");
++        CHECK(conflicts.size() == 1, "RAW produces one conflict");
++        CHECK(conflicts[0].buf == BUF_A && conflicts[0].base == 100 && conflicts[0].size == 50,
++              "RAW conflict covers the enclosing range of the pair");
++    }
++    {
++        // Cross-buffer: identical offsets, different buffers -> no sync.
++        ggml_vk::unsynced_tracker t;
++        t.record(BUF_A, 100, 50, true);
++        CHECK(!t.find_conflicts(BUF_B, 100, 50, false, nullptr), "cross-buffer RAW does not fire");
++        CHECK(!t.find_conflicts(BUF_B, 100, 50, true, nullptr), "cross-buffer WAW does not fire");
++    }
++    {
++        // WAR: read then write the same region.
++        ggml_vk::unsynced_tracker t;
++        t.record(BUF_A, 0, 64, false);
++        CHECK(t.find_conflicts(BUF_A, 0, 64, true, nullptr), "WAR same buffer fires");
++    }
++    {
++        // WAW: write then write the same region.
++        ggml_vk::unsynced_tracker t;
++        t.record(BUF_A, 0, 64, true);
++        CHECK(t.find_conflicts(BUF_A, 32, 64, true, nullptr), "WAW overlapping fires");
++    }
++    {
++        // Read after read never conflicts.
++        ggml_vk::unsynced_tracker t;
++        t.record(BUF_A, 0, 64, false);
++        CHECK(!t.find_conflicts(BUF_A, 0, 64, false, nullptr), "RAR does not fire");
++    }
++    {
++        // Disjoint and exactly-adjacent ranges in the same buffer do not
++        // conflict (strict-inequality semantics of the original check).
++        ggml_vk::unsynced_tracker t;
++        t.record(BUF_A, 0, 64, true);
++        CHECK(!t.find_conflicts(BUF_A, 64, 64, false, nullptr), "adjacent ranges do not conflict");
++        CHECK(!t.find_conflicts(BUF_A, 1000, 64, false, nullptr), "disjoint ranges do not conflict");
++    }
++    {
++        // Zero-size query with base strictly inside a tracked region still
++        // conflicts (first clause of the original predicate); a zero-size
++        // tracked region conflicts when a later access strictly contains
++        // its base (second clause).
++        ggml_vk::unsynced_tracker t;
++        t.record(BUF_A, 0, 64, true);
++        CHECK(t.find_conflicts(BUF_A, 10, 0, false, nullptr), "zero-size query inside region fires");
++        CHECK(!t.find_conflicts(BUF_A, 64, 0, false, nullptr), "zero-size query at region end does not fire");
++        t.clear_all();
++        t.record(BUF_A, 100, 0, true);
++        CHECK(!t.empty(), "zero-size regions are tracked");
++        CHECK(t.find_conflicts(BUF_A, 50, 100, false, nullptr), "zero-size tracked region conflicts when contained");
++        CHECK(!t.find_conflicts(BUF_A, 100, 0, false, nullptr), "zero-size vs zero-size at same base does not fire");
++    }
++    {
++        // Only the queried buffer's regions are scanned.
++        ggml_vk::unsynced_tracker t;
++        t.record(BUF_A, 0, 64, true);
++        t.record(BUF_B, 0, 64, false);
++        std::vector<ggml_vk::sync_conflict> conflicts;
++        CHECK(t.find_conflicts(BUF_A, 0, 64, true, &conflicts), "query hits its own buffer only");
++        CHECK(conflicts.size() == 1 && conflicts[0].buf == BUF_A,
++              "conflicts never reference other buffers");
++    }
++    {
++        // clear_all drops everything (device-wide barrier).
++        ggml_vk::unsynced_tracker t;
++        t.record(BUF_A, 0, 64, true);
++        t.record(BUF_B, 0, 64, false);
++        t.clear_all();
++        CHECK(t.empty(), "clear_all empties the tracker");
++        CHECK(!t.find_conflicts(BUF_A, 0, 64, true, nullptr), "no conflict after clear_all");
++    }
++}
++
++// ---------------------------------------------------------------------------
++// Randomized equivalence against the reference (previous) semantics.
++// ---------------------------------------------------------------------------
++
++struct rng {
++    uint64_t s;
++    explicit rng(uint64_t seed) : s(seed) {}
++    uint64_t next() {
++        // xorshift64*
++        s ^= s >> 12; s ^= s << 25; s ^= s >> 27;
++        return s * 2685821657736338717ULL;
++    }
++    uint64_t below(uint64_t n) { return n ? next() % n : 0; }
++};
++
++// Simulates ggml_vk_build_graph's tracker block for one "node group":
++// returns whether a sync fires, applies it (clear-all on sync, like the
++// device-wide barrier) and records the group accesses. Runs both the new
++// tracker and the reference in lockstep and compares the decisions.
++static bool run_group(ggml_vk::unsynced_tracker & t, ref_tracker & r,
++                      const void * const * bufs, size_t n_bufs,
++                      bool dst_write, size_t dst_buf_idx, uint64_t dst_base, uint64_t dst_size,
++                      const uint64_t (&src)[4][3], bool src_used[4]) {
++    // Mirror the production loop: dst (if it writes memory) against both
++    // hazard classes, then each src against prior writes.
++    bool need_new = false;
++    if (dst_write && t.find_conflicts(bufs[dst_buf_idx], dst_base, dst_size, true, nullptr)) {
++        need_new = true;
++    }
++    if (!need_new) {
++        for (int j = 0; j < 4; ++j) {
++            if (!src_used[j]) continue;
++            if (t.find_conflicts(bufs[src[j][0] % n_bufs], src[j][1], src[j][2], false, nullptr)) {
++                need_new = true;
++                break;
++            }
++        }
++    }
++
++    bool need_ref = false;
++    if (dst_write && r.conflicts(bufs[dst_buf_idx], dst_base, dst_size, true)) {
++        need_ref = true;
++    }
++    if (!need_ref) {
++        for (int j = 0; j < 4; ++j) {
++            if (!src_used[j]) continue;
++            if (r.conflicts(bufs[src[j][0] % n_bufs], src[j][1], src[j][2], false)) {
++                need_ref = true;
++                break;
++            }
++        }
++    }
++
++    CHECK(need_new == need_ref, "sync decision identical to reference semantics");
++
++    if (need_new) {
++        t.clear_all();
++        r.clear_all();
++    }
++    if (dst_write) {
++        t.record(bufs[dst_buf_idx], dst_base, dst_size, true);
++        r.record(bufs[dst_buf_idx], dst_base, dst_size, true);
++    }
++    for (int j = 0; j < 4; ++j) {
++        if (!src_used[j]) continue;
++        t.record(bufs[src[j][0] % n_bufs], src[j][1], src[j][2], false);
++        r.record(bufs[src[j][0] % n_bufs], src[j][1], src[j][2], false);
++    }
++    return need_new;
++}
++
++static void test_randomized_equivalence() {
++    const void * bufs[4] = { BUF_A, BUF_B, BUF_C, BUF_A };  // A appears twice on purpose
++
++    for (uint64_t seed = 1; seed <= 20; ++seed) {
++        rng g(seed * 0x9E3779B97F4A7C15ULL);
++        ggml_vk::unsynced_tracker t;
++        ref_tracker r;
++
++        const int n_groups = 2000;
++        int syncs = 0;
++        for (int grp = 0; grp < n_groups; ++grp) {
++            // Access layout that mimics a decode graph: mostly small regions
++            // in a narrow offset window so overlaps are frequent, with some
++            // far-apart regions and occasional zero-size tensors.
++            const uint64_t window = (g.below(4) == 0) ? 65536 : 512;
++            const size_t dst_buf_idx = g.below(4);
++            const uint64_t dst_base = g.below(window);
++            const uint64_t dst_size = g.below(4) == 0 ? 0 : (1 + g.below(256));
++            const bool dst_write = g.below(8) != 0;  // most groups write memory
++
++            uint64_t src[4][3];
++            bool src_used[4];
++            const int n_src = 1 + (int) g.below(4);
++            for (int j = 0; j < 4; ++j) {
++                src_used[j] = j < n_src;
++                src[j][0] = g.below(1024);
++                src[j][1] = g.below(window);
++                src[j][2] = g.below(8) == 0 ? 0 : (1 + g.below(256));
++            }
++
++            if (run_group(t, r, bufs, 4, dst_write, dst_buf_idx, dst_base, dst_size, src, src_used)) {
++                syncs++;
++            }
++        }
++        CHECK(syncs > n_groups / 10, "randomized sequence actually exercises syncs");
++        (void) syncs;
++    }
++}
++
++// ---------------------------------------------------------------------------
++// main
++// ---------------------------------------------------------------------------
++
++int main() {
++    test_hazard_patterns();
++    test_randomized_equivalence();
++
++    if (g_failures == 0) {
++        printf("test-vk-sync-tracker: OK (%d checks)\n", g_checks);
++        return 0;
++    }
++    printf("test-vk-sync-tracker: %d FAILURES out of %d checks\n", g_failures, g_checks);
++    return 1;
++}
+-- 
+2.53.0
+

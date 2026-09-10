@@ -814,14 +814,18 @@ void llama_memory_recurrent::state_read(llama_io_read_i & io, llama_seq_id seq_i
 }
 
 void llama_memory_recurrent::state_write_meta(llama_io_write_i & io, const std::vector<std::pair<uint32_t, uint32_t>> & cell_ranges, llama_seq_id seq_id) const {
+    // W6-5 (A3-4): {pos, n_seq_id} are contiguous in the stream - one
+    // io.write per cell instead of two; byte sequence unchanged
     for (const auto & range : cell_ranges) {
         for (uint32_t i = range.first; i < range.second; ++i) {
             const auto & cell = cells[i];
             const llama_pos pos      = cell.pos;
             const uint32_t  n_seq_id = seq_id == -1 ? cell.seq_id.size() : 0;
 
-            io.write(&pos,      sizeof(pos));
-            io.write(&n_seq_id, sizeof(n_seq_id));
+            uint8_t head[sizeof(llama_pos) + sizeof(uint32_t)];
+            memcpy(head + 0, &pos, sizeof(pos));
+            memcpy(head + sizeof(pos), &n_seq_id, sizeof(n_seq_id));
+            io.write(head, sizeof(head));
 
             if (n_seq_id) {
                 for (auto seq_id : cell.seq_id) {
@@ -973,12 +977,18 @@ bool llama_memory_recurrent::state_read_meta(llama_io_read_i & io, uint32_t cell
 
         llama_ubatch ubatch = balloc.ubatch_reserve(cell_count, 1);
 
+        // W6-5 (A3-4): the single-seq record is fixed-size {pos, n_seq_id}
+        // with n_seq_id == 0 (validated below) - read the whole meta block in
+        // one io.read and parse from memory instead of two reads per cell
+        std::vector<uint8_t> meta((size_t) cell_count * (sizeof(llama_pos) + sizeof(uint32_t)));
+        io.read(meta.data(), meta.size());
+
         for (uint32_t i = 0; i < cell_count; ++i) {
             llama_pos pos;
             uint32_t n_seq_id;
 
-            io.read(&pos,      sizeof(pos));
-            io.read(&n_seq_id, sizeof(n_seq_id));
+            memcpy(&pos,      meta.data() + (size_t) i * 8, sizeof(pos));
+            memcpy(&n_seq_id, meta.data() + (size_t) i * 8 + sizeof(pos), sizeof(n_seq_id));
 
             if (n_seq_id != 0) {
                 LLAMA_LOG_ERROR("%s: invalid seq_id-agnostic kv cell\n", __func__);
@@ -1012,14 +1022,18 @@ bool llama_memory_recurrent::state_read_meta(llama_io_read_i & io, uint32_t cell
 
         clear(true);
 
+        // W6-5 (A3-4): fixed-size head {pos, n_seq_id} in one io.read per cell
         for (uint32_t i = 0; i < cell_count; ++i) {
             auto & cell = cells[i];
+
+            uint8_t head[sizeof(llama_pos) + sizeof(uint32_t)];
+            io.read(head, sizeof(head));
 
             llama_pos pos;
             uint32_t  n_seq_id;
 
-            io.read(&pos,      sizeof(pos));
-            io.read(&n_seq_id, sizeof(n_seq_id));
+            memcpy(&pos,      head, sizeof(pos));
+            memcpy(&n_seq_id, head + sizeof(pos), sizeof(n_seq_id));
 
             cell.pos = pos;
 

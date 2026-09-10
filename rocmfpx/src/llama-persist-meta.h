@@ -46,6 +46,32 @@ uint32_t llama_persist_crc32(const uint8_t * data, size_t size);
 // false; crc_out untouched in those cases)
 bool llama_persist_crc32_file(const char * path, uint64_t expected_size, uint32_t * crc_out);
 
+// W6-5/W6-7 (A3): incremental CRC-32 over a byte stream - the same value
+// llama_persist_crc32 returns for the concatenated bytes. For callers that
+// already hold the bytes as they move (a state file being written, a payload
+// being streamed in from disk): the fold composes across update() calls, so
+// the chunk boundaries are irrelevant to the result. finalize() may be called
+// once; the destructor releases the (tiny) fold state either way.
+class llama_persist_crc32_folder {
+public:
+    llama_persist_crc32_folder();
+    ~llama_persist_crc32_folder();
+
+    llama_persist_crc32_folder(const llama_persist_crc32_folder &) = delete;
+    llama_persist_crc32_folder & operator=(const llama_persist_crc32_folder &) = delete;
+
+    llama_persist_crc32_folder(llama_persist_crc32_folder && other) noexcept;
+    llama_persist_crc32_folder & operator=(llama_persist_crc32_folder && other) noexcept;
+
+    void update(const void * data, size_t size);
+
+    uint32_t finalize(); // returns the CRC of everything updated so far
+
+private:
+    struct impl;
+    impl * p = nullptr;
+};
+
 // eviction score: hits decayed with a 6h half-life on time since last_used
 double llama_persist_eviction_score(uint32_t hits, uint64_t last_used, uint64_t now_s);
 

@@ -1,0 +1,45 @@
+From 3efd5cd944ddd9774f0f2f391cead2688c4fd172 Mon Sep 17 00:00:00 2001
+From: pugant <pugant@localhost>
+Date: Thu, 10 Sep 2026 15:36:17 +0200
+Subject: [PATCH 06/19] test-state-io-buffer: guard the error-path section
+ against an empty state file
+
+When the artifact directory is unwritable the save fails and state_file
+stays empty; the malformed-buffer checks then indexed element 0 of an empty
+vector (SIGSEGV, reproduced with a nonexistent argv[1] dir). The engine
+itself handled the whole chain defensively - every failed open returns 0
+with an error log. Skip the mutation-based error checks when no state was
+saved (the earlier checks have already reported the write failure).
+
+Co-Authored-By: GLM by z.ai
+---
+ tests/test-state-io-buffer.cpp | 8 +++++---
+ 1 file changed, 5 insertions(+), 3 deletions(-)
+
+diff --git a/tests/test-state-io-buffer.cpp b/tests/test-state-io-buffer.cpp
+index d5c8b438d..61257c964 100644
+--- a/tests/test-state-io-buffer.cpp
++++ b/tests/test-state-io-buffer.cpp
+@@ -358,14 +358,16 @@ static void run_arch(llm_arch arch, const char * arch_name, const std::string &
+               "buffer restore == file restore, payload bit-identical (gate N)");
+ 
+         // error paths: every malformed buffer must fail clean (return 0), the
+-        // public wrapper converts IO over-read exceptions like the file one
+-        {
++        // public wrapper converts IO over-read exceptions like the file one.
++        // (skip when the artifact dir was unwritable and no state was saved -
++        // the checks above have already reported that)
++        if (!state_file.empty()) {
+             std::vector<uint8_t> bad_magic = state_file;
+             bad_magic[0] ^= 0xFF;
+             CHECK(llama_state_seq_load_buffer(ctx2.get(), bad_magic.data(), bad_magic.size(), 0,
+                     restored.data(), restored.size(), &n_restored) == 0, "load_buffer rejects bad magic");
+         }
+-        {
++        if (!state_file.empty()) {
+             std::vector<uint8_t> trunc = state_file;
+             trunc.pop_back(); // state data one byte short
+             CHECK(llama_state_seq_load_buffer(ctx2.get(), trunc.data(), trunc.size(), 0,
+-- 
+2.53.0
+

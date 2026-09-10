@@ -294,9 +294,12 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
     gated = ggml_reshape_3d(ctx0, gated, n_embd, hc, nt);
 
     // collapse the streams by their mean
+    // [w6-2] the streams are consumed straight as strided views: ADD reads through nb
+    // (its src1 was already a strided view here), so the leading cont of stream 0 only
+    // materialized data the first ADD would re-read anyway. With hc == 1 the loop body
+    // never runs and `mixed` stays a view of `gated` until the scale allocates.
     ggml_tensor * mixed = ggml_view_2d(ctx0, gated, n_embd, nt,
             ggml_row_size(gated->type, n_embd) * hc, 0);
-    mixed = ggml_cont(ctx0, mixed);
     for (int64_t c = 1; c < hc; ++c) {
         ggml_tensor * s = ggml_view_2d(ctx0, gated, n_embd, nt,
                 ggml_row_size(gated->type, n_embd) * hc,
@@ -873,11 +876,13 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
     members = ggml_reshape_4d(ctx0, members, idx_dim, r, n_blocks, n_stream);
 
     // mean over the block members; r is small, so summing slices beats a transpose plus sum_rows
+    // [w6-2] the slices feed ADD, which reads through nb, so the per-slice cont only added
+    // a dispatch; the last ADD (or the scale when r == 1) still produces the contiguous
+    // tensor the reshape below needs
     ggml_tensor * pooled = nullptr;
     for (int64_t i = 0; i < r; ++i) {
-        ggml_tensor * slice = ggml_cont(ctx0,
-                ggml_view_3d(ctx0, members, idx_dim, n_blocks, n_stream,
-                        members->nb[2], members->nb[3], i*members->nb[1]));
+        ggml_tensor * slice = ggml_view_3d(ctx0, members, idx_dim, n_blocks, n_stream,
+                members->nb[2], members->nb[3], i*members->nb[1]);
         pooled = pooled ? ggml_add(ctx0, pooled, slice) : slice;
     }
     pooled = ggml_scale(ctx0, pooled, 1.0f/(float) r);
@@ -902,8 +907,10 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
 
     // rectify each head dot product before the sum, as in the DeepSeek lightning indexer
     // mul_mat matches ne[2], so the queries of stream s only meet the blocks of stream s
+    // [w6-2] q comes fresh out of rope_multi and is already contiguous, so the cont was a
+    // byte-identical copy ahead of a reshape that keeps it contiguous
     ggml_tensor * score = ggml_mul_mat(ctx0, pooled,
-            ggml_reshape_3d(ctx0, ggml_cont(ctx0, q), idx_dim, n_idx_h*n_tps, n_stream));
+            ggml_reshape_3d(ctx0, q, idx_dim, n_idx_h*n_tps, n_stream));
     score = ggml_reshape_4d(ctx0, score, n_blocks, n_idx_h, n_tps, n_stream);
     score = ggml_relu(ctx0, score);
     score = ggml_cont(ctx0, ggml_permute(ctx0, score, 1, 0, 2, 3));
@@ -933,7 +940,9 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
     // the reference returns indexer_top_k + compress_ratio - 1: whole blocks plus the tail
     const int64_t width = std::min<int64_t>(n_kv, (int64_t) hparams.indexer_top_k + r - 1);
 
-    ggml_tensor * top_k = ggml_cont(ctx0, ggml_top_k(ctx0, expanded, width));
+    // [w6-2] top_k allocates its result, so the cont was a byte-identical copy before the
+    // contiguous reshape below
+    ggml_tensor * top_k = ggml_top_k(ctx0, expanded, width);
 
     // build_attn_qsa reads [n_top_k, n_batch, 1, n_stream], matching the KQ mask.
     top_k = ggml_reshape_4d(ctx0, top_k, width, n_tps, 1, n_stream);
@@ -1552,7 +1561,12 @@ ggml_tensor * llama_model_qwen4exp::graph::build_conv_state_at(
                 conv_states_all->nb[1],
                 (s_slot * mem_size + kv_head) * row_size);
 
-        ggml_build_forward_expand(gf, ggml_cpy(ctx0, ggml_cont(ctx0, tail), dst));
+        // [w6-2] the tail view is strided (rows of the wider conv_input), but CPY reads
+        // through nb on every backend (delta-net-base.cpp build_conv_state has cpy'd the
+        // raw view since the start), so materializing a contiguous copy of it first just
+        // added one CONT dispatch per ring slot: K-1 of them carry byte-identical data in
+        // decode (n_tokens == 1 leaves a single distinct s_idx). Copy the view directly.
+        ggml_build_forward_expand(gf, ggml_cpy(ctx0, tail, dst));
     }
 
     return conv_input;
@@ -1661,6 +1675,8 @@ ggml_tensor * llama_model_qwen4exp::graph::build_ple(
                                 ggml_row_size(padded->type, start))));
 
         // column k of the [kern, hc_dim] kernel is one weight per channel
+        // [w6-2] tried a contiguous view_1d of row k here: wrong data, the tap needs
+        // COLUMN k (a stride-kern gather), so the cont that materializes it stays
         ggml_tensor * wk = ggml_cont(ctx0,
                 ggml_view_2d(ctx0, model.layers[il].ple_conv1d, 1, hc_dim,
                         model.layers[il].ple_conv1d->nb[1],
@@ -1676,7 +1692,9 @@ ggml_tensor * llama_model_qwen4exp::graph::build_ple(
     }
 
     conv_out = ggml_silu(ctx0, conv_out);
-    conv_out = ggml_reshape_3d(ctx0, ggml_cont(ctx0, conv_out), n_embd, hc, n_tokens);
+    // [w6-2] silu allocates a fresh contiguous tensor, so the cont before the reshape was
+    // a byte-identical copy
+    conv_out = ggml_reshape_3d(ctx0, conv_out, n_embd, hc, n_tokens);
     cb(conv_out, "ple_conv_out", il);
 
     return ggml_add(ctx0, hidden, ggml_add(ctx0, gated, conv_out));
