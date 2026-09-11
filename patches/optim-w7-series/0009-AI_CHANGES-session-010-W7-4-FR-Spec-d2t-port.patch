@@ -1,0 +1,40 @@
+From d98d2d60b2aba27327b44b6a0007700a6dd84a28 Mon Sep 17 00:00:00 2001
+From: pugant <pugant@localhost>
+Date: Thu, 10 Sep 2026 21:57:15 +0200
+Subject: [PATCH 09/15] AI_CHANGES: session 010 (W7-4 FR-Spec d2t port)
+
+Co-Authored-By: GLM by z.ai <glm@z.ai>
+---
+ AI_CHANGES.md | 16 ++++++++++++++++
+ 1 file changed, 16 insertions(+)
+
+diff --git a/AI_CHANGES.md b/AI_CHANGES.md
+index f5ad1e4d4..7b2f566ed 100644
+--- a/AI_CHANGES.md
++++ b/AI_CHANGES.md
+@@ -509,6 +509,22 @@ A fresh build never sees this because freshly built tensors have `buffer == data
+ | Re-bind restore | `graph_result_restore_built()` puts the cached graph back to the exact as-built state (nodes order, src links, `buffer`/`data` scrubbed to NULL for every tensor in the result's ggml context — weights/KV/cross tensors are not in that context and keep their persistent buffers), then `sched_reset` + `alloc_graph` as before. The re-bind now goes through exactly the same split+alloc a fresh build would. |
+ 
+ **Repro + gate**: the crash is reproducible in the builder container with zero GPU via lavapipe (`VK_ICD_FILENAMES=lvp_icd...`, `GGML_VK_VISIBLE_DEVICES=0`) + CPU — pre-fix: abort at the FIRST rebind (`repro-prefix-k3.*`: rms_norm shape assert — the dangling-src manifestation; the RADV cell aborted earlier on the stale-buffer probe — same root). Post-fix gate (`logs/wave6/w6c9/gate-output.txt`): all arms bit-exact incl. the multi-backend arm (hashes k=0 ≡ k=3 on [VK-lvp, CPU], 25→14 rebuilds, 11 rebinds, 8 evictions); default without env = legacy (1 slot, 0 rebinds) on the same topology.
++## Session 011 — 2026-09-10 (W7-4 FR-Spec; rinumerato da 010 nel rebase su optim-w7 con W7-5) — 2026-09-10
++
++**Scope:** W7-4 FR-Spec — port of the 5-commit d2t series from the drluoto reference clone (`staging-w7-frspec-ref` @ `fb367b8cf2cf`) onto `w7p4` (= optim-w6 `f37da5c0c`): draft-vocab trim for the qwen4exp MTP sidecar. Tooling (map builder, trim wrapper, gate scripts) lives OUTSIDE the repo in the workspace (`scripts/w7p4-*`, `staging-w7/w7p4-*`), per wave convention.
++
++### `src/models/qwen4exp.cpp`
++
++| Fix | Line(s) | Detail |
++|-----|---------|--------|
++| d2t/t2d loader | load_arch_tensors | `d2t` meta-gated branch: forward map (len = n_draft rows) sizes `output.weight` to `n_vocab_out`; inverse map (len = n_vocab, I32) reads n_draft from `output.weight` ne[1]; assert when output falls back to a duplicated token_embd |
++| MTP inputs as graph outputs | graph_mtp ctor | `ggml_set_output(inp->tokens/.h)` after `mtp_h_input` naming (CIRU H121: continuation step rewrites them; allocator could recycle storage between steps) |
++| FR-Spec spread | graph_mtp head | after `build_lora_mm(head_w, ...)`: t2d inverse-gather (get_rows over [n_out, n_draft+1] with -inf sentinel row) or d2t forward scatter (`ggml_set_rows` into a -inf-filled full-vocab tensor), then `result_output` cb; TRUNK graph left untouched (the draft never runs it) |
++
++**Port notes (per commit, full detail in `docs/research/wave7/w7p4-report.md`):** `7a3aa1dd5` (f01e30e42) and `6b7713dd6` (dfcaeb160) auto-merged clean (anchor rename `tf`→`trunk_flags`/`mtp_flags` absorbed); `cd9c998b0` (e0b617b71) auto-merged clean; `ff146108d` (53aef6bac) and `ebb3def77` (d786226ef) conflicted on the ref's divergent graph_mtp (dsv4 lineage) — resolved by keeping OUR graph_mtp and applying only the semantic change by hand; the trunk-graph deletion side of `ebb3def77` auto-merged. Series net on our tree +55/−1, identical to the reference series. Interaction with W6-2 copy-elim: none — W6-2 touches build_hc_mix/QSA/conv/PLE helpers, disjoint regions. No files outside `qwen4exp.cpp` were needed (`LLM_TENSOR_D2T` + `llama_model::d2t` already exist upstream for EAGLE3/dflash).
++
++**Verification:** build in container `docker-llm-service:w2-vk-builder` rc=0 (`logs/wave7/w7p4-build.{log,err,rc}`); artifact gates 5/5 PASS (`logs/wave7/w7p4-sidecar-gates.txt`); gate N: see `docs/research/wave7/w7p4-report.md`.
++
+ 
+ <!-- TEMPLATE FOR FUTURE AI SESSIONS:
+ 
+-- 
+2.53.0
+

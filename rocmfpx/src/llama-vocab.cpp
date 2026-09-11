@@ -257,6 +257,11 @@ public:
         return item;
     }
 
+    // drop all entries while keeping the storage (an empty container is a valid heap)
+    void clear() {
+        this->c.clear();
+    }
+
     void pop() =  delete;
 };
 
@@ -269,9 +274,11 @@ struct llm_bigram_bpe {
 
     using queue_storage = std::vector<llm_bigram_bpe>;
     using queue = llama_priority_queue<llm_bigram_bpe, queue_storage, comparator>;
+    // W7-5 / S3: the merged text is not carried in the queue item (stale entries
+    // are detected from the symbol sizes, like llm_bigram_spm): the per-merge
+    // string concatenations were the dominant cost of the merge loop
     llm_symbol::index left;
     llm_symbol::index right;
-    std::string text;
     int rank;
     size_t size;
 };
@@ -598,7 +605,7 @@ struct llm_tokenizer_bpe_session {
         auto tok_pre = vocab.get_pre_type();
 
         for (const auto & word : word_collection) {
-            work_queue = llm_bigram_bpe::queue();
+            work_queue.clear();
             symbols.clear();
 
             int index = 0;
@@ -639,12 +646,11 @@ struct llm_tokenizer_bpe_session {
                 auto & left_symbol = symbols[bigram.left];
                 auto & right_symbol = symbols[bigram.right];
 
-                if (left_symbol.n == 0 || right_symbol.n == 0) {
-                    continue;
-                }
-                std::string left_token = std::string(left_symbol.text, left_symbol.n);
-                std::string right_token = std::string(right_symbol.text, right_symbol.n);
-                if (left_token + right_token != bigram.text) {
+                // if one of the symbols already got merged, or grew by absorbing
+                // another merge, the bigram is outdated (the symbol text pointer
+                // never moves and `n` never shrinks, so the size check is exact)
+                if (left_symbol.n == 0 || right_symbol.n == 0 ||
+                    left_symbol.n + right_symbol.n != bigram.size) {
                     continue;  // Skip this bigram if it's outdated
                 }
 
@@ -679,13 +685,14 @@ struct llm_tokenizer_bpe_session {
         symbols = symbols_final;
 
         if (!symbols.empty()) {
+            std::string str;
             for (int i = 0; i != -1; i = symbols[i].next) {
                 auto & symbol = symbols[i];
                 if (symbol.n == 0) {
                     continue;
                 }
 
-                const std::string str = std::string(symbol.text, symbol.n);
+                str.assign(symbol.text, symbol.n);
                 const auto token = vocab.text_to_token(str);
 
                 if (token == LLAMA_TOKEN_NULL) {
@@ -717,8 +724,10 @@ private:
         if (left == -1 || right == -1) {
             return;
         }
-        std::string left_token  = std::string(symbols[left].text,  symbols[left].n);
-        std::string right_token = std::string(symbols[right].text, symbols[right].n);
+        // reuse the scratch buffers across calls: BPE pieces are short, so this
+        // stays inside the SSO buffer and the rank lookup allocates nothing
+        left_token.assign(symbols[left].text,  symbols[left].n);
+        right_token.assign(symbols[right].text, symbols[right].n);
 
         int rank_found = -1;
 
@@ -732,7 +741,6 @@ private:
 
         bigram.left  = left;
         bigram.right = right;
-        bigram.text  = left_token + right_token;
         bigram.size  = left_token.size() + right_token.size();
         bigram.rank  = rank_found;
 
@@ -745,6 +753,8 @@ private:
     std::vector<llm_symbol> symbols;
     std::vector<llm_symbol> symbols_final;
     llm_bigram_bpe::queue work_queue;
+    std::string left_token;
+    std::string right_token;
 };
 
 //

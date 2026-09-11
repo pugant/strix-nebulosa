@@ -1,0 +1,615 @@
+// test-copy-elim — wave-6 W6-2 (A1-C1) harness: synthetic mini qwen4exp model +
+// per-node graph dump + bit-exact hashes of the decode round.
+//
+// Modes:
+//   --make-model <path>   write the mini trunk+MTP qwen4exp GGUF (all decode paths:
+//                         GDN recurrent layers, full-attention QSA layer, PLE layer,
+//                         hyper-connection mixers, MoE with separate gate/up experts)
+//   --make-draft <path>   write the mini draft-only (MTP block) GGUF
+//   --run [--model P] [--draft P] [--dump FILE] [--steps N]
+//                         load the model(s) on CPU, run a fixed decode schedule
+//                         (1 prefill of 8, N single-token steps, one 3-token batch,
+//                         3 drafter steps), hash logits after every eval and the full
+//                         context state at the end. With --dump, install the eval
+//                         callback and print one line per computed graph node with a
+//                         hash of its bytes (CPU buffers are host-visible).
+//
+// The node dump is the P3 attribution instrument (op + shape + contiguity + data
+// hash per node); the logits/state hashes are the gate-N bit-exact probe used to
+// compare a baseline build against a copy-elimination build. All weights and inputs
+// come from a seeded LCG, so runs are reproducible.
+//
+// [w6-2] part of the W6-2 card tooling.
+
+#include "llama.h"
+#include "ggml.h"
+#include "ggml-backend.h"
+#include "gguf.h"
+
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <cstdint>
+#include <string>
+#include <vector>
+
+// ---------------------------------------------------------------- lcg weights
+
+static uint64_t lcg_state = 0x9e3779b97f4a7c15ull;
+
+static uint64_t lcg_next() {
+    lcg_state = lcg_state * 6364136223846793005ull + 1442695040888963407ull;
+    return lcg_state;
+}
+
+static void lcg_seed(uint64_t seed) {
+    lcg_state = seed ? seed : 1;
+    for (int i = 0; i < 8; ++i) {
+        lcg_next();
+    }
+}
+
+static float lcg_float(float scale) {
+    return ((float) (lcg_next() >> 40) / (float) (1 << 24) - 0.5f) * scale;
+}
+
+// ---------------------------------------------------------------- fnv hash
+
+static uint64_t fnv1a(const void * data, size_t n) {
+    const uint8_t * p = (const uint8_t *) data;
+    uint64_t h = 1469598103934665603ull;
+    for (size_t i = 0; i < n; ++i) {
+        h ^= p[i];
+        h *= 1099511628211ull;
+    }
+    return h;
+}
+
+// ---------------------------------------------------------------- mini model geometry
+
+static const int64_t N_VOCAB    = 64;
+static const int64_t N_EMBD     = 32;
+static const int64_t N_LAYER    = 5;   // 4 trunk blocks + 1 NextN/MTP block
+static const int64_t N_HEAD     = 2;
+static const int64_t N_HEAD_KV  = 1;
+static const int64_t N_EMBD_HEAD= 16;
+static const int64_t HC         = 4;
+static const int64_t HC_LR      = 8;
+static const int64_t N_EXPERT   = 8;
+static const int64_t N_EXP_USED = 2;
+static const int64_t N_FF       = 16;
+static const int64_t D_STATE    = 8;   // ssm_state_size
+static const int64_t N_GROUP    = 2;   // ssm_group_count
+static const int64_t DT_RANK    = 4;   // ssm_time_step_rank
+static const int64_t D_INNER    = 32;  // ssm_inner_size
+static const int64_t IDX_HEADS  = 2;
+static const int64_t IDX_DIM    = 16;
+static const int64_t IDX_TOPK   = 4;   // tiny so the QSA selection runs after a few steps
+static const int64_t PLE_DIM    = 8;
+
+static int64_t head_v_dim()  { return D_INNER / DT_RANK; }               // 8
+static int64_t conv_dim()    { return D_STATE*N_GROUP*2 + head_v_dim()*DT_RANK; } // 64
+static int64_t key_dim()     { return D_STATE*N_GROUP; }                  // 16
+static int64_t value_dim()   { return D_STATE*DT_RANK; }                  // 32
+static int64_t hc_dim()      { return HC*N_EMBD; }                        // 128
+
+// ---------------------------------------------------------------- gguf writer
+
+struct tensor_adder {
+    ggml_context * ctx = nullptr;
+    gguf_context * gguf = nullptr;
+    std::vector<ggml_tensor *> tensors;
+
+    ggml_tensor * add(const std::string & name, std::initializer_list<int64_t> ne) {
+        ggml_type type = GGML_TYPE_F32;
+        int64_t elems = 1;
+        for (auto n : ne) {
+            elems *= n;
+        }
+        ggml_tensor * t = ggml_new_tensor(ctx, type, (int) ne.size(), ne.begin());
+        ggml_set_name(t, name.c_str());
+        float * data = (float *) t->data;
+        lcg_seed(fnv1a(name.data(), name.size()));
+        for (int64_t i = 0; i < elems; ++i) {
+            data[i] = lcg_float(1.0f);
+        }
+        gguf_add_tensor(gguf, t);
+        tensors.push_back(t);
+        return t;
+    }
+};
+
+static void write_common_kv(tensor_adder & ta) {
+    gguf_set_val_str (ta.gguf, "general.architecture", "qwen4exp");
+    gguf_set_val_str (ta.gguf, "general.name", "w6-2-mini");
+    gguf_set_val_u32 (ta.gguf, "qwen4exp.vocab_size", (uint32_t) N_VOCAB);
+    gguf_set_val_u32 (ta.gguf, "qwen4exp.block_count", (uint32_t) N_LAYER);
+    gguf_set_val_u32 (ta.gguf, "qwen4exp.context_length", 256);
+    gguf_set_val_u32 (ta.gguf, "qwen4exp.embedding_length", (uint32_t) N_EMBD);
+    gguf_set_val_u32 (ta.gguf, "qwen4exp.attention.head_count", (uint32_t) N_HEAD);
+    gguf_set_val_u32 (ta.gguf, "qwen4exp.attention.head_count_kv", (uint32_t) N_HEAD_KV);
+    gguf_set_val_u32 (ta.gguf, "qwen4exp.attention.key_length", (uint32_t) N_EMBD_HEAD);
+    gguf_set_val_u32 (ta.gguf, "qwen4exp.attention.value_length", (uint32_t) N_EMBD_HEAD);
+    {
+        const int32_t sections[4] = { 4, 4, 4, 0 };
+        gguf_set_arr_data(ta.gguf, "qwen4exp.rope.dimension_sections", GGUF_TYPE_INT32, sections, 4);
+    }
+    gguf_set_val_f32 (ta.gguf, "qwen4exp.rope.freq_base", 10000000.0f);
+    gguf_set_val_f32 (ta.gguf, "qwen4exp.attention.layer_norm_rms_epsilon", 1e-6f);
+    gguf_set_val_u32 (ta.gguf, "qwen4exp.expert_count", (uint32_t) N_EXPERT);
+    gguf_set_val_u32 (ta.gguf, "qwen4exp.expert_used_count", (uint32_t) N_EXP_USED);
+    gguf_set_val_u32 (ta.gguf, "qwen4exp.expert_feed_forward_length", (uint32_t) N_FF);
+    gguf_set_val_u32 (ta.gguf, "qwen4exp.expert_shared_feed_forward_length", (uint32_t) N_FF);
+    gguf_set_val_u32 (ta.gguf, "qwen4exp.ssm.conv_kernel", 4);
+    gguf_set_val_u32 (ta.gguf, "qwen4exp.ssm.state_size", (uint32_t) D_STATE);
+    gguf_set_val_u32 (ta.gguf, "qwen4exp.ssm.group_count", (uint32_t) N_GROUP);
+    gguf_set_val_u32 (ta.gguf, "qwen4exp.ssm.time_step_rank", (uint32_t) DT_RANK);
+    gguf_set_val_u32 (ta.gguf, "qwen4exp.ssm.inner_size", (uint32_t) D_INNER);
+    gguf_set_val_u32 (ta.gguf, "qwen4exp.full_attention_interval", 4);
+    gguf_set_val_u32 (ta.gguf, "qwen4exp.rope.dimension_count", (uint32_t) N_EMBD_HEAD);
+    gguf_set_val_u32 (ta.gguf, "qwen4exp.hyper_connection.count", (uint32_t) HC);
+    gguf_set_val_u32 (ta.gguf, "qwen4exp.hyper_connection.low_rank", (uint32_t) HC_LR);
+    gguf_set_val_u32 (ta.gguf, "qwen4exp.attention.indexer.head_count", (uint32_t) IDX_HEADS);
+    gguf_set_val_u32 (ta.gguf, "qwen4exp.attention.indexer.key_length", (uint32_t) IDX_DIM);
+    gguf_set_val_u32 (ta.gguf, "qwen4exp.attention.indexer.top_k", (uint32_t) IDX_TOPK);
+    {
+        // layer 3 of the trunk is the full-attention QSA layer (every 4th); the MTP
+        // block (4) is full-attention too but dense, so a ratio there is never used
+        const uint32_t ratios[5] = { 0, 0, 0, 4, 0 };
+        gguf_set_arr_data(ta.gguf, "qwen4exp.attention.compress_ratios", GGUF_TYPE_UINT32, ratios, 5);
+    }
+    gguf_set_val_u32 (ta.gguf, "qwen4exp.nextn_predict_layers", 1);
+
+    // minimal gpt2-style vocab so the model loads; nothing tokenizes here
+    gguf_set_val_str (ta.gguf, "tokenizer.ggml.model", "gpt2");
+    gguf_set_val_str (ta.gguf, "tokenizer.ggml.pre", "qwen2");
+    {
+        std::vector<const char *> toks;
+        std::vector<float> scores;
+        std::vector<uint32_t> types;
+        char buf[16];
+        static char store[N_VOCAB][16];
+        for (int64_t i = 0; i < N_VOCAB; ++i) {
+            snprintf(buf, sizeof(buf), "t%03lld", (long long) i);
+            snprintf(store[i], sizeof(store[i]), "%s", buf);
+            toks.push_back(store[i]);
+            scores.push_back(0.0f);
+            types.push_back(1);
+        }
+        gguf_set_arr_str (ta.gguf, "tokenizer.ggml.tokens", toks.data(), toks.size());
+        gguf_set_arr_data(ta.gguf, "tokenizer.ggml.scores", GGUF_TYPE_FLOAT32, scores.data(), scores.size());
+        gguf_set_arr_data(ta.gguf, "tokenizer.ggml.token_type", GGUF_TYPE_UINT32, types.data(), types.size());
+        const char * merges[1] = { "" };
+        gguf_set_arr_str (ta.gguf, "tokenizer.ggml.merges", merges, 0);
+    }
+}
+
+static bool write_mini_gguf(const std::string & path, bool draft_only, std::string & err) {
+    gguf_context * gguf = gguf_init_empty();
+    if (!gguf) {
+        err = "gguf_init_empty failed";
+        return false;
+    }
+
+    size_t buf_size = 512ull * 1024 * 1024;
+    struct ggml_init_params ip = {
+        /*.mem_size   =*/ buf_size,
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ false,
+    };
+    ggml_context * ctx = ggml_init(ip);
+
+    tensor_adder ta;
+    ta.ctx = ctx;
+    ta.gguf = gguf;
+
+    write_common_kv(ta);
+
+    // PLE group (only present when the trunk is written; the loader keys the whole
+    // group off qwen4exp.ple.layers, so the draft file keeps the layer out of it)
+    if (!draft_only) {
+        const uint32_t ple_layers[1] = { 1 };
+        gguf_set_arr_data(ta.gguf, "qwen4exp.ple.layers", GGUF_TYPE_UINT32, ple_layers, 1);
+        gguf_set_val_u32 (ta.gguf, "qwen4exp.ple.ngram_size", 3);
+        gguf_set_val_u32 (ta.gguf, "qwen4exp.ple.heads_per_ngram", 2);
+        gguf_set_val_u32 (ta.gguf, "qwen4exp.ple.conv_kernel", 4);
+        gguf_set_val_u32 (ta.gguf, "qwen4exp.ple.eos_token_id", 2);
+        gguf_set_val_u32 (ta.gguf, "qwen4exp.ple.image_token_id", 3);
+        gguf_set_val_u32 (ta.gguf, "qwen4exp.embedding_length_per_layer_input", (uint32_t) PLE_DIM);
+        {
+            const uint64_t mult[3] = { 0x9e3779b97f4a7c15ull, 0xc2b2ae3d27d4eb4full, 0x165667b19e3779f9ull };
+            const uint64_t offs[4] = { 0, 16, 32, 48 };
+            const uint64_t vocabs[4] = { 16, 16, 16, 16 };
+            gguf_set_arr_data(ta.gguf, "qwen4exp.ple.layer_multipliers", GGUF_TYPE_UINT64, mult, 3);
+            gguf_set_arr_data(ta.gguf, "qwen4exp.ple.head_offsets", GGUF_TYPE_UINT64, offs, 4);
+            gguf_set_arr_data(ta.gguf, "qwen4exp.ple.head_vocab_sizes", GGUF_TYPE_UINT64, vocabs, 4);
+        }
+    }
+
+    // shared tables
+    ta.add("token_embd.weight", { N_EMBD, N_VOCAB });
+    ta.add("output_hc_norm.weight", { hc_dim() });
+    ta.add("output_hc_down.weight", { hc_dim(), HC_LR });
+    ta.add("output_hc_up.weight",   { HC_LR, hc_dim() });
+    ta.add("output.weight", { N_EMBD, N_VOCAB });
+
+    if (!draft_only) {
+        // flat PLE n-gram table: rows cover every head window
+        ta.add("per_layer_token_embd.weight", { PLE_DIM, 64 });
+    }
+
+    for (int64_t il = 0; il < N_LAYER; ++il) {
+        char n[128];
+        const bool trunk = il < N_LAYER - 1;
+        const bool write = draft_only ? !trunk : true;
+
+        if (!write) {
+            continue;
+        }
+
+        auto T = [&](const std::string & suffix, std::initializer_list<int64_t> ne) {
+            snprintf(n, sizeof(n), "blk.%lld.%s", (long long) il, suffix.c_str());
+            ta.add(n, ne);
+        };
+
+        // hyper-connection weights: two modules per layer
+        T("hc_attn_norm.weight",   { hc_dim() });
+        T("hc_attn_down.weight",   { hc_dim(), HC_LR });
+        T("hc_attn_up.weight",     { HC_LR, hc_dim() });
+        T("hc_attn_inject.weight", { hc_dim(), HC });
+        T("hc_ffn_norm.weight",    { hc_dim() });
+        T("hc_ffn_down.weight",    { hc_dim(), HC_LR });
+        T("hc_ffn_up.weight",      { HC_LR, hc_dim() });
+        T("hc_ffn_inject.weight",  { hc_dim(), HC });
+
+        if (trunk) {
+            const bool recurrent = ((il + 1) % 4) != 0;  // matches the loader's rule
+            const bool ple = il == 1;
+
+            if (recurrent) {
+                T("attn_qkv.weight",   { N_EMBD, key_dim() * 2 + value_dim() });
+                T("attn_gate.weight",  { N_EMBD, value_dim() });
+                T("ssm_conv1d.weight", { 4, conv_dim() });
+                T("ssm_dt.bias",       { DT_RANK });
+                T("ssm_a",             { DT_RANK });
+                T("ssm_beta.weight",   { N_EMBD, DT_RANK });
+                T("ssm_alpha.weight",  { N_EMBD, DT_RANK });
+                T("ssm_norm.weight",   { head_v_dim() });
+                T("ssm_out.weight",    { value_dim(), N_EMBD });
+            }
+            if (ple) {
+                T("ple_key.weight",        { N_EMBD, hc_dim() });
+                T("ple_value.weight",      { N_EMBD, N_EMBD });
+                T("ple_norm_key.weight",   { hc_dim() });
+                T("ple_norm_query.weight", { hc_dim() });
+                T("ple_norm_conv.weight",  { hc_dim() });
+                T("ple_conv1d.weight",     { 4, hc_dim() });
+            }
+        }
+
+        if (!trunk || ((il + 1) % 4) == 0) {
+            // full attention (trunk QSA layer and the MTP block, which is dense):
+            // wq holds [q|gate] interleaved per head
+            T("attn_q.weight",   { N_EMBD, N_EMBD_HEAD * N_HEAD * 2 });
+            T("attn_k.weight",   { N_EMBD, N_EMBD_HEAD * N_HEAD_KV });
+            T("attn_v.weight",   { N_EMBD, N_EMBD_HEAD * N_HEAD_KV });
+            T("attn_output.weight", { N_EMBD_HEAD * N_HEAD, N_EMBD });
+            T("attn_q_norm.weight", { N_EMBD_HEAD });
+            T("attn_k_norm.weight", { N_EMBD_HEAD });
+            T("indexer.q_proj.weight", { N_EMBD, IDX_HEADS * IDX_DIM });
+            T("indexer.k_proj.weight", { N_EMBD, IDX_DIM });
+            T("indexer.q_norm.weight", { IDX_DIM });
+            T("indexer.k_norm.weight", { IDX_DIM });
+        }
+
+        // MoE + shared expert (all layers, the MTP block included)
+        T("ffn_gate_inp.weight",       { N_EMBD, N_EXPERT });
+        T("ffn_gate_exps.weight",      { N_EMBD, N_FF, N_EXPERT });
+        T("ffn_up_exps.weight",        { N_EMBD, N_FF, N_EXPERT });
+        T("ffn_down_exps.weight",      { N_FF, N_EMBD, N_EXPERT });
+        T("ffn_gate_inp_shexp.weight", { N_EMBD });
+        T("ffn_gate_shexp.weight",     { N_EMBD, N_FF });
+        T("ffn_up_shexp.weight",       { N_EMBD, N_FF });
+        T("ffn_down_shexp.weight",     { N_FF, N_EMBD });
+
+        if (!trunk) {
+            // NextN/MTP head tensors live on the MTP block
+            T("nextn.enorm.weight",   { N_EMBD });
+            T("nextn.hnorm.weight",   { hc_dim() });
+            T("nextn.eh_proj.weight", { 2 * N_EMBD, N_EMBD });
+        }
+    }
+
+    bool ok = gguf_write_to_file(gguf, path.c_str(), false);
+    if (!ok) {
+        err = "gguf_write_to_file failed for " + path;
+    }
+
+    gguf_free(gguf);
+    ggml_free(ctx);
+    return ok;
+}
+
+// ---------------------------------------------------------------- node dump
+
+static FILE * dump_file = nullptr;
+static int dump_eval_id = 0;
+
+static const ggml_tensor * find_named_ancestor(const ggml_tensor * t, int depth) {
+    if (!t || depth <= 0) {
+        return nullptr;
+    }
+    if (t->name[0] != '\0') {
+        return t;
+    }
+    for (int i = 0; i < GGML_MAX_SRC; ++i) {
+        if (t->src[i]) {
+            const ggml_tensor * r = find_named_ancestor(t->src[i], depth - 1);
+            if (r) {
+                return r;
+            }
+        }
+    }
+    return nullptr;
+}
+
+static bool node_cb(ggml_tensor * t, bool ask, void * ud) {
+    if (ask) {
+        return true; // observe every node
+    }
+    if (!dump_file) {
+        return true;
+    }
+
+    // only hash host buffers (the CPU backend keeps everything host-visible)
+    const bool host = t->buffer ? ggml_backend_buffer_is_host(t->buffer) : true;
+
+    uint64_t hash = 0;
+    if (host && t->data) {
+        const size_t nbytes = ggml_nbytes(t);
+        if (nbytes > 0 && !(t->type == GGML_TYPE_I32 || t->type == GGML_TYPE_I64)) {
+            hash = fnv1a(t->data, nbytes) ^ (nbytes * 0x100000001b3ull);
+        }
+    }
+
+    const ggml_tensor * root = find_named_ancestor(t, 8);
+
+    fprintf(dump_file, "N|%d|%s|%s|%lldx%lldx%lldx%lld|%d|%lld|%016llx|%s|%s|%s\n",
+            dump_eval_id,
+            ggml_op_desc((ggml_tensor *) t),
+            t->name[0] ? t->name : "(anon)",
+            (long long) t->ne[0], (long long) t->ne[1],
+            (long long) t->ne[2], (long long) t->ne[3],
+            ggml_is_contiguous((ggml_tensor *) t) ? 1 : (ggml_is_contiguous_rows((ggml_tensor *) t) ? 2 : 0),
+            (long long) ggml_nbytes(t),
+            (unsigned long long) hash,
+            t->src[0] ? ggml_op_desc(t->src[0]) : "-",
+            t->src[1] ? ggml_op_desc(t->src[1]) : "-",
+            root ? (root->name[0] ? root->name : "(anon2)") : "(none)");
+    (void) ud;
+    return true;
+}
+
+// ---------------------------------------------------------------- run
+
+static int do_run(const std::string & model_path, const std::string & draft_path,
+                  const std::string & dump_path, int steps) {
+    llama_backend_init();
+
+    llama_model_params mp = llama_model_default_params();
+    mp.n_gpu_layers = 0;
+    mp.use_mmap = false;
+
+    llama_model * model = llama_model_load_from_file(model_path.c_str(), mp);
+    if (!model) {
+        fprintf(stderr, "load model failed\n");
+        return 1;
+    }
+
+    llama_context_params cp = llama_context_default_params();
+    cp.n_ctx = 256;
+    cp.n_batch = 64;
+    cp.n_ubatch = 64;
+    cp.n_seq_max = 1;
+    cp.n_threads = 1;
+    cp.n_threads_batch = 1;
+    cp.n_rs_seq = 16;   // prod target ring: 17 conv-state snapshots per recurrent layer
+    if (!dump_path.empty()) {
+        cp.cb_eval = node_cb;
+        cp.cb_eval_user_data = nullptr;
+    }
+
+    llama_context * ctx = llama_init_from_model(model, cp);
+    if (!ctx) {
+        fprintf(stderr, "init ctx failed\n");
+        return 1;
+    }
+
+    if (!dump_path.empty()) {
+        dump_file = fopen(dump_path.c_str(), "w");
+        if (!dump_file) {
+            fprintf(stderr, "cannot open dump %s\n", dump_path.c_str());
+            return 1;
+        }
+    }
+
+    uint64_t logits_hashes[512] = { 0 };
+    int n_hashes = 0;
+
+    const int64_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
+    auto hash_logits = [&]() -> bool {
+        const float * l = llama_get_logits_ith(ctx, -1);
+        if (!l) {
+            return false;
+        }
+        logits_hashes[n_hashes++] = fnv1a(l, (size_t) n_vocab * sizeof(float));
+        return true;
+    };
+
+    auto decode_tokens = [&](std::vector<llama_token> toks, std::vector<llama_pos> pos) -> bool {
+        const int32_t n = (int32_t) toks.size();
+        llama_batch b = llama_batch_init(n, 0, 1);
+        for (int32_t i = 0; i < n; ++i) {
+            b.token[i] = toks[i];
+            b.pos[i] = pos[i];
+            b.n_seq_id[i] = 1;
+            b.seq_id[i][0] = 0;
+            b.logits[i] = (i + 1 == n) ? 1 : 0;
+        }
+        b.n_tokens = n;
+        int rc = llama_decode(ctx, b);
+        llama_batch_free(b);
+        if (rc != 0) {
+            fprintf(stderr, "decode rc=%d at eval %d\n", rc, dump_eval_id);
+            return false;
+        }
+        dump_eval_id++;
+        hash_logits();
+        return true;
+    };
+
+    // 1) prefill of 8 tokens
+    {
+        std::vector<llama_token> toks = { 1, 5, 9, 13, 2, 7, 11, 3 };
+        std::vector<llama_pos> pos;
+        for (size_t i = 0; i < toks.size(); ++i) {
+            pos.push_back((llama_pos) i);
+        }
+        if (!decode_tokens(toks, pos)) return 2;
+    }
+
+    // 2) single-token decode steps
+    for (int s = 0; s < steps; ++s) {
+        llama_token t = 4 + (s * 7) % 40;
+        if (!decode_tokens({ t }, { (llama_pos) (8 + s) })) return 2;
+    }
+
+    // 3) one verify-like 3-token batch
+    {
+        const int base = 8 + steps;
+        if (!decode_tokens({ 6, 12, 18 }, { (llama_pos) base, (llama_pos) (base + 1), (llama_pos) (base + 2) })) return 2;
+    }
+
+    // 4) drafter (MTP) evals, if a draft model was given
+    if (!draft_path.empty()) {
+        llama_model * dmodel = llama_model_load_from_file(draft_path.c_str(), mp);
+        if (!dmodel) {
+            fprintf(stderr, "load draft model failed\n");
+            return 1;
+        }
+
+        llama_context_params dcp = cp;
+        dcp.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+        dcp.n_rs_seq = 0;    // the server zeroes the drafter ring
+
+        llama_context * dctx = llama_init_from_model(dmodel, dcp);
+        if (!dctx) {
+            fprintf(stderr, "init draft ctx failed\n");
+            return 1;
+        }
+
+        const int64_t n_embd_h = llama_model_n_embd_out(dmodel);
+        lcg_seed(0x243f6a8885a308d3ull);
+        for (int s = 0; s < 3; ++s) {
+            llama_batch b = llama_batch_init(1, (int32_t) n_embd_h, 1);
+            // llama_batch_init allocates only one of token/embd; the MTP head needs both
+            b.token = (llama_token *) malloc(sizeof(llama_token));
+            b.token[0] = 4 + (s * 5) % 40;
+            b.pos[0] = (llama_pos) (10 + s);
+            b.n_seq_id[0] = 1;
+            b.seq_id[0][0] = 0;
+            b.logits[0] = 1;
+            b.n_tokens = 1;
+            // fill the h input with deterministic values (the spec driver does this
+            // from the target boundary; any bytes exercise the same graph)
+            for (int64_t i = 0; i < n_embd_h; ++i) {
+                b.embd[i] = lcg_float(1.0f);
+            }
+            int rc = llama_decode(dctx, b);
+            free(b.token);
+            b.token = nullptr;
+            llama_batch_free(b);
+            if (rc != 0) {
+                fprintf(stderr, "draft decode rc=%d\n", rc);
+                return 2;
+            }
+            dump_eval_id++;
+        }
+        llama_free(dctx);
+        llama_model_free(dmodel); // NOLINT
+    }
+
+    if (dump_file) {
+        fclose(dump_file);
+        dump_file = nullptr;
+    }
+
+    // 5) full context state hash (covers KV + recurrent + conv caches)
+    {
+        const size_t need = llama_state_get_size(ctx);
+        std::vector<uint8_t> buf(need);
+        const size_t got = llama_state_get_data(ctx, buf.data(), buf.size());
+        uint64_t h = fnv1a(buf.data(), got);
+        printf("STATEHASH %zu %016llx\n", got, (unsigned long long) h);
+    }
+
+    for (int i = 0; i < n_hashes; ++i) {
+        printf("LOGITSHASH %d %016llx\n", i, (unsigned long long) logits_hashes[i]);
+    }
+    printf("EVALS %d\n", dump_eval_id);
+
+    llama_free(ctx);
+    llama_model_free(model); // NOLINT
+    llama_backend_free();
+    return 0;
+}
+
+int main(int argc, char ** argv) {
+    std::string model_path, draft_path, dump_path, make_path, make_draft_path;
+    int steps = 8;
+
+    for (int i = 1; i < argc; ++i) {
+        std::string a = argv[i];
+        auto next = [&]() -> std::string {
+            return (i + 1 < argc) ? argv[++i] : "";
+        };
+        if (a == "--make-model") {
+            make_path = next();
+        } else if (a == "--make-draft") {
+            make_draft_path = next();
+        } else if (a == "--model") {
+            model_path = next();
+        } else if (a == "--draft") {
+            draft_path = next();
+        } else if (a == "--dump") {
+            dump_path = next();
+        } else if (a == "--steps") {
+            steps = atoi(next().c_str());
+        } else {
+            fprintf(stderr, "unknown arg %s\n", a.c_str());
+            return 1;
+        }
+    }
+
+    std::string err;
+    if (!make_path.empty()) {
+        if (!write_mini_gguf(make_path, false, err)) {
+            fprintf(stderr, "%s\n", err.c_str());
+            return 1;
+        }
+        printf("wrote %s\n", make_path.c_str());
+    }
+    if (!make_draft_path.empty()) {
+        if (!write_mini_gguf(make_draft_path, true, err)) {
+            fprintf(stderr, "%s\n", err.c_str());
+            return 1;
+        }
+        printf("wrote %s\n", make_draft_path.c_str());
+    }
+
+    if (model_path.empty()) {
+        return 0;
+    }
+
+    return do_run(model_path, draft_path, dump_path, steps);
+}

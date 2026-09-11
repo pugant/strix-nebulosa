@@ -1,0 +1,44 @@
+From b21239c06b00b152873bbfab35e7f5ba7fe068e6 Mon Sep 17 00:00:00 2001
+From: pugant <pugant@localhost>
+Date: Thu, 10 Sep 2026 23:05:56 +0200
+Subject: [PATCH 15/15] AI_CHANGES: session 012 (W7-1 EW fusion series)
+
+Co-Authored-By: GLM by z.ai <glm@z.ai>
+---
+ AI_CHANGES.md | 20 ++++++++++++++++++++
+ 1 file changed, 20 insertions(+)
+
+diff --git a/AI_CHANGES.md b/AI_CHANGES.md
+index 40748feef..f4d7dbc89 100644
+--- a/AI_CHANGES.md
++++ b/AI_CHANGES.md
+@@ -526,6 +526,26 @@ A fresh build never sees this because freshly built tensors have `buffer == data
+ **Verification:** build in container `docker-llm-service:w2-vk-builder` rc=0 (`logs/wave7/w7p4-build.{log,err,rc}`); artifact gates 5/5 PASS (`logs/wave7/w7p4-sidecar-gates.txt`); gate N: see `docs/research/wave7/w7p4-report.md`.
+ 
+ 
++## Session 012 — 2026-09-10 (W7-1 fusione EW host-side)
++
++**Scope:** W7-1 (wave-7 Task 4) — fuse adjacent element-wise chains in the qwen4exp graph-builder where the cpu/vulkan matchers don't fire, unblocking EXISTING fusions only (no shader changes). Census first (W6-2 per-node dump + matcher simulation, `logs/wave7/w7p1-census.{py}` + report §1): the grouped-RMSNorm `rms_norm → reshape(flat) → mul` chain missed `RMS_NORM_MUL` at every hyper-connection mix (2/layer + final + drafter + 3 PLE sites) because the flat gamma relabel sat between the two ops; the GDN alpha `mul_mat → reshape(id) → add` missed `MUL_MAT_ADD` (mat-vec) the same way.
++
++### `src/models/qwen4exp.cpp`
++
++| Fix | Line(s) | Detail |
++|-----|---------|--------|
++| Gamma re-chunk at load | load_arch_tensors | `rechunk_hc_gamma` helper: metadata-only `[hc_dim] → [n_embd, hc]` for `output_hc_norm`, per-layer `hc_attn_norm`/`hc_ffn_norm`, `nextn.hnorm`, `ple_norm_{key,query,conv}` (same contiguous storage; asserts type/contiguity; null- and already-chunked-safe). Weights stay LEAFs so no relabel node interleaves. |
++| hc mix mul in place | `build_hc_mix` | gamma multiplies the normed `[n_embd, hc, T]` tensor directly (broadcast over T); the flat `[hc_dim, nt]` relabel moves AFTER the mul → RMS_NORM+MUL adjacent, same shape, f32, contiguous ⇒ fusion fires on VK (and on CPU via `ggml_cpu_try_fuse_ops`). |
++| drafter hnorm | `graph_mtp` ctor | mul directly on the normed streams; the two flat relabels collapse (consumer concat already wants `[n_embd, hc, T]`). |
++| PLE grouped norm | `build_ple` `grouped_norm` | mul lands straight on the normed `[n_embd, hc, T]`; inner flat relabels dropped. |
++| GDN alpha | `build_layer_attn_linear` | early identity `reshape_3d` between the `ssm_alpha` matmul and the `ssm_dt` bias add dropped; the closing `reshape_4d` already restores the mixer's shape; add/softplus/mul broadcast identically either way. |
++
++**Bit-exactness (read from both matcher implementations before claiming):** VK `rms_norm.comp` `do_multiply` is the same shader with the same sum-of-squares reduction and the same left-to-right `(scale·a)·b` association (D_TYPE=f32 round-trip lossless); VK mat-vec `MAT_VEC_FUSION_FLAGS_BIAS0` adds the bias in-register after the identical dot accumulation; CPU fused template computes the same `(x·scale)·w` as unfused vec_scale+mul with the identical double accumulator. Broadcast pairing `gamma[k] ↔ element k` unchanged by the relabel move (row-major order preserved).
++
++**Known boundary:** `llama_model_save_to_file` on a patched build writes the gammas already chunked (`[n_embd, hc]`); the loader's strict per-dim check rejects them (patched or not). No in-tree consumer saves qwen4exp (`test-llama-archs` skips the arch; quantizer works at loader/GGUF level, untouched).
++
++**Verification:** gate N (W6-2 §3 pattern, `staging-w7/w7p1-gateN.sh`), VK build + interleaved cells (`staging-w7/w7p1-{build,base-build,celle}.sh`) — outcomes in `docs/research/wave7/w7p1-report.md` §3-§5.
++
+ <!-- TEMPLATE FOR FUTURE AI SESSIONS:
+ 
+ Addendum (post final-review): fix `423a7b59b` — euristica LONGEST nutrita con la size d'ARRIVO del task (task_prev->tokens, spec r3) invece del boundary di slot (che include i generati e rendeva l'eguaglianza irraggiungibile); gate sorgente anti-regressione nel test. Serie finale: 13 commit, tree SHA `808af2282` (gate git-am pari).
+-- 
+2.53.0
+

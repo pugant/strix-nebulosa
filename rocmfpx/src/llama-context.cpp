@@ -19,6 +19,13 @@
 #include <limits>
 #include <stdexcept>
 
+#include <algorithm>
+
+// W6-9 (A2-C2): hard cap for LLAMA_GRAPH_CACHE_SLOTS. Each extra cache slot
+// costs one buf_compute_meta (~15-20 MB at the qwen4exp prod max_nodes), so the
+// cap bounds the worst-case host-memory footprint per context.
+#define LLAMA_GRAPH_CACHE_SLOTS_MAX 8
+
 //
 // llama_context
 //
@@ -241,6 +248,23 @@ llama_context::llama_context(
         if (graph_build_timing) {
             LLAMA_LOG_INFO("%s: graph build timing enabled\n", __func__);
         }
+
+        // W6-9 (A2-C2): k-slot graph-result cache. 0 or 1 selects the legacy
+        // single-slot behavior (same-binary A/B and runtime rollback).
+        const char * LLAMA_GRAPH_CACHE_SLOTS = getenv("LLAMA_GRAPH_CACHE_SLOTS");
+        if (LLAMA_GRAPH_CACHE_SLOTS != nullptr) {
+            const int32_t k_requested = atoi(LLAMA_GRAPH_CACHE_SLOTS);
+            graph_cache_slots = std::clamp(k_requested, (int32_t) 1, (int32_t) LLAMA_GRAPH_CACHE_SLOTS_MAX);
+
+            if (k_requested != graph_cache_slots) {
+                LLAMA_LOG_WARN("%s: graph cache slots clamped from %d to %d\n", __func__, k_requested, graph_cache_slots);
+            }
+        }
+        graph_cache_slots = std::clamp(graph_cache_slots, (int32_t) 1, (int32_t) LLAMA_GRAPH_CACHE_SLOTS_MAX);
+
+        if (graph_cache_slots > 1) {
+            LLAMA_LOG_INFO("%s: graph cache slots = %d\n", __func__, (int) graph_cache_slots);
+        }
     }
 
     // With SPLIT_MODE_TENSOR both contexts share meta-backend buffers;
@@ -444,6 +468,15 @@ llama_context::llama_context(
 }
 
 llama_context::~llama_context() {
+    // W6-9 (A2-C2): opt-in cache counters at destruction, gated on the same
+    // env as the build timing. WARN level so the line survives the server's
+    // default verbosity filter (INFO lines from this file are dropped at -lv 3).
+    if (graph_build_timing) {
+        LLAMA_LOG_WARN("%s: graph cache: rebuilds = %d, hits = %d (rebinds = %d, evictions = %d), slots = %d / %d\n",
+                __func__, n_graph_builds, n_cache_hits, n_cache_rebinds, n_cache_evicts,
+                (int) gf_res_cache.size(), (int) graph_cache_slots);
+    }
+
     if (!model.hparams.no_alloc) {
         for (size_t i = 0; i < backend_ptrs.size(); ++i) {
             ggml_backend_t             backend = backend_ptrs[i];
@@ -461,6 +494,103 @@ llama_context::~llama_context() {
         }
     }
     ggml_opt_free(opt_ctx);
+}
+
+// W6-9 (A2-C2): drop all cache slots and re-create slot 0. Called whenever the
+// scheduler itself is re-created — no cached graph (nor its tensor data
+// pointers, which live in the sched's buffers) survives that.
+void llama_context::graph_cache_reinit(int64_t max_nodes) {
+    gf_res_cache.clear();
+    gf_res_cur = -1;
+    gf_res_lru_clock = 0;
+    graph_cache_max_nodes = max_nodes;
+
+    // slot 0 always exists (mirrors the legacy gf_res_prev invariant: callers
+    // outside process_ubatch use it as a scratch build target)
+    gf_res_cache.resize(1);
+    gf_res_cache[0].res.reset(new llm_graph_result(max_nodes));
+}
+
+// W6-9 (A2-C2): invalidate every cached graph (res->reset() re-initializes the
+// ggml context in the same buffer and clears the stored params, so can_reuse
+// can no longer match). Called whenever the scheduler was reset externally.
+void llama_context::graph_cache_reset_all() {
+    for (auto & slot : gf_res_cache) {
+        if (slot.res) {
+            slot.res->reset();
+        }
+        slot.lru = 0;
+    }
+    gf_res_cur = -1;
+}
+
+// W6-9 rev-2 (A2-C2): drop the allocation state from every tensor created by
+// the graph builder (they all live in the result's ggml context), returning
+// the cached graph to the exact state a freshly built graph of the same
+// topology would have. Root cause of the cell crash: the tensors of a cached
+// graph keep the buffer/data pointers that the gallocr assigned them during
+// their original allocation. Once any other graph has been allocated on the
+// same sched (and the gallocr has re-reserved its pools), those pointers are
+// stale, and two things go wrong:
+//   1. ggml_backend_sched_backend_id_from_cur() takes the pre-allocated path
+//      and probes (stale buffer type, op) — on the VK+CPU cell this aborted
+//      in split_graph ("pre-allocated tensor (attn_inp_kq_mask (copy)) in a
+//      buffer (Vulkan0) that cannot run the operation (CPY)");
+//   2. ggml_gallocr_init_tensor() skips re-assignment for tensors with
+//      data != NULL, so the graph would compute through stale pointers even
+//      when the split survives.
+// A freshly built graph has buffer == NULL and data == NULL for all of its
+// tensors, which is what the scrub restores. Views are scrubbed as well:
+// ggml_backend_view_init() re-derives their buffer/data from view_src during
+// the allocation. Model weights, KV-cache and cross-context tensors are not
+// created in the result's ggml context, so they are not touched — their
+// buffers are persistent and the fresh-build path relies on exactly that.
+void llama_context::graph_result_scrub_allocation(llm_graph_result * res) {
+    struct ggml_context * ctx = res->get_ctx();
+
+    for (struct ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+        t->buffer = NULL;
+        t->data   = NULL;
+    }
+}
+
+// W6-9 rev-2 (A2-C2): restore a cached graph to its as-built state before a
+// re-bind. Beyond the stale allocation state, the previous split left two
+// in-place mutations on the user graph:
+//   1. ggml_backend_sched_split_graph replaces node->src[j] with the
+//      cross-backend copy tensors it creates in sched->ctx — a context that
+//      split_graph frees and re-initializes at EVERY call, so those pointers
+//      dangle into freed (and reused) memory: on the next walk the graph is
+//      silently corrupted (the lavapipe+CPU repro aborted in
+//      ggml_compute_forward_rms_norm with mismatched shapes; the RADV cell
+//      aborted earlier, in backend_id_from_cur, on the stale-buffer probe);
+//   2. the backend graph optimizer (ggml_vk_graph_optimize) reorders
+//      nodes[] through the split views.
+// Restoring the snapshot taken right after build_graph (before any alloc)
+// makes the re-bind go through exactly the same split + alloc that a freshly
+// built graph of the same topology would.
+void llama_context::graph_result_restore_built(gf_res_slot & slot) {
+    auto * res = slot.res.get();
+    auto * gf  = res->get_gf();
+
+    const int n_nodes = ggml_graph_n_nodes(gf);
+
+    GGML_ASSERT((int) slot.built_nodes.size() == n_nodes);
+    GGML_ASSERT(slot.built_srcs.size() == (size_t) n_nodes * GGML_MAX_SRC);
+
+    struct ggml_tensor ** nodes = ggml_graph_nodes(gf);
+
+    for (int i = 0; i < n_nodes; ++i) {
+        struct ggml_tensor * node = slot.built_nodes[i];
+
+        for (int j = 0; j < GGML_MAX_SRC; ++j) {
+            node->src[j] = slot.built_srcs[i*GGML_MAX_SRC + j];
+        }
+
+        nodes[i] = node;
+    }
+
+    graph_result_scrub_allocation(res);
 }
 
 void llama_context::sched_reserve() {
@@ -483,7 +613,8 @@ void llama_context::sched_reserve() {
 
     LLAMA_LOG_DEBUG("%s: max_nodes = %zu\n", __func__, max_nodes);
 
-    gf_res_prev.reset(new llm_graph_result(max_nodes));
+    // W6-9 (A2-C2): the sched is being re-created — no cached graph survives that
+    graph_cache_reinit(max_nodes);
     gf_res_reserve.reset(new llm_graph_result(max_nodes));
 
     sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
@@ -850,7 +981,8 @@ bool llama_context::memory_update(bool optimize) {
         // reset the previous graph result to make sure that it won't be reused
         // TODO: change the mctx->apply() to return information if a graph reserve is needed
         //       reset the graph result only if the memory module did reset the scheduler
-        gf_res_prev->reset();
+        // W6-9 (A2-C2): every cached slot suffers the same staleness — reset them all
+        graph_cache_reset_all();
 
         if (!mctx->apply()) {
             LLAMA_LOG_ERROR("%s: failed to apply memory update\n", __func__);
@@ -1379,25 +1511,126 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         return nullptr;
     }
 
-    auto * res = gf_res_prev.get();
-    auto * gf  = res->get_gf();
+    // W6-9 (A2-C2): k-slot graph-result cache. The MTP round alternates graph
+    // keys within one context (verify(n=d+1, all outputs) -> plain(n=1) on the
+    // target; process(n=d+1, 0) -> step(n=1, 1) on the drafter), so the legacy
+    // single slot misses almost every eval (measured: 4-4.5 rebuilds / 7.7
+    // evals per round). Slots are tried most-recently-used first, and the full
+    // can_reuse predicate (params + per-input checks, e.g. the n_kv bucket of
+    // the attention mask) remains the single source of truth — the lookup only
+    // routes the request and never widens the predicate.
+    const int32_t cache_cap = graph_reuse_disable ? 1 : std::max<int32_t>(1, graph_cache_slots);
 
-    // the new graph parameters
-    // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
-    const auto gparams = graph_params(res, ubatch, mctx, gtype);
+    int32_t hit_idx = -1;
 
-    if (!graph_reuse_disable && res->can_reuse(gparams)) {
-        //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
+    if (!graph_reuse_disable && !gf_res_cache.empty()) {
+        // gather the warm slots (lru != 0), most recent first (k is single digits)
+        int32_t cand[LLAMA_GRAPH_CACHE_SLOTS_MAX];
+        int32_t n_cand = 0;
+
+        for (int32_t i = 0; i < (int32_t) gf_res_cache.size() && n_cand < LLAMA_GRAPH_CACHE_SLOTS_MAX; ++i) {
+            if (gf_res_cache[i].res && gf_res_cache[i].lru != 0) {
+                cand[n_cand++] = i;
+            }
+        }
+
+        for (int32_t a = 0; a < n_cand && hit_idx < 0; ++a) {
+            for (int32_t b = a + 1; b < n_cand; ++b) {
+                if (gf_res_cache[cand[b]].lru > gf_res_cache[cand[a]].lru) {
+                    std::swap(cand[a], cand[b]);
+                }
+            }
+
+            auto * cand_res = gf_res_cache[cand[a]].res.get();
+
+            // the new graph parameters
+            // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
+            const auto cand_params = graph_params(cand_res, ubatch, mctx, gtype);
+
+            if (cand_res->can_reuse(cand_params)) {
+                hit_idx = cand[a];
+            }
+        }
+    }
+
+    llm_graph_result * res = nullptr;
+    ggml_cgraph      * gf  = nullptr;
+
+    if (hit_idx >= 0) {
+        res = gf_res_cache[hit_idx].res.get();
+        gf  = res->get_gf();
 
         // with pipeline parallelism, the previous graph_compute_async may still be running
         // on the GPU. we must synchronize before set_inputs to avoid overwriting input tensors
-        // that the previous compute is still reading.
+        // that the previous compute is still reading. the re-bind below reassigns the
+        // sched allocation while that compute may still be in flight, so it is covered too.
         if (cparams.pipeline_parallel) {
             ggml_backend_sched_synchronize(sched.get());
         }
 
+        if (hit_idx != gf_res_cur) {
+            // W6-9 (A2-C2): cache hit on a non-current slot. the sched currently
+            // holds another graph's allocation — compute_splits() would run that
+            // one (the gf passed to graph_compute is ignored while is_alloc is
+            // set), and this graph's tensor data pointers went stale when the
+            // other one was allocated. re-bind: fresh sched allocation for the
+            // cached graph, skipping only its (topology-identical) construction.
+            // rev-2: the cached graph must first be restored to its as-built
+            // topology and scrubbed of the previous allocation state (see
+            // graph_result_restore_built) — without that the split aborts on
+            // pre-allocated/stale tensors or walks dangling src pointers.
+            const int64_t t_rebind_start_us = ggml_time_us();
+
+            graph_result_restore_built(gf_res_cache[hit_idx]);
+
+            ggml_backend_sched_reset(sched.get());
+            ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
+
+            if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
+                LLAMA_LOG_ERROR("%s: failed to allocate cached graph\n", __func__);
+                ret = GGML_STATUS_ALLOC_FAILED;
+                return nullptr;
+            }
+
+            gf_res_cur = hit_idx;
+
+            n_cache_rebinds++;
+            t_graph_rebind_us += ggml_time_us() - t_rebind_start_us;
+        }
+
         n_reused++;
+        n_cache_hits++;
+        gf_res_cache[hit_idx].lru = ++gf_res_lru_clock;
     } else {
+        // reuse miss: pick the victim slot — a free one if the cache is not full
+        // yet (extra slots are created lazily, so the memory cost tracks the
+        // actual key working set), otherwise the least recently used one
+        int32_t victim = -1;
+
+        if ((int32_t) gf_res_cache.size() < cache_cap) {
+            gf_res_cache.resize(gf_res_cache.size() + 1);
+            gf_res_cache.back().res.reset(new llm_graph_result(graph_cache_max_nodes));
+            victim = (int32_t) gf_res_cache.size() - 1;
+        } else {
+            victim = 0;
+            for (int32_t i = 1; i < (int32_t) gf_res_cache.size(); ++i) {
+                if (gf_res_cache[i].lru < gf_res_cache[victim].lru) {
+                    victim = i;
+                }
+            }
+            // W6-9: an eviction is a warm slot dropped while other slots
+            // exist — with a single slot every miss is the legacy rebuild
+            if (gf_res_cache[victim].lru != 0 && gf_res_cache.size() > 1) {
+                n_cache_evicts++;
+            }
+        }
+
+        res = gf_res_cache[victim].res.get();
+
+        // the new graph parameters
+        // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
+        const auto gparams = graph_params(res, ubatch, mctx, gtype);
+
         const int64_t t_rebuild_start_us = graph_build_timing ? ggml_time_us() : 0;
 
         res->reset();
@@ -1424,11 +1657,34 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             return nullptr;
         }
 
+        // W6-9 rev-2 (A2-C2): snapshot the as-built topology BEFORE the
+        // allocation — alloc_graph's split mutates the graph in place (src
+        // replacement by cross-backend copies, optimizer reordering), and a
+        // later re-bind of this slot needs the pristine state back.
+        {
+            auto & slot = gf_res_cache[victim];
+
+            const int n_nodes = ggml_graph_n_nodes(gf);
+            struct ggml_tensor ** nodes = ggml_graph_nodes(gf);
+
+            slot.built_nodes.assign(nodes, nodes + n_nodes);
+
+            slot.built_srcs.resize((size_t) n_nodes * GGML_MAX_SRC);
+            for (int i = 0; i < n_nodes; ++i) {
+                for (int j = 0; j < GGML_MAX_SRC; ++j) {
+                    slot.built_srcs[i*GGML_MAX_SRC + j] = nodes[i]->src[j];
+                }
+            }
+        }
+
         if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
             LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
             ret = GGML_STATUS_ALLOC_FAILED;
             return nullptr;
         }
+
+        gf_res_cur = victim;
+        gf_res_cache[victim].lru = ++gf_res_lru_clock;
     }
 
     // set the input data for the input tensors
@@ -2478,7 +2734,8 @@ ggml_cgraph * llama_context::graph_reserve(
     ggml_backend_sched_reset(sched.get());
 
     // when the scheduler is reset, we cannot reuse the old graph, so we reset the previous graph result to prevent that
-    gf_res_prev->reset();
+    // W6-9 (A2-C2): same staleness applies to every cached slot
+    graph_cache_reset_all();
 
     // store the n_outputs as it is, and restore it afterwards
     // TODO: not sure if needed, might simplify in the future by removing this
@@ -3531,7 +3788,7 @@ llama_perf_context_data llama_context::perf_get_data() const {
 }
 
 void llama_context::perf_print_graph_build_data() const {
-    if (!graph_build_timing && n_graph_builds == 0) {
+    if (!graph_build_timing && n_graph_builds == 0 && n_cache_hits == 0) {
         return;
     }
 
@@ -3545,6 +3802,17 @@ void llama_context::perf_print_graph_build_data() const {
             __func__, t_build_ms, n_graph_builds, avg_build_ms);
     LLAMA_LOG_INFO("%s: graph reset+build = %10.2f ms / %5d builds (%8.2f ms per build)\n",
             __func__, t_rebuild_ms, n_graph_builds, avg_total_ms);
+
+    // W6-9 (A2-C2): k-slot cache counters (rebind = cache hit that still paid
+    // the sched reset + alloc because another slot held the sched allocation)
+    const double t_rebind_ms   = 1e-3 * t_graph_rebind_us;
+    const double avg_rebind_ms = n_cache_rebinds > 0 ? t_rebind_ms / n_cache_rebinds : 0.0;
+
+    LLAMA_LOG_INFO("%s:   graph cache slots = %10d / %d\n", __func__, (int) gf_res_cache.size(), (int) graph_cache_slots);
+    LLAMA_LOG_INFO("%s:     graph cache hits = %10d (rebinds = %d, evictions = %d)\n",
+            __func__, n_cache_hits, n_cache_rebinds, n_cache_evicts);
+    LLAMA_LOG_INFO("%s:      graph rebind time = %10.2f ms / %5d rebinds (%8.2f ms per rebind)\n",
+            __func__, t_rebind_ms, n_cache_rebinds, avg_rebind_ms);
 }
 
 void llama_context::perf_reset() {
@@ -3552,8 +3820,10 @@ void llama_context::perf_reset() {
     t_eval_us   = n_eval = 0;
     t_p_eval_us = n_p_eval = 0;
     t_graph_build_us = t_graph_rebuild_us = 0;
+    t_graph_rebind_us = 0;
     n_reused         = 0;
     n_graph_builds   = 0;
+    n_cache_hits = n_cache_rebinds = n_cache_evicts = 0;
 }
 
 llama_memory_breakdown llama_context::memory_breakdown() const {
@@ -3707,7 +3977,12 @@ void llama_context::opt_epoch_iter(
                 break;
             }
 
-            auto * res = gf_res_prev.get();
+            // W6-9 (A2-C2): the training path always rebuilds and reallocates
+            // through the opt context, so no cached decode graph stays valid —
+            // reset all slots and build into slot 0 like the legacy single slot
+            graph_cache_reset_all();
+
+            auto * res = gf_res_cache[0].res.get();
 
             const auto gparams = graph_params(res, ubatch, mctx.get(), ctx_type_to_graph_type(cparams.ctx_type));
 

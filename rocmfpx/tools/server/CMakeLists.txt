@@ -16,6 +16,8 @@ add_library(${TARGET} STATIC
     server-common.h
     server-context.cpp
     server-context.h
+    llama-park-identity.cpp
+    llama-park-identity.h
     server-tools.cpp
     server-tools.h
 )

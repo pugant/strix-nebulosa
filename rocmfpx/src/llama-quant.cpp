@@ -322,7 +322,7 @@ static void llama_tensor_dequantize_impl(
 // do we allow this tensor to be quantized?
 //
 
-static bool tensor_allows_quantization(const llama_model_quantize_params * params, llm_arch arch, const ggml_tensor * tensor) {
+static bool tensor_allows_quantization(const llama_model_quantize_params * params, llm_arch arch, const ggml_tensor * tensor, const std::vector<std::pair<std::regex, ggml_type>> * tensor_type_patterns = nullptr) {
     // trivial checks first -- no string ops needed
     if (params->only_copy)       return false;
 
@@ -341,7 +341,21 @@ static bool tensor_allows_quantization(const llama_model_quantize_params * param
 
     // do not quantize expert gating tensors
     // NOTE: can't use LLM_TN here because the layer number is not known
-    quantize &= name.find("ffn_gate_inp.weight") == std::string::npos;
+    // fork (W7-2): a gating tensor explicitly named by a --tensor-type pattern
+    // is allowed through the guard. Quantizing MoE routers is a deliberate
+    // per-tensor act (router requant), and the pattern names the exact tensors,
+    // so accidental quantization through a generic recipe is not possible.
+    if (name.find("ffn_gate_inp.weight") != std::string::npos) {
+        quantize = false;
+        if (tensor_type_patterns != nullptr) {
+            for (const auto & [pattern, qtype] : *tensor_type_patterns) {
+                if (std::regex_search(name, pattern)) {
+                    quantize = true;
+                    break;
+                }
+            }
+        }
+    }
 
     // DeepSeek V4 source checkpoints contain native MXFP4 routed experts and
     // hash routing tables that must not be requantized.
@@ -1029,7 +1043,7 @@ static ggml_type llama_tensor_get_type_impl(quantize_state_impl & qs, ggml_type 
 
 // outer wrapper: determine the ggml_type that this tensor should be quantized to
 static ggml_type llama_tensor_get_type(quantize_state_impl & qs, const llama_model_quantize_params * params, const ggml_tensor * tensor, ggml_type default_type, const tensor_metadata & tm) {
-    if (!tensor_allows_quantization(params, qs.model.arch, tensor)) {
+    if (!tensor_allows_quantization(params, qs.model.arch, tensor, &qs.tensor_type_patterns)) {
         return tensor->type;
     }
     if (params->token_embedding_type < GGML_TYPE_COUNT && tm.category == tensor_category::TOKEN_EMBD) {
@@ -1051,6 +1065,23 @@ static ggml_type llama_tensor_get_type(quantize_state_impl & qs, const llama_mod
     }
     if (params->output_tensor_type < GGML_TYPE_COUNT && tm.category == tensor_category::OUTPUT) {
         return params->output_tensor_type;
+    }
+
+    // fork (W7-2): with --pure AND explicit --tensor-type patterns, exactly the
+    // tensors named by a pattern are converted to the override type; every other
+    // tensor keeps its current type, so the main loop copies it verbatim
+    // (cur_type == new_type). This is the per-tensor requant mode used for the
+    // MoE routers of an already-quantized trunk. Without patterns, --pure keeps
+    // the legacy ftype-default semantics (w6t3 head requant); without --pure,
+    // patterns keep the recipe-mode semantics (applied before the recipe mix).
+    if (params->pure && !qs.tensor_type_patterns.empty()) {
+        const std::string tensor_name(tensor->name);
+        for (const auto & [pattern, qtype] : qs.tensor_type_patterns) {
+            if (std::regex_search(tensor_name, pattern)) {
+                return tensor_type_fallback(qs, tensor, qtype);
+            }
+        }
+        return tensor->type;
     }
 
     ggml_type new_type = default_type;
@@ -1478,7 +1509,7 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
         }
         gguf_add_tensor(ctx_outs[i_split].get(), tensor);
 
-        metadata[i].allows_quantization = tensor_allows_quantization(params, model->arch, tensor);
+        metadata[i].allows_quantization = tensor_allows_quantization(params, model->arch, tensor, &qs.tensor_type_patterns);
 
         if (metadata[i].allows_quantization) {
             metadata[i].target_type = llama_tensor_get_type(qs, params, tensor, default_type, metadata[i]);
@@ -1846,7 +1877,7 @@ llama_model * llama_quant_model_from_metadata(const llama_quant_model_desc * des
 bool llama_quant_tensor_allows_quantization(
         const quantize_state_impl * qs,
         const ggml_tensor * tensor) {
-    return tensor_allows_quantization(qs->params, qs->model.arch, tensor);
+    return tensor_allows_quantization(qs->params, qs->model.arch, tensor, &qs->tensor_type_patterns);
 }
 
 void llama_quant_compute_types(

@@ -1,0 +1,254 @@
+From bf06efb4d95112ebb41305265c812b50debd256c Mon Sep 17 00:00:00 2001
+From: pugant <pugant@localhost>
+Date: Thu, 10 Sep 2026 19:37:55 +0200
+Subject: [PATCH 03/15] llama-context: restore the as-built topology when
+ re-binding a cached graph [w6-9 a2-c2 rev-2]
+
+The W6-9 cells crashed the server on the real VK path with the cache
+enabled: ggml_abort in ggml_backend_sched_backend_id_from_cur during the
+re-bind's split_graph ("pre-allocated tensor (attn_inp_kq_mask (copy)) in
+a buffer (Vulkan0) that cannot run the operation (CPY)").
+
+Root cause: a cached llm_graph_result holds the graph as its last
+allocation left it, not as it was built. ggml_backend_sched_split_graph
+mutates the user graph in place - it replaces node->src[j] with its
+cross-backend copy tensors, created in sched->ctx, which split_graph
+frees and re-initializes at every call, so those links dangle into
+freed memory - and the vk graph optimizer reorders nodes[] through the
+split views. The tensors also keep their gallocr-assigned buffer/data,
+which ggml_gallocr_init_tensor does not re-assign (data != NULL skip)
+and which backend_id_from_cur probes as pre-allocated (the abort). A
+fresh build never sees any of this because freshly built tensors have
+buffer == data == NULL and pristine links.
+
+Fix: snapshot the as-built topology (nodes order + src links) right
+after build_graph and before alloc_graph, and restore it (plus scrub
+the allocation state of every tensor in the result's ggml context)
+when a cache slot is re-bound. The re-bind then goes through exactly
+the same split + alloc a fresh build would.
+
+Also flip the default to legacy (k=1): the cache is strictly opt-in
+via LLAMA_GRAPH_CACHE_SLOTS >= 2 until the cells re-pass - a default
+must not be able to crash.
+
+Reproduced in the builder container with zero GPU on lavapipe VK + CPU
+(pre-fix: abort at the first re-bind; logs/wave6/w6c9/repro-prefix-k3.*),
+fixed and verified bit-exact on both CPU-only and multi-backend arms.
+
+Co-Authored-By: GLM by z.ai <glm@z.ai>
+---
+ AI_CHANGES.md         | 26 ++++++++++++
+ src/llama-context.cpp | 95 +++++++++++++++++++++++++++++++++++++++++++
+ src/llama-context.h   | 23 ++++++++++-
+ 3 files changed, 142 insertions(+), 2 deletions(-)
+
+diff --git a/AI_CHANGES.md b/AI_CHANGES.md
+index b1cc500df..f5ad1e4d4 100644
+--- a/AI_CHANGES.md
++++ b/AI_CHANGES.md
+@@ -484,6 +484,32 @@ byte 2: v2[5:4] | v3[5:0]<<2
+ 
+ 
+ 
++## Session 010 — 2026-09-10 (W6-9 gradino-2 rev-2: multi-backend re-bind fix + default flip)
++
++**Scope:** the W6-9 cells crashed the server on the real VK path with the cache enabled (k=3 default): `ggml_abort ← ggml_backend_sched_backend_id_from_cur ← split_graph ← alloc_graph ← process_ubatch`, message `pre-allocated tensor (attn_inp_kq_mask (copy)) in a buffer (Vulkan0) that cannot run the operation (CPY)` (`logs/wave6/w6c9c-slot3-r1.log`). Root cause analysis + fix + default flip to legacy. Perimeter still `src/llama-context.{h,cpp}` only.
++
++**Root cause (two in-place mutations of the user graph by the allocation path, verified in `ggml-backend.cpp`/`ggml-alloc.c`):** a cached `llm_graph_result` holds the graph as it was LEFT by its last allocation, not as built —
++1. `ggml_backend_sched_split_graph` replaces `node->src[j]` with its cross-backend copy tensors, created in `sched->ctx`, which split_graph **frees and re-initializes at every call** (`ggml-backend.cpp:1266-1268`) — the cached graph's srcs dangle into freed/reused memory;
++2. the backend graph optimizer (`ggml_vk_graph_optimize`) reorders `gf->nodes[]` through the split views;
++3. the tensors keep their gallocr-assigned `buffer`/`data`, which `ggml_gallocr_init_tensor` would NOT re-assign (`data != NULL` skip) and which `backend_id_from_cur` probes as pre-allocated (the cell abort).
++A fresh build never sees this because freshly built tensors have `buffer == data == NULL` and pristine links.
++
++### `src/llama-context.h`
++
++| Fix | Detail |
++|-----|-------|
++| Default flip | `graph_cache_slots` default 3 → 1 (legacy). The cache is strictly opt-in (`LLAMA_GRAPH_CACHE_SLOTS >= 2`) until the cells re-pass; a default can never crash. |
++| Slot snapshot | `gf_res_slot` gains `built_nodes` / `built_srcs` (as-built topology, ~0.9 MB per slot at 10k nodes) + `graph_result_restore_built()`. |
++
++### `src/llama-context.cpp`
++
++| Fix | Detail |
++|-----|-------|
++| Snapshot | taken in the miss path right after `model.build_graph()` and BEFORE `ggml_backend_sched_alloc_graph` (the mutation point): node order + all `src[]` links, via public API (`ggml_graph_nodes`). |
++| Re-bind restore | `graph_result_restore_built()` puts the cached graph back to the exact as-built state (nodes order, src links, `buffer`/`data` scrubbed to NULL for every tensor in the result's ggml context — weights/KV/cross tensors are not in that context and keep their persistent buffers), then `sched_reset` + `alloc_graph` as before. The re-bind now goes through exactly the same split+alloc a fresh build would. |
++
++**Repro + gate**: the crash is reproducible in the builder container with zero GPU via lavapipe (`VK_ICD_FILENAMES=lvp_icd...`, `GGML_VK_VISIBLE_DEVICES=0`) + CPU — pre-fix: abort at the FIRST rebind (`repro-prefix-k3.*`: rms_norm shape assert — the dangling-src manifestation; the RADV cell aborted earlier on the stale-buffer probe — same root). Post-fix gate (`logs/wave6/w6c9/gate-output.txt`): all arms bit-exact incl. the multi-backend arm (hashes k=0 ≡ k=3 on [VK-lvp, CPU], 25→14 rebuilds, 11 rebinds, 8 evictions); default without env = legacy (1 slot, 0 rebinds) on the same topology.
++
+ <!-- TEMPLATE FOR FUTURE AI SESSIONS:
+ 
+ Addendum (post final-review): fix `423a7b59b` — euristica LONGEST nutrita con la size d'ARRIVO del task (task_prev->tokens, spec r3) invece del boundary di slot (che include i generati e rendeva l'eguaglianza irraggiungibile); gate sorgente anti-regressione nel test. Serie finale: 13 commit, tree SHA `808af2282` (gate git-am pari).
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 30ebc3dfe..cb4f69036 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -524,6 +524,75 @@ void llama_context::graph_cache_reset_all() {
+     gf_res_cur = -1;
+ }
+ 
++// W6-9 rev-2 (A2-C2): drop the allocation state from every tensor created by
++// the graph builder (they all live in the result's ggml context), returning
++// the cached graph to the exact state a freshly built graph of the same
++// topology would have. Root cause of the cell crash: the tensors of a cached
++// graph keep the buffer/data pointers that the gallocr assigned them during
++// their original allocation. Once any other graph has been allocated on the
++// same sched (and the gallocr has re-reserved its pools), those pointers are
++// stale, and two things go wrong:
++//   1. ggml_backend_sched_backend_id_from_cur() takes the pre-allocated path
++//      and probes (stale buffer type, op) — on the VK+CPU cell this aborted
++//      in split_graph ("pre-allocated tensor (attn_inp_kq_mask (copy)) in a
++//      buffer (Vulkan0) that cannot run the operation (CPY)");
++//   2. ggml_gallocr_init_tensor() skips re-assignment for tensors with
++//      data != NULL, so the graph would compute through stale pointers even
++//      when the split survives.
++// A freshly built graph has buffer == NULL and data == NULL for all of its
++// tensors, which is what the scrub restores. Views are scrubbed as well:
++// ggml_backend_view_init() re-derives their buffer/data from view_src during
++// the allocation. Model weights, KV-cache and cross-context tensors are not
++// created in the result's ggml context, so they are not touched — their
++// buffers are persistent and the fresh-build path relies on exactly that.
++void llama_context::graph_result_scrub_allocation(llm_graph_result * res) {
++    struct ggml_context * ctx = res->get_ctx();
++
++    for (struct ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
++        t->buffer = NULL;
++        t->data   = NULL;
++    }
++}
++
++// W6-9 rev-2 (A2-C2): restore a cached graph to its as-built state before a
++// re-bind. Beyond the stale allocation state, the previous split left two
++// in-place mutations on the user graph:
++//   1. ggml_backend_sched_split_graph replaces node->src[j] with the
++//      cross-backend copy tensors it creates in sched->ctx — a context that
++//      split_graph frees and re-initializes at EVERY call, so those pointers
++//      dangle into freed (and reused) memory: on the next walk the graph is
++//      silently corrupted (the lavapipe+CPU repro aborted in
++//      ggml_compute_forward_rms_norm with mismatched shapes; the RADV cell
++//      aborted earlier, in backend_id_from_cur, on the stale-buffer probe);
++//   2. the backend graph optimizer (ggml_vk_graph_optimize) reorders
++//      nodes[] through the split views.
++// Restoring the snapshot taken right after build_graph (before any alloc)
++// makes the re-bind go through exactly the same split + alloc that a freshly
++// built graph of the same topology would.
++void llama_context::graph_result_restore_built(gf_res_slot & slot) {
++    auto * res = slot.res.get();
++    auto * gf  = res->get_gf();
++
++    const int n_nodes = ggml_graph_n_nodes(gf);
++
++    GGML_ASSERT((int) slot.built_nodes.size() == n_nodes);
++    GGML_ASSERT(slot.built_srcs.size() == (size_t) n_nodes * GGML_MAX_SRC);
++
++    struct ggml_tensor ** nodes = ggml_graph_nodes(gf);
++
++    for (int i = 0; i < n_nodes; ++i) {
++        struct ggml_tensor * node = slot.built_nodes[i];
++
++        for (int j = 0; j < GGML_MAX_SRC; ++j) {
++            node->src[j] = slot.built_srcs[i*GGML_MAX_SRC + j];
++        }
++
++        nodes[i] = node;
++    }
++
++    graph_result_scrub_allocation(res);
++}
++
+ void llama_context::sched_reserve() {
+     if (!sched_need_reserve) {
+         return;
+@@ -1506,8 +1575,14 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+             // set), and this graph's tensor data pointers went stale when the
+             // other one was allocated. re-bind: fresh sched allocation for the
+             // cached graph, skipping only its (topology-identical) construction.
++            // rev-2: the cached graph must first be restored to its as-built
++            // topology and scrubbed of the previous allocation state (see
++            // graph_result_restore_built) — without that the split aborts on
++            // pre-allocated/stale tensors or walks dangling src pointers.
+             const int64_t t_rebind_start_us = ggml_time_us();
+ 
++            graph_result_restore_built(gf_res_cache[hit_idx]);
++
+             ggml_backend_sched_reset(sched.get());
+             ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
+ 
+@@ -1582,6 +1657,26 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+             return nullptr;
+         }
+ 
++        // W6-9 rev-2 (A2-C2): snapshot the as-built topology BEFORE the
++        // allocation — alloc_graph's split mutates the graph in place (src
++        // replacement by cross-backend copies, optimizer reordering), and a
++        // later re-bind of this slot needs the pristine state back.
++        {
++            auto & slot = gf_res_cache[victim];
++
++            const int n_nodes = ggml_graph_n_nodes(gf);
++            struct ggml_tensor ** nodes = ggml_graph_nodes(gf);
++
++            slot.built_nodes.assign(nodes, nodes + n_nodes);
++
++            slot.built_srcs.resize((size_t) n_nodes * GGML_MAX_SRC);
++            for (int i = 0; i < n_nodes; ++i) {
++                for (int j = 0; j < GGML_MAX_SRC; ++j) {
++                    slot.built_srcs[i*GGML_MAX_SRC + j] = nodes[i]->src[j];
++                }
++            }
++        }
++
+         if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
+             LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
+             ret = GGML_STATUS_ALLOC_FAILED;
+diff --git a/src/llama-context.h b/src/llama-context.h
+index ea10d6d9e..622f0a820 100644
+--- a/src/llama-context.h
++++ b/src/llama-context.h
+@@ -391,6 +391,16 @@ private:
+     // only routes the request and never widens the predicate.
+     struct gf_res_slot {
+         llm_graph_result_ptr res;
++        // rev-2: as-built topology snapshot. ggml_backend_sched_split_graph
++        // mutates the user graph in place: node->src[j] is replaced by the
++        // cross-backend copy tensors (created in sched->ctx, which is freed and
++        // re-initialized at EVERY split_graph call), and the backend graph
++        // optimizer (e.g. ggml_vk_graph_optimize) reorders nodes[] through the
++        // split views. A cached graph therefore cannot be re-bound as it is —
++        // its topology must be restored to the state it had right after
++        // build_graph, before the next split.
++        std::vector<ggml_tensor *> built_nodes;                // [n_nodes]
++        std::vector<ggml_tensor *> built_srcs;                 // [n_nodes * GGML_MAX_SRC]
+         uint64_t             lru = 0; // 0 = never used, otherwise a stamp from gf_res_lru_clock
+     };
+     std::vector<gf_res_slot> gf_res_cache; // slot 0 always exists after sched_reserve(), the rest are created lazily up to the cap
+@@ -412,8 +422,11 @@ private:
+     bool graph_reuse_disable = false;
+ 
+     // env: LLAMA_GRAPH_CACHE_SLOTS (W6-9: k-slot graph-result cache; 0 or 1 selects
+-    // the legacy single-slot behavior, for same-binary A/B and runtime rollback)
+-    int32_t graph_cache_slots = 3;
++    // the legacy single-slot behavior, for same-binary A/B and runtime rollback).
++    // REV-2: default flipped to legacy (1) after the cell crash — see the
++    // re-bind scrub in process_ubatch; the cache is strictly opt-in until the
++    // cells re-pass.
++    int32_t graph_cache_slots = 1;
+ 
+     // env: LLAMA_GRAPH_BUILD_TIMING
+     bool graph_build_timing = false;
+@@ -422,6 +435,12 @@ private:
+     void graph_cache_reinit(int64_t max_nodes);
+     // reset every slot's result so that nothing can be reused (the sched was reset externally)
+     void graph_cache_reset_all();
++    // rev-2: clear the gallocr-assigned buffer/data pointers from a cached graph's
++    // tensors before re-binding it (see the comment at the definition)
++    void graph_result_scrub_allocation(llm_graph_result * res);
++    // rev-2: restore a cached graph's as-built topology (nodes order + src links,
++    // undoing the split mutations) and scrub its allocation state
++    void graph_result_restore_built(gf_res_slot & slot);
+ 
+     // perf
+     mutable int64_t t_start_us  = 0;
+-- 
+2.53.0
+

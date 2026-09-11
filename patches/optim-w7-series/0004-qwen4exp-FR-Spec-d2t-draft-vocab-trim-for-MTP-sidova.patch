@@ -1,0 +1,77 @@
+From 680ac40e782f4e4dc11b1363ba5dd1ec33caa700 Mon Sep 17 00:00:00 2001
+From: M5 merge <jl@lokal>
+Date: Sat, 5 Sep 2026 10:33:03 +0200
+Subject: [PATCH 04/15] qwen4exp: FR-Spec d2t draft-vocab trim for MTP-sidovagn
+ (port av avifenesh 047bfa508)
+
+Port of d2t 7a3aa1dd5 onto optim-w6 lineage [w7-4 step 7.1/5]: clean
+auto-merge, anchors adapted (tf -> trunk_flags/mtp_flags rename in our
+load_arch_tensors); graph spread lands in the trunk graph, later moved
+to graph_mtp by the ebb3def77 port.
+
+(cherry picked from commit 7a3aa1dd59f904d8f624afb13460715169838b65)
+
+Co-Authored-By: GLM by z.ai <glm@z.ai>
+---
+ src/models/qwen4exp.cpp | 30 +++++++++++++++++++++++++++++-
+ 1 file changed, 29 insertions(+), 1 deletion(-)
+
+diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
+index d805f8d88..6b57c539a 100644
+--- a/src/models/qwen4exp.cpp
++++ b/src/models/qwen4exp.cpp
+@@ -113,6 +113,17 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
+     const int      trunk_flags = mtp_only ? TENSOR_NOT_REQUIRED : 0;
+     const int      mtp_flags   = mtp_only ? 0 : TENSOR_SKIP;
+ 
++    // FR-Spec-style draft-vocab trim (samma d2t-konvention som EAGLE3): en MTP-only sidovagn
++    // kan bara ha huvudet over en frekvensrankad delmangd av vokabularen. Riktiga stammar har
++    // aldrig d2t, sa detta ar en no-op overallt utom for en medvetet trimmad sidovagn.
++    int64_t n_vocab_out = n_vocab;
++    const struct ggml_tensor * d2t_meta = ml.get_tensor_meta("d2t");
++    if (mtp_only && d2t_meta) {
++        n_vocab_out = d2t_meta->ne[0];
++        d2t = create_tensor(tn(LLM_TENSOR_D2T), { n_vocab_out }, 0);
++        LLAMA_LOG_INFO("%s: QWEN4EXP MTP using d2t draft-vocab trim (n_vocab_out = %lld)\n", __func__, (long long) n_vocab_out);
++    }
++
+     tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, 0);
+ 
+     // there is no output_norm: the final hyper-connection mixer carries it
+@@ -120,8 +131,9 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
+     output_hc_down = create_tensor(tn(LLM_TENSOR_OUTPUT_HC_DOWN, "weight"), { hc_dim, hc_lr }, 0);
+     output_hc_up   = create_tensor(tn(LLM_TENSOR_OUTPUT_HC_UP,   "weight"), { hc_lr, hc_dim }, 0);
+ 
+-    output = create_tensor(tn(LLM_TENSOR_OUTPUT, "weight"), { n_embd, n_vocab }, TENSOR_NOT_REQUIRED);
++    output = create_tensor(tn(LLM_TENSOR_OUTPUT, "weight"), { n_embd, n_vocab_out }, TENSOR_NOT_REQUIRED);
+     if (output == NULL) {
++        GGML_ASSERT(!d2t && "d2t draft-vocab trim requires its own output.weight");
+         output = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, TENSOR_DUPLICATED);
+     }
+ 
+@@ -457,6 +469,22 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
+ 
+     cur = build_lora_mm(model.output, cur, model.output_s);
+     cb(cur, "result_output", -1);
++
++    if (model.d2t) {
++        // sprid de komprimerade logitsen till full vokabularform (ovriga -inf), sa att
++        // sampling/verifiering aldrig behover veta att utkastet bara poangsatte en delmangd
++        const int64_t n_draft_vocab = cur->ne[0];
++        const int64_t n_outputs     = cur->ne[1];
++        const int64_t n_vocab_full  = (int64_t) model.vocab.n_tokens();
++        GGML_ASSERT(model.d2t->type == GGML_TYPE_I64);
++        GGML_ASSERT(model.d2t->ne[0] == n_draft_vocab);
++        ggml_tensor * logits = ggml_fill(ctx0, ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, 1, n_vocab_full, n_outputs), -INFINITY);
++        cur = ggml_set_rows(ctx0, logits,
++                ggml_reshape_3d(ctx0, cur,       1,             n_draft_vocab, n_outputs),
++                ggml_reshape_3d(ctx0, model.d2t, n_draft_vocab, 1,             1));
++        cur = ggml_reshape_2d(ctx0, cur, n_vocab_full, n_outputs);
++        cb(cur, "result_output_d2t", -1);
++    }
+     res->t_logits = cur;
+ 
+     ggml_build_forward_expand(gf, cur);
+-- 
+2.53.0
+

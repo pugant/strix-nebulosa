@@ -113,15 +113,58 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
     const int      trunk_flags = mtp_only ? TENSOR_NOT_REQUIRED : 0;
     const int      mtp_flags   = mtp_only ? 0 : TENSOR_SKIP;
 
+    // FR-Spec-style draft-vocab trim (samma d2t-konvention som EAGLE3): en MTP-only sidovagn
+    // kan bara ha huvudet over en frekvensrankad delmangd av vokabularen. Riktiga stammar har
+    // aldrig d2t, sa detta ar en no-op overallt utom for en medvetet trimmad sidovagn.
+    int64_t n_vocab_out = n_vocab;
+    const struct ggml_tensor * d2t_meta = ml.get_tensor_meta("d2t");
+    if (mtp_only && d2t_meta) {
+        if (d2t_meta->ne[0] == n_vocab) {
+            // invers karta: t2d[v] = komprimerad rad for v, eller n_draft (sentinel) om v saknas
+            const struct ggml_tensor * out_meta = ml.get_tensor_meta("output.weight");
+            GGML_ASSERT(out_meta && "t2d-trim kraver eget output.weight");
+            n_vocab_out = out_meta->ne[1];
+            d2t = create_tensor(tn(LLM_TENSOR_D2T), { n_vocab }, 0);
+            LLAMA_LOG_INFO("%s: QWEN4EXP MTP using t2d (inverse) draft-vocab trim (n_vocab_out = %lld)\n", __func__, (long long) n_vocab_out);
+        } else {
+            n_vocab_out = d2t_meta->ne[0];
+            d2t = create_tensor(tn(LLM_TENSOR_D2T), { n_vocab_out }, 0);
+            LLAMA_LOG_INFO("%s: QWEN4EXP MTP using d2t draft-vocab trim (n_vocab_out = %lld)\n", __func__, (long long) n_vocab_out);
+        }
+    }
+
     tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, 0);
+
+    // [w7-1] the grouped-RMSNorm gammas ship flat [hc_dim] in the GGUF. Re-chunking the
+    // metadata to the stream layout [n_embd, hc] (same contiguous storage, same bytes)
+    // lets the graph builder apply each gamma straight on the normed [n_embd, hc, T]
+    // tensor: RMS_NORM+MUL then fuse in the cpu/vulkan matchers, instead of paying the
+    // MUL as its own dispatch after a flat reshape (which also broke adjacency).
+    auto rechunk_hc_gamma = [n_embd, hc](ggml_tensor * w) {
+        if (w == nullptr) {
+            return;
+        }
+        if (w->ne[0] == n_embd && w->ne[1] == hc) {
+            return; // already chunked (e.g. a GGUF re-exported by this build)
+        }
+        GGML_ASSERT(w->ne[0] == n_embd * hc && w->ne[1] == 1 && w->ne[2] == 1 && w->ne[3] == 1);
+        GGML_ASSERT(w->nb[0] == ggml_type_size(w->type) && w->nb[1] == w->nb[0] * w->ne[0]);
+        w->ne[0] = n_embd;
+        w->ne[1] = hc;
+        w->nb[1] = w->nb[0] * n_embd;
+        w->nb[2] = w->nb[1] * hc;
+        w->nb[3] = w->nb[2];
+    };
 
     // there is no output_norm: the final hyper-connection mixer carries it
     output_hc_norm = create_tensor(tn(LLM_TENSOR_OUTPUT_HC_NORM, "weight"), { hc_dim }, 0);
+    rechunk_hc_gamma(output_hc_norm);
     output_hc_down = create_tensor(tn(LLM_TENSOR_OUTPUT_HC_DOWN, "weight"), { hc_dim, hc_lr }, 0);
     output_hc_up   = create_tensor(tn(LLM_TENSOR_OUTPUT_HC_UP,   "weight"), { hc_lr, hc_dim }, 0);
 
-    output = create_tensor(tn(LLM_TENSOR_OUTPUT, "weight"), { n_embd, n_vocab }, TENSOR_NOT_REQUIRED);
+    output = create_tensor(tn(LLM_TENSOR_OUTPUT, "weight"), { n_embd, n_vocab_out }, TENSOR_NOT_REQUIRED);
     if (output == NULL) {
+        GGML_ASSERT(!d2t && "d2t draft-vocab trim requires its own output.weight");
         output = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, TENSOR_DUPLICATED);
     }
 
@@ -184,10 +227,12 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
 
         // two HC modules per layer: before the token mixer, before the MoE
         layer.hc_attn_norm   = create_tensor(tn(LLM_TENSOR_HC_ATTN_NORM,   "weight", il), { hc_dim }, flags);
+        rechunk_hc_gamma(layer.hc_attn_norm);
         layer.hc_attn_down   = create_tensor(tn(LLM_TENSOR_HC_ATTN_DOWN,   "weight", il), { hc_dim, hc_lr }, flags);
         layer.hc_attn_up     = create_tensor(tn(LLM_TENSOR_HC_ATTN_UP,     "weight", il), { hc_lr, hc_dim }, flags);
         layer.hc_attn_inject = create_tensor(tn(LLM_TENSOR_HC_ATTN_INJECT, "weight", il), { hc_dim, hc }, flags);
         layer.hc_ffn_norm    = create_tensor(tn(LLM_TENSOR_HC_FFN_NORM,    "weight", il), { hc_dim }, flags);
+        rechunk_hc_gamma(layer.hc_ffn_norm);
         layer.hc_ffn_down    = create_tensor(tn(LLM_TENSOR_HC_FFN_DOWN,    "weight", il), { hc_dim, hc_lr }, flags);
         layer.hc_ffn_up      = create_tensor(tn(LLM_TENSOR_HC_FFN_UP,      "weight", il), { hc_lr, hc_dim }, flags);
         layer.hc_ffn_inject  = create_tensor(tn(LLM_TENSOR_HC_FFN_INJECT,  "weight", il), { hc_dim, hc }, flags);
@@ -223,6 +268,9 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
             layer.ple_norm_key   = create_tensor(tn(LLM_TENSOR_PLE_NORM_KEY,   "weight", il), { hc_dim }, flags);
             layer.ple_norm_query = create_tensor(tn(LLM_TENSOR_PLE_NORM_QUERY, "weight", il), { hc_dim }, flags);
             layer.ple_norm_conv  = create_tensor(tn(LLM_TENSOR_PLE_NORM_CONV,  "weight", il), { hc_dim }, flags);
+            rechunk_hc_gamma(layer.ple_norm_key);
+            rechunk_hc_gamma(layer.ple_norm_query);
+            rechunk_hc_gamma(layer.ple_norm_conv);
             layer.ple_conv1d     = create_tensor(tn(LLM_TENSOR_PLE_CONV1D,     "weight", il), { hparams.ple_conv_kernel, hc_dim }, flags);
         }
 
@@ -248,6 +296,7 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
 
         layer.nextn.enorm   = create_tensor(tn(LLM_TENSOR_NEXTN_ENORM,   "weight", il), { n_embd }, mtp_flags);
         layer.nextn.hnorm   = create_tensor(tn(LLM_TENSOR_NEXTN_HNORM,   "weight", il), { hc_dim }, mtp_flags);
+        rechunk_hc_gamma(layer.nextn.hnorm);
         layer.nextn.eh_proj = create_tensor(tn(LLM_TENSOR_NEXTN_EH_PROJ, "weight", il), { 2 * n_embd, n_embd }, mtp_flags);
 
         // qwen4exp sets mtp_use_dedicated_embeddings=false, so these are absent and the
@@ -280,9 +329,13 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
 
     // grouped RMSNorm: reduce over one stream, then scale all streams with the [hc_dim] gamma
     // the converter folded each gamma to (1 + w)
+    // [w7-1] w_norm arrives re-chunked to [n_embd, hc] (loader), so the gamma multiplies
+    // the normed streams in place and RMS_NORM+MUL fuse in the cpu/vulkan matchers; the
+    // flat [hc_dim, nt] relabel the consumers want moves after the mul. Bit-exact: the
+    // pairing gamma[k] <-> element k is unchanged and the relabel preserves storage order.
     ggml_tensor * xn = ggml_rms_norm(ctx0, x, hparams.f_norm_rms_eps);
-    xn = ggml_reshape_2d(ctx0, xn, hc_dim, nt);
     xn = ggml_mul(ctx0, xn, w_norm);
+    xn = ggml_reshape_2d(ctx0, xn, hc_dim, nt);
     cb(xn, "hc_norm", il);
 
     ggml_tensor * lo = build_lora_mm(w_down, xn);
@@ -505,6 +558,12 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     ggml_set_input(inp->h);
     ggml_set_name(inp->h, "mtp_h_input");
 
+    // CIRU H121: the continuation step rewrites these inputs after the graph ran; without
+    // the output flag the allocator may recycle their storage between steps (side fault on
+    // HIP, silent scrape on Vulkan -> non-deterministic drafts).
+    ggml_set_output(inp->tokens);
+    ggml_set_output(inp->h);
+
     ggml_tensor * tok_embd_w = layer.nextn.embed_tokens ? layer.nextn.embed_tokens : model.tok_embd;
     ggml_tensor * tok_embd   = ggml_get_rows(ctx0, tok_embd_w, inp->tokens);
     cb(tok_embd, "mtp_tok_embd", il);
@@ -521,10 +580,10 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
 
     // grouped RMSNorm over the wide stream: normalise each hc stream, then scale the flattened
     // [hc_dim] vector with the head's gamma, exactly as build_hc_mix does
+    // [w7-1] the gamma multiplies the normed streams in place ([n_embd, hc] re-chunk at load),
+    // so RMS_NORM+MUL fuse and the flat relabels around the old 2d mul collapse away
     ggml_tensor * h_norm = ggml_rms_norm(ctx0, h_state, hparams.f_norm_rms_eps);
-    h_norm = ggml_reshape_2d(ctx0, h_norm, hc_dim, n_tokens);
     h_norm = ggml_mul(ctx0, h_norm, layer.nextn.hnorm);
-    h_norm = ggml_reshape_3d(ctx0, h_norm, n_embd, hc, n_tokens);
     cb(h_norm, "mtp_hnorm", il);
 
     // the token embedding is shared across the streams, so broadcast it to hc copies
@@ -647,6 +706,33 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     GGML_ASSERT(head_w && "QWEN4EXP MTP: missing LM head (nextn.shared_head_head or model.output)");
 
     cur = build_lora_mm(head_w, cur, head_s);
+
+    if (model.d2t && model.d2t->ne[0] == (int64_t) model.vocab.n_tokens()) {
+        // FR-Spec, invers karta (t2d): samla fulla logits med get_rows ur [n_out, n_draft+1], sista raden -inf
+        const int64_t n_outputs    = cur->ne[1];
+        const int64_t n_vocab_full = (int64_t) model.vocab.n_tokens();
+        GGML_ASSERT(model.d2t->type == GGML_TYPE_I32);
+        ggml_tensor * ct   = ggml_cont(ctx0, ggml_transpose(ctx0, cur));                                   // [n_out, n_draft]
+        ggml_tensor * sent = ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_outputs, 1), -INFINITY); // [n_out, 1]
+        ggml_tensor * ext  = ggml_concat(ctx0, ct, sent, 1);                                               // [n_out, n_draft+1]
+        ggml_tensor * full = ggml_get_rows(ctx0, ext, model.d2t);                                          // [n_out, n_vocab]
+        cur = ggml_cont(ctx0, ggml_transpose(ctx0, full));                                                 // [n_vocab, n_out]
+        GGML_ASSERT(cur->ne[0] == n_vocab_full && cur->ne[1] == n_outputs);
+        cb(cur, "result_output_t2d", -1);
+    } else if (model.d2t) {
+        // FR-Spec, d2t: sprid de komprimerade logitsen till full vokabularform (ovriga -inf) med set_rows
+        const int64_t n_draft_vocab = cur->ne[0];
+        const int64_t n_outputs     = cur->ne[1];
+        const int64_t n_vocab_full  = (int64_t) model.vocab.n_tokens();
+        GGML_ASSERT(model.d2t->type == GGML_TYPE_I64 || model.d2t->type == GGML_TYPE_I32);
+        GGML_ASSERT(model.d2t->ne[0] == n_draft_vocab);
+        ggml_tensor * fulla = ggml_fill(ctx0, ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, 1, n_vocab_full, n_outputs), -INFINITY);
+        cur = ggml_set_rows(ctx0, fulla,
+                ggml_reshape_3d(ctx0, cur,       1,             n_draft_vocab, n_outputs),
+                ggml_reshape_3d(ctx0, model.d2t, n_draft_vocab, 1,             1));
+        cur = ggml_reshape_2d(ctx0, cur, n_vocab_full, n_outputs);
+        cb(cur, "result_output_d2t", -1);
+    }
     cb(cur, "result_output", -1);
     res->t_logits = cur;
 
@@ -1203,9 +1289,12 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
     cb(beta, "beta_sigmoid", il);
 
     ggml_tensor * alpha = build_lora_mm(model.layers[il].ssm_alpha, cur, model.layers[il].ssm_alpha_s);
-    alpha = ggml_reshape_3d(ctx0, alpha, num_v_heads, n_seq_tokens, n_seqs);
     cb(alpha, "alpha", il);
 
+    // [w7-1] the [num_v_heads, n_seq_tokens, n_seqs] relabel used to sit between the
+    // matmul and the bias add, which blocked the MUL_MAT+ADD mat-vec fusion. The
+    // add/softplus/mul are layout-agnostic (ssm_dt / ssm_a broadcast over the row
+    // either way) and the closing reshape_4d restores the exact shape the mixer asserts.
     ggml_tensor * alpha_biased   = ggml_add(ctx0, alpha, model.layers[il].ssm_dt);
     ggml_tensor * alpha_softplus = ggml_softplus(ctx0, alpha_biased);
     cb(alpha_softplus, "a_softplus", il);
@@ -1615,12 +1704,13 @@ ggml_tensor * llama_model_qwen4exp::graph::build_ple(
     ggml_tensor * value = build_lora_mm(model.layers[il].ple_value, emb);
 
     // both norms group over one hc stream, with a weight over the whole hc*n_embd layout
+    // [w7-1] the gammas arrive re-chunked to [n_embd, hc] (loader): the mul lands directly
+    // on the normed streams (RMS_NORM+MUL fuses) and the flat relabels around it collapse
     auto grouped_norm = [&](ggml_tensor * x, ggml_tensor * w) {
         ggml_tensor * t = ggml_reshape_3d(ctx0, x, n_embd, hc, n_tokens);
         t = ggml_rms_norm(ctx0, t, hparams.f_norm_rms_eps);
-        t = ggml_reshape_2d(ctx0, t, hc_dim, n_tokens);
         t = ggml_mul(ctx0, t, w);
-        return ggml_reshape_3d(ctx0, t, n_embd, hc, n_tokens);
+        return t;
     };
 
     key = grouped_norm(key, model.layers[il].ple_norm_key);

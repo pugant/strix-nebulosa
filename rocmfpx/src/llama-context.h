@@ -380,7 +380,34 @@ private:
     std::vector<ggml_backend_buffer_type_t> backend_buft;
     std::vector<size_t>                     backend_buf_exp_size; // expected buffer sizes
 
-    llm_graph_result_ptr gf_res_prev;
+    // W6-9 (A2-C2): k-slot cache of llm_graph_result objects. Exactly one slot
+    // can be "current" — the one whose graph the scheduler has allocated.
+    // compute_splits() runs whatever the sched last allocated (the gf argument
+    // is ignored when is_alloc is set), and allocating any other graph leaves
+    // the cached tensors' data pointers stale, so a cache hit on a non-current
+    // slot re-binds it (sched reset + alloc_graph), skipping only the graph
+    // construction (reset + build_graph). The full llm_graph_result::can_reuse
+    // predicate stays the single source of truth for reuse — the slot lookup
+    // only routes the request and never widens the predicate.
+    struct gf_res_slot {
+        llm_graph_result_ptr res;
+        // rev-2: as-built topology snapshot. ggml_backend_sched_split_graph
+        // mutates the user graph in place: node->src[j] is replaced by the
+        // cross-backend copy tensors (created in sched->ctx, which is freed and
+        // re-initialized at EVERY split_graph call), and the backend graph
+        // optimizer (e.g. ggml_vk_graph_optimize) reorders nodes[] through the
+        // split views. A cached graph therefore cannot be re-bound as it is —
+        // its topology must be restored to the state it had right after
+        // build_graph, before the next split.
+        std::vector<ggml_tensor *> built_nodes;                // [n_nodes]
+        std::vector<ggml_tensor *> built_srcs;                 // [n_nodes * GGML_MAX_SRC]
+        uint64_t             lru = 0; // 0 = never used, otherwise a stamp from gf_res_lru_clock
+    };
+    std::vector<gf_res_slot> gf_res_cache; // slot 0 always exists after sched_reserve(), the rest are created lazily up to the cap
+    int32_t                  gf_res_cur = -1; // cache slot whose graph the sched currently has allocated (-1 = none)
+    uint64_t                 gf_res_lru_clock = 0;
+    int64_t                  graph_cache_max_nodes = 0;
+
     llm_graph_result_ptr gf_res_reserve;
 
     // host buffer for the model output (logits and embeddings)
@@ -394,8 +421,26 @@ private:
     // env: LLAMA_GRAPH_REUSE_DISABLE
     bool graph_reuse_disable = false;
 
+    // env: LLAMA_GRAPH_CACHE_SLOTS (W6-9: k-slot graph-result cache; 0 or 1 selects
+    // the legacy single-slot behavior, for same-binary A/B and runtime rollback).
+    // REV-2: default flipped to legacy (1) after the cell crash — see the
+    // re-bind scrub in process_ubatch; the cache is strictly opt-in until the
+    // cells re-pass.
+    int32_t graph_cache_slots = 1;
+
     // env: LLAMA_GRAPH_BUILD_TIMING
     bool graph_build_timing = false;
+
+    // drop all cache slots and re-create slot 0 with the given capacity (the sched is being re-created)
+    void graph_cache_reinit(int64_t max_nodes);
+    // reset every slot's result so that nothing can be reused (the sched was reset externally)
+    void graph_cache_reset_all();
+    // rev-2: clear the gallocr-assigned buffer/data pointers from a cached graph's
+    // tensors before re-binding it (see the comment at the definition)
+    void graph_result_scrub_allocation(llm_graph_result * res);
+    // rev-2: restore a cached graph's as-built topology (nodes order + src links,
+    // undoing the split mutations) and scrub its allocation state
+    void graph_result_restore_built(gf_res_slot & slot);
 
     // perf
     mutable int64_t t_start_us  = 0;
@@ -404,6 +449,7 @@ private:
     mutable int64_t t_eval_us   = 0;
     mutable int64_t t_graph_build_us   = 0;
     mutable int64_t t_graph_rebuild_us = 0;
+    mutable int64_t t_graph_rebind_us  = 0;
 
     mutable int64_t t_compute_start_us = 0;
     mutable int64_t n_queued_tokens    = 0;
@@ -413,4 +459,7 @@ private:
 
     mutable int32_t n_reused = 0; // number of times the previous graph was reused
     mutable int32_t n_graph_builds = 0; // number of graph rebuilds after reuse misses
+    mutable int32_t n_cache_hits = 0; // W6-9: graph reuses served from the k-slot cache (includes slot-1-style hits)
+    mutable int32_t n_cache_rebinds = 0; // W6-9: of which needed a sched reset + alloc (non-current slot)
+    mutable int32_t n_cache_evicts = 0; // W6-9: warm slots dropped for a new key (LRU)
 };

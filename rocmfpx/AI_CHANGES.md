@@ -433,6 +433,118 @@ byte 2: v2[5:4] | v3[5:0]<<2
 
 **Verification:** bit-exact vs base `482d84333` (same harness both sides): 10/10 logits hashes + full state hash identical; 6.158/6.169 named tensor instances identical (the 11 diffs are the GDN fused result's never-read unwritten snapshot tail, proven by the matching cache writes). CONT per trunk eval 96→12, drafter 4→1, CPY unchanged (structural ring writes). Artifacts: `logs/wave6/w6m2-attribuzione.txt`, dumps and hashes alongside. VK build rc=0.
 
+## Session 009b — 2026-09-10 (W6-9 gradino-2, A2-C2; rinumerato da 009 nel cherry-pick W7-3 su w7p3)
+
+**Scope:** k-slot cache of `llm_graph_result` in `llama_context` (wave-6 card W6-9 / A2-C2). The MTP round alternates graph keys inside one context (verify `n=d+1` all-outputs -> plain `n=1` on the target; process -> step on the drafter), so the legacy single slot (`gf_res_prev`) missed almost every eval (measured 4-4.5 rebuilds / 7.7 evals per round). Base `optim-w6` @ `482d84333`, branch `optim-w6-c9`.
+
+### `src/llama-context.h`
+
+| Fix | Line(s) | Detail |
+|-----|---------|-------|
+| Cache members | ~383-427 | `gf_res_prev` replaced by `gf_res_cache` (slot 0 always exists after `sched_reserve()`, extra slots created lazily up to the cap), `gf_res_cur` (slot whose graph the sched currently has allocated), LRU clock, `graph_cache_max_nodes`, `graph_cache_slots` (env `LLAMA_GRAPH_CACHE_SLOTS`), helpers `graph_cache_reinit` / `graph_cache_reset_all`, perf counters `n_cache_hits` / `n_cache_rebinds` / `n_cache_evicts` + `t_graph_rebind_us`. |
+
+### `src/llama-context.cpp`
+
+| Fix | Line(s) | Detail |
+|-----|---------|-------|
+| Env flag | ~250-267 | `LLAMA_GRAPH_CACHE_SLOTS` parsed in the ctor (clamped to [1, `LLAMA_GRAPH_CACHE_SLOTS_MAX`=8]); 0/1 = legacy single-slot behavior (same-binary A/B, runtime rollback). |
+| Slot lifecycle | ~490-520 | `graph_cache_reinit()` (sched re-created: drop all slots, re-create slot 0) called from `sched_reserve()`; `graph_cache_reset_all()` replaces the single-slot `gf_res_prev->reset()` at the two external-sched-reset sites (`memory_update`, `graph_reserve`) and at the top of the training path (`opt_epoch_iter` builds into slot 0). |
+| Cache logic | ~1429-1600 | `process_ubatch`: warm slots tried most-recently-used first, each with the UNMODIFIED `llm_graph_result::can_reuse` predicate (the slot lookup only routes, it never widens the predicate). Hit on the current slot = legacy fast path (no sched work). Hit on a non-current slot = re-bind: `sched_reset` + `alloc_graph(cached_gf)` (the sched runs whatever it last allocated — `compute_splits` ignores the passed gf while `is_alloc` is set — and the cached tensors' data pointers went stale when another graph was allocated), skipping only `reset` + `build_graph`. Miss = LRU victim (or lazy new slot); rebuild as before. `pipeline_parallel` synchronize covers the re-bind too. |
+| Perf | ~3684-3725 | `perf_print_graph_build_data` also prints `graph cache slots = used / cap`, `graph cache hits (rebinds, evictions)` and rebind timing; `perf_reset` clears them. Early-return condition extended so a pure-hit run still prints. Eviction counter only counts warm slots dropped while other slots exist (single-slot misses are the legacy rebuild). |
+
+**Gate N (bit-exact of construction)**: harness `logs/wave6/w6c9/w6c9-cache-harness.cpp` + driver `run-gate.sh` (outside the repo, modeled on `tests/test-llama-archs.cpp`): seeded tiny llama fixture, CPU-only, MTP-shaped key alternation with a 5-key working set, two invalidation phases (sched re-reserve via `llama_set_sampler`, full KV clear via `llama_memory_seq_rm`). All per-eval output hashes identical for k=0 vs k=2 vs k=3 (two seeds); counters: k=0 = 25 rebuilds / 0 rebinds (legacy parity), k=3 = 14 rebuilds / 16 hits / 11 rebinds / 8 evictions. `GATE-N: PASS` (`logs/wave6/w6c9/gate-output.txt`). Memory: 15.86 MiB per slot at the prod `max_nodes` = 39168 (`ggml_tensor_overhead()` = 368 B measured in the builder container).
+## Session 010 — 2026-09-10
+
+**Scope:** W7-5 — per-request pi path S3/S4 residuals: census + tokenizer bit-identical optimisations (card docs/research/wave7/w7p5-report.md).
+
+### `src/llama-vocab.cpp`
+
+| Fix | Line(s) | Detail |
+|-----|---------|--------|
+| bigram text | ~274 | `llm_bigram_bpe` no longer carries `std::string text`; stale entries detected from symbol sizes (`left.n + right.n != bigram.size`), the same pattern as `llm_bigram_spm`. Symbol text pointers never move and `n` never shrinks, so the size check is exactly equivalent to the old concatenation compare. Kills ~13 heap allocations per merge |
+| pop-loop | ~646 | drop the per-merge `left_token`/`right_token` constructions and concatenation check |
+| add_new_bigram | ~724 | rank lookups go through member scratch strings (SSO covers BPE pieces): no allocation per call |
+| final lookup | ~688 | reused `str.assign` instead of a fresh `std::string` per output token |
+| queue reset | ~608 | `llama_priority_queue::clear()` keeps the vector storage across words |
+
+### `src/unicode.cpp`
+
+| Fix | Line(s) | Detail |
+|-----|---------|--------|
+| byte encode | ~196 | `unicode_byte_encoding_process`: removed the per-word decode->re-encode round-trip (words are concatenations of `unicode_cpt_to_utf8`, valid UTF-8 by construction, so the round-trip reproduced the same bytes) |
+| byte table | ~1161 | `unicode_byte_to_utf8`: flat 256-entry table instead of a per-call `unordered_map` lookup |
+
+### `tests/`
+
+| Fix | Detail |
+|-----|--------|
+| new gate | `test-per-request-path.cpp` + CMake wiring: offline census/bit-identity harness for the server per-request path (json::parse -> chat params -> template apply -> prefix-cache tokenize -> task params) with per-component timings and sha256 of prompt/token streams |
+
+**Verification:** token bit-identity 16/16 real pi prompts (T12 rounds), pre-change == post-change == pinned Python tokenizer (staging-w7/tokenizer-trunk); formatted-text sha unchanged 16/16; test-tokenizer-0 15/15 vocabs; test-token-prefix-cache (qwen35 + pi corpus 16/16, gpt2, spm) and test-chat-template-cache (62 templates / 3720 applies / 0 fail) all PASS. Tokenize full 741->412 ms on the 412 KB pi corpus (1.8x), steady splice 2.5x; llama-server builds rc=0. Artifacts: logs/wave7/w7p5-*.
+
+
+
+## Session 009c — 2026-09-10 (W6-9 gradino-2 rev-2: multi-backend re-bind fix + default flip; rinumerato per deduplica 010 nel merge wave-7)
+
+**Scope:** the W6-9 cells crashed the server on the real VK path with the cache enabled (k=3 default): `ggml_abort ← ggml_backend_sched_backend_id_from_cur ← split_graph ← alloc_graph ← process_ubatch`, message `pre-allocated tensor (attn_inp_kq_mask (copy)) in a buffer (Vulkan0) that cannot run the operation (CPY)` (`logs/wave6/w6c9c-slot3-r1.log`). Root cause analysis + fix + default flip to legacy. Perimeter still `src/llama-context.{h,cpp}` only.
+
+**Root cause (two in-place mutations of the user graph by the allocation path, verified in `ggml-backend.cpp`/`ggml-alloc.c`):** a cached `llm_graph_result` holds the graph as it was LEFT by its last allocation, not as built —
+1. `ggml_backend_sched_split_graph` replaces `node->src[j]` with its cross-backend copy tensors, created in `sched->ctx`, which split_graph **frees and re-initializes at every call** (`ggml-backend.cpp:1266-1268`) — the cached graph's srcs dangle into freed/reused memory;
+2. the backend graph optimizer (`ggml_vk_graph_optimize`) reorders `gf->nodes[]` through the split views;
+3. the tensors keep their gallocr-assigned `buffer`/`data`, which `ggml_gallocr_init_tensor` would NOT re-assign (`data != NULL` skip) and which `backend_id_from_cur` probes as pre-allocated (the cell abort).
+A fresh build never sees this because freshly built tensors have `buffer == data == NULL` and pristine links.
+
+### `src/llama-context.h`
+
+| Fix | Detail |
+|-----|-------|
+| Default flip | `graph_cache_slots` default 3 → 1 (legacy). The cache is strictly opt-in (`LLAMA_GRAPH_CACHE_SLOTS >= 2`) until the cells re-pass; a default can never crash. |
+| Slot snapshot | `gf_res_slot` gains `built_nodes` / `built_srcs` (as-built topology, ~0.9 MB per slot at 10k nodes) + `graph_result_restore_built()`. |
+
+### `src/llama-context.cpp`
+
+| Fix | Detail |
+|-----|-------|
+| Snapshot | taken in the miss path right after `model.build_graph()` and BEFORE `ggml_backend_sched_alloc_graph` (the mutation point): node order + all `src[]` links, via public API (`ggml_graph_nodes`). |
+| Re-bind restore | `graph_result_restore_built()` puts the cached graph back to the exact as-built state (nodes order, src links, `buffer`/`data` scrubbed to NULL for every tensor in the result's ggml context — weights/KV/cross tensors are not in that context and keep their persistent buffers), then `sched_reset` + `alloc_graph` as before. The re-bind now goes through exactly the same split+alloc a fresh build would. |
+
+**Repro + gate**: the crash is reproducible in the builder container with zero GPU via lavapipe (`VK_ICD_FILENAMES=lvp_icd...`, `GGML_VK_VISIBLE_DEVICES=0`) + CPU — pre-fix: abort at the FIRST rebind (`repro-prefix-k3.*`: rms_norm shape assert — the dangling-src manifestation; the RADV cell aborted earlier on the stale-buffer probe — same root). Post-fix gate (`logs/wave6/w6c9/gate-output.txt`): all arms bit-exact incl. the multi-backend arm (hashes k=0 ≡ k=3 on [VK-lvp, CPU], 25→14 rebuilds, 11 rebinds, 8 evictions); default without env = legacy (1 slot, 0 rebinds) on the same topology.
+## Session 011 — 2026-09-10 (W7-4 FR-Spec; rinumerato da 010 nel rebase su optim-w7 con W7-5) — 2026-09-10
+
+**Scope:** W7-4 FR-Spec — port of the 5-commit d2t series from the drluoto reference clone (`staging-w7-frspec-ref` @ `fb367b8cf2cf`) onto `w7p4` (= optim-w6 `f37da5c0c`): draft-vocab trim for the qwen4exp MTP sidecar. Tooling (map builder, trim wrapper, gate scripts) lives OUTSIDE the repo in the workspace (`scripts/w7p4-*`, `staging-w7/w7p4-*`), per wave convention.
+
+### `src/models/qwen4exp.cpp`
+
+| Fix | Line(s) | Detail |
+|-----|---------|--------|
+| d2t/t2d loader | load_arch_tensors | `d2t` meta-gated branch: forward map (len = n_draft rows) sizes `output.weight` to `n_vocab_out`; inverse map (len = n_vocab, I32) reads n_draft from `output.weight` ne[1]; assert when output falls back to a duplicated token_embd |
+| MTP inputs as graph outputs | graph_mtp ctor | `ggml_set_output(inp->tokens/.h)` after `mtp_h_input` naming (CIRU H121: continuation step rewrites them; allocator could recycle storage between steps) |
+| FR-Spec spread | graph_mtp head | after `build_lora_mm(head_w, ...)`: t2d inverse-gather (get_rows over [n_out, n_draft+1] with -inf sentinel row) or d2t forward scatter (`ggml_set_rows` into a -inf-filled full-vocab tensor), then `result_output` cb; TRUNK graph left untouched (the draft never runs it) |
+
+**Port notes (per commit, full detail in `docs/research/wave7/w7p4-report.md`):** `7a3aa1dd5` (f01e30e42) and `6b7713dd6` (dfcaeb160) auto-merged clean (anchor rename `tf`→`trunk_flags`/`mtp_flags` absorbed); `cd9c998b0` (e0b617b71) auto-merged clean; `ff146108d` (53aef6bac) and `ebb3def77` (d786226ef) conflicted on the ref's divergent graph_mtp (dsv4 lineage) — resolved by keeping OUR graph_mtp and applying only the semantic change by hand; the trunk-graph deletion side of `ebb3def77` auto-merged. Series net on our tree +55/−1, identical to the reference series. Interaction with W6-2 copy-elim: none — W6-2 touches build_hc_mix/QSA/conv/PLE helpers, disjoint regions. No files outside `qwen4exp.cpp` were needed (`LLM_TENSOR_D2T` + `llama_model::d2t` already exist upstream for EAGLE3/dflash).
+
+**Verification:** build in container `docker-llm-service:w2-vk-builder` rc=0 (`logs/wave7/w7p4-build.{log,err,rc}`); artifact gates 5/5 PASS (`logs/wave7/w7p4-sidecar-gates.txt`); gate N: see `docs/research/wave7/w7p4-report.md`.
+
+
+## Session 012 — 2026-09-10 (W7-1 fusione EW host-side)
+
+**Scope:** W7-1 (wave-7 Task 4) — fuse adjacent element-wise chains in the qwen4exp graph-builder where the cpu/vulkan matchers don't fire, unblocking EXISTING fusions only (no shader changes). Census first (W6-2 per-node dump + matcher simulation, `logs/wave7/w7p1-census.{py}` + report §1): the grouped-RMSNorm `rms_norm → reshape(flat) → mul` chain missed `RMS_NORM_MUL` at every hyper-connection mix (2/layer + final + drafter + 3 PLE sites) because the flat gamma relabel sat between the two ops; the GDN alpha `mul_mat → reshape(id) → add` missed `MUL_MAT_ADD` (mat-vec) the same way.
+
+### `src/models/qwen4exp.cpp`
+
+| Fix | Line(s) | Detail |
+|-----|---------|--------|
+| Gamma re-chunk at load | load_arch_tensors | `rechunk_hc_gamma` helper: metadata-only `[hc_dim] → [n_embd, hc]` for `output_hc_norm`, per-layer `hc_attn_norm`/`hc_ffn_norm`, `nextn.hnorm`, `ple_norm_{key,query,conv}` (same contiguous storage; asserts type/contiguity; null- and already-chunked-safe). Weights stay LEAFs so no relabel node interleaves. |
+| hc mix mul in place | `build_hc_mix` | gamma multiplies the normed `[n_embd, hc, T]` tensor directly (broadcast over T); the flat `[hc_dim, nt]` relabel moves AFTER the mul → RMS_NORM+MUL adjacent, same shape, f32, contiguous ⇒ fusion fires on VK (and on CPU via `ggml_cpu_try_fuse_ops`). |
+| drafter hnorm | `graph_mtp` ctor | mul directly on the normed streams; the two flat relabels collapse (consumer concat already wants `[n_embd, hc, T]`). |
+| PLE grouped norm | `build_ple` `grouped_norm` | mul lands straight on the normed `[n_embd, hc, T]`; inner flat relabels dropped. |
+| GDN alpha | `build_layer_attn_linear` | early identity `reshape_3d` between the `ssm_alpha` matmul and the `ssm_dt` bias add dropped; the closing `reshape_4d` already restores the mixer's shape; add/softplus/mul broadcast identically either way. |
+
+**Bit-exactness (read from both matcher implementations before claiming):** VK `rms_norm.comp` `do_multiply` is the same shader with the same sum-of-squares reduction and the same left-to-right `(scale·a)·b` association (D_TYPE=f32 round-trip lossless); VK mat-vec `MAT_VEC_FUSION_FLAGS_BIAS0` adds the bias in-register after the identical dot accumulation; CPU fused template computes the same `(x·scale)·w` as unfused vec_scale+mul with the identical double accumulator. Broadcast pairing `gamma[k] ↔ element k` unchanged by the relabel move (row-major order preserved).
+
+**Known boundary:** `llama_model_save_to_file` on a patched build writes the gammas already chunked (`[n_embd, hc]`); the loader's strict per-dim check rejects them (patched or not). No in-tree consumer saves qwen4exp (`test-llama-archs` skips the arch; quantizer works at loader/GGUF level, untouched).
+
+**Verification:** gate N (W6-2 §3 pattern, `staging-w7/w7p1-gateN.sh`), VK build + interleaved cells (`staging-w7/w7p1-{build,base-build,celle}.sh`) — outcomes in `docs/research/wave7/w7p1-report.md` §3-§5.
 
 <!-- TEMPLATE FOR FUTURE AI SESSIONS:
 

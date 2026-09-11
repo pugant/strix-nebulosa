@@ -1,0 +1,27 @@
+From 3911bf4cdae7d69fdd0179c007d481eac98b2e60 Mon Sep 17 00:00:00 2001
+From: pugant <pugant@localhost>
+Date: Thu, 10 Sep 2026 22:43:21 +0200
+Subject: [PATCH 10/15] AI_CHANGES: dedup numerazione sessioni 010 (009c per
+ w6-9 rev-2)
+
+Co-Authored-By: GLM by z.ai <glm@z.ai>
+---
+ AI_CHANGES.md | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/AI_CHANGES.md b/AI_CHANGES.md
+index 7b2f566ed..40748feef 100644
+--- a/AI_CHANGES.md
++++ b/AI_CHANGES.md
+@@ -484,7 +484,7 @@ byte 2: v2[5:4] | v3[5:0]<<2
+ 
+ 
+ 
+-## Session 010 — 2026-09-10 (W6-9 gradino-2 rev-2: multi-backend re-bind fix + default flip)
++## Session 009c — 2026-09-10 (W6-9 gradino-2 rev-2: multi-backend re-bind fix + default flip; rinumerato per deduplica 010 nel merge wave-7)
+ 
+ **Scope:** the W6-9 cells crashed the server on the real VK path with the cache enabled (k=3 default): `ggml_abort ← ggml_backend_sched_backend_id_from_cur ← split_graph ← alloc_graph ← process_ubatch`, message `pre-allocated tensor (attn_inp_kq_mask (copy)) in a buffer (Vulkan0) that cannot run the operation (CPY)` (`logs/wave6/w6c9c-slot3-r1.log`). Root cause analysis + fix + default flip to legacy. Perimeter still `src/llama-context.{h,cpp}` only.
+ 
+-- 
+2.53.0
+

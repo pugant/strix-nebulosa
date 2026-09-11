@@ -1,0 +1,39 @@
+From bcfaf9044b73553bc037c1f331e52334ebf3fc63 Mon Sep 17 00:00:00 2001
+From: pugant <pugant@localhost>
+Date: Thu, 10 Sep 2026 23:01:34 +0200
+Subject: [PATCH 14/15] qwen4exp: drop the early alpha relabel so MUL_MAT+ADD
+ fuses [w7-1]
+
+The GDN alpha path reshaped the ssm_alpha matmul to [num_v_heads,
+n_seq_tokens, n_seqs] before the ssm_dt bias add; for decode (mat-vec) that
+relabel is a pure no-op shape echo that sat between MUL_MAT and ADD and
+blocked the MUL_MAT+ADD fusion. The add/softplus/mul are layout-agnostic
+(ssm_dt / ssm_a broadcast over the row either way) and the closing
+reshape_4d already restores the exact shape the gated-delta mixer asserts.
+
+Co-Authored-By: GLM by z.ai <glm@z.ai>
+---
+ src/models/qwen4exp.cpp | 5 ++++-
+ 1 file changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
+index fadbc4628..f53e7b179 100644
+--- a/src/models/qwen4exp.cpp
++++ b/src/models/qwen4exp.cpp
+@@ -1289,9 +1289,12 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
+     cb(beta, "beta_sigmoid", il);
+ 
+     ggml_tensor * alpha = build_lora_mm(model.layers[il].ssm_alpha, cur, model.layers[il].ssm_alpha_s);
+-    alpha = ggml_reshape_3d(ctx0, alpha, num_v_heads, n_seq_tokens, n_seqs);
+     cb(alpha, "alpha", il);
+ 
++    // [w7-1] the [num_v_heads, n_seq_tokens, n_seqs] relabel used to sit between the
++    // matmul and the bias add, which blocked the MUL_MAT+ADD mat-vec fusion. The
++    // add/softplus/mul are layout-agnostic (ssm_dt / ssm_a broadcast over the row
++    // either way) and the closing reshape_4d restores the exact shape the mixer asserts.
+     ggml_tensor * alpha_biased   = ggml_add(ctx0, alpha, model.layers[il].ssm_dt);
+     ggml_tensor * alpha_softplus = ggml_softplus(ctx0, alpha_biased);
+     cb(alpha_softplus, "a_softplus", il);
+-- 
+2.53.0
+

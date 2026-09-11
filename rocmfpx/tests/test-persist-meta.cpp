@@ -5,12 +5,14 @@
 
 #include "../src/llama-persist-meta.h"
 
+#include <algorithm>
 #include <cassert>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <random>
+#include <utility>
 #include <vector>
 
 #include <unistd.h>
@@ -141,6 +143,75 @@ int main() {
     CHECK(!llama_persist_crc32_file("/tmp/t23-persist-meta-does-not-exist", 1, &sentinel), "missing file rejected");
 
     unlink(tmp_path);
+
+    // --- 3b. W6-5/W6-7 (A3): incremental folder - chunked updates must equal
+    //         the one-shot and the file API for ANY chunking, incl. ragged
+    //         (non 16-multiple) boundaries and empty updates ---
+    {
+        // fixed splits at every boundary type around the fold's 16-byte block
+        const size_t chunks1[] = { 0, 1, 15, 16, 17, 31, blob.size() / 2, blob.size() / 2 }; // ends exactly at EOF if even
+        {
+            llama_persist_crc32_folder f;
+            size_t off = 0;
+            for (size_t c : chunks1) {
+                if (off + c > blob.size()) {
+                    c = blob.size() - off;
+                }
+                f.update(blob.data() + off, c);
+                off += c;
+            }
+            f.update(blob.data(), 0); // empty update is a no-op
+            f.update(blob.data() + off, blob.size() - off);
+            CHECK(f.finalize() == crc_a, "folder: fixed ragged chunking == one-shot");
+        }
+
+        // pseudo-random ragged chunking over a larger buffer
+        std::vector<uint8_t> big(1 << 18);
+        {
+            std::mt19937 rng(31337);
+            std::uniform_int_distribution<int> byte_dist(0, 255);
+            for (auto & b : big) b = (uint8_t) byte_dist(rng);
+        }
+        const uint32_t crc_big = llama_persist_crc32(big.data(), big.size());
+        {
+            llama_persist_crc32_folder f;
+            size_t off = 0;
+            std::mt19937 rng(424242);
+            while (off < big.size()) {
+                std::uniform_int_distribution<size_t> len_dist(1, 33331); // ragged on purpose
+                size_t len = std::min(len_dist(rng), big.size() - off);
+                f.update(big.data() + off, len);
+                off += len;
+            }
+            CHECK(f.finalize() == crc_big, "folder: random ragged chunking == one-shot (256 KiB)");
+        }
+
+        // single-shot through the folder == one-shot API
+        {
+            llama_persist_crc32_folder f;
+            f.update(big.data(), big.size());
+            CHECK(f.finalize() == crc_big, "folder: single update == one-shot");
+        }
+
+        // move-construction/assignment keep the fold state alive
+        {
+            llama_persist_crc32_folder f;
+            f.update(big.data(), big.size() / 2);
+            llama_persist_crc32_folder g = std::move(f);
+            g.update(big.data() + big.size() / 2, big.size() - big.size() / 2);
+            CHECK(g.finalize() == crc_big, "folder: moved handle continues the same stream");
+        }
+
+        // the canonical check-value through the folder
+        {
+            llama_persist_crc32_folder f;
+            const char * chk = "123456789";
+            for (int i = 0; i < 9; i++) {
+                f.update(chk + i, 1); // byte-at-a-time: worst-case chunking
+            }
+            CHECK(f.finalize() == 0xCBF43926u, "folder: check-value byte-at-a-time");
+        }
+    }
 
     // --- 4. eviction score: exact half-life points (fixtures are the
     //        analytic values, eps 1e-9; ds4 semantics: 6h half-life) ---

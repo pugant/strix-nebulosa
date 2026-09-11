@@ -1,0 +1,41 @@
+From 103592153954d3ff19ab2c3bf675692cb767f5f2 Mon Sep 17 00:00:00 2001
+From: M5 merge <jl@lokal>
+Date: Sat, 5 Sep 2026 15:01:15 +0200
+Subject: [PATCH 07/15] qwen4exp: MTP-indata som grafutdata (CIRU H121)
+
+Port of d2t ff146108d [w7-4 step 7.1/5]. DECLARED ADAPTATION: the ref
+side carried its own divergent graph_mtp implementation (dsv4 lineage:
+fc_embd/fc_hidden, n_layer_nextn), textually unrelated to ours (eh_proj,
+nextn_predict_layers, llm_graph_input_embd_h); the cherry-pick conflicted
+on the whole constructor. Resolution: kept OUR graph_mtp and applied only
+the semantic change - ggml_set_output(inp->tokens) and ggml_set_output
+(inp->h) right after the mtp_h_input naming, same relative position as
+the ref. Net diff on our tree: +6 lines, none removed.
+
+(cherry picked from commit ff146108d95b63edd345d0fc20970188cc37ce72)
+
+Co-Authored-By: GLM by z.ai <glm@z.ai>
+---
+ src/models/qwen4exp.cpp | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
+index f4c68d324..7f56e5f70 100644
+--- a/src/models/qwen4exp.cpp
++++ b/src/models/qwen4exp.cpp
+@@ -555,6 +555,12 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
+     ggml_set_input(inp->h);
+     ggml_set_name(inp->h, "mtp_h_input");
+ 
++    // CIRU H121: the continuation step rewrites these inputs after the graph ran; without
++    // the output flag the allocator may recycle their storage between steps (side fault on
++    // HIP, silent scrape on Vulkan -> non-deterministic drafts).
++    ggml_set_output(inp->tokens);
++    ggml_set_output(inp->h);
++
+     ggml_tensor * tok_embd_w = layer.nextn.embed_tokens ? layer.nextn.embed_tokens : model.tok_embd;
+     ggml_tensor * tok_embd   = ggml_get_rows(ctx0, tok_embd_w, inp->tokens);
+     cb(tok_embd, "mtp_tok_embd", il);
+-- 
+2.53.0
+

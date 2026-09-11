@@ -195,18 +195,17 @@ static std::unordered_map<std::string, uint8_t> unicode_utf8_to_byte_map() {
 
 static std::vector<std::string> unicode_byte_encoding_process(const std::vector<std::string> & bpe_words) {
     std::vector<std::string> bpe_encoded_words;
+    bpe_encoded_words.reserve(bpe_words.size());
     for (const auto & word : bpe_words) {
-        std::string text_utf;
-        auto utf_word =  unicode_cpts_from_utf8(word);
-        for (size_t i = 0; i < utf_word.size(); ++i) {
-            text_utf += unicode_cpt_to_utf8(utf_word[i]);
-        }
-
+        // W7-5 / S3: the words are built by concatenating unicode_cpt_to_utf8()
+        // output, so they are valid UTF-8 by construction - the previous
+        // decode/re-encode round-trip on each word reproduced the very same
+        // bytes (it only ever sanitized already-sanitized text)
         std::string encoded_token;
-        for (char & c : text_utf) {
+        for (unsigned char c : word) {
             encoded_token += unicode_byte_to_utf8(c);
         }
-        bpe_encoded_words.emplace_back(encoded_token);
+        bpe_encoded_words.emplace_back(std::move(encoded_token));
     }
     return bpe_encoded_words;
 }
@@ -1160,8 +1159,17 @@ unicode_cpt_flags unicode_cpt_flags_from_utf8(const std::string & utf8) {
 }
 
 std::string unicode_byte_to_utf8(uint8_t byte) {
-    static std::unordered_map<uint8_t, std::string> map = unicode_byte_to_utf8_map();
-    return map.at(byte);
+    // W7-5 / S3: flat table instead of a per-call hash lookup - this runs once
+    // per input byte of every BPE word on the tokenize path
+    static const std::vector<std::string> map = []() {
+        auto mm = unicode_byte_to_utf8_map();
+        std::vector<std::string> m(256);
+        for (auto & kv : mm) {
+            m[kv.first] = std::move(kv.second);
+        }
+        return m;
+    }();
+    return map[byte];
 }
 
 uint8_t unicode_utf8_to_byte(const std::string & utf8) {

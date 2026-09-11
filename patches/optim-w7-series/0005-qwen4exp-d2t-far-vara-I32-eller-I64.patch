@@ -1,0 +1,30 @@
+From 0bb283c56f2acae368a1aec49df7fec25c2b0f48 Mon Sep 17 00:00:00 2001
+From: M5 merge <jl@lokal>
+Date: Sat, 5 Sep 2026 14:40:52 +0200
+Subject: [PATCH 05/15] qwen4exp: d2t far vara I32 eller I64
+
+Port of d2t 6b7713dd6 [w7-4 step 7.1/5]: trivial, applied as-is.
+
+(cherry picked from commit 6b7713dd6eb6c91b208d2455a64109dd2e206a25)
+
+Co-Authored-By: GLM by z.ai <glm@z.ai>
+---
+ src/models/qwen4exp.cpp | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
+index 6b57c539a..dd4c18190 100644
+--- a/src/models/qwen4exp.cpp
++++ b/src/models/qwen4exp.cpp
+@@ -476,7 +476,7 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
+         const int64_t n_draft_vocab = cur->ne[0];
+         const int64_t n_outputs     = cur->ne[1];
+         const int64_t n_vocab_full  = (int64_t) model.vocab.n_tokens();
+-        GGML_ASSERT(model.d2t->type == GGML_TYPE_I64);
++        GGML_ASSERT(model.d2t->type == GGML_TYPE_I64 || model.d2t->type == GGML_TYPE_I32);
+         GGML_ASSERT(model.d2t->ne[0] == n_draft_vocab);
+         ggml_tensor * logits = ggml_fill(ctx0, ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, 1, n_vocab_full, n_outputs), -INFINITY);
+         cur = ggml_set_rows(ctx0, logits,
+-- 
+2.53.0
+

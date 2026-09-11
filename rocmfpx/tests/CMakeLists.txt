@@ -135,6 +135,29 @@ llama_test(test-tokenizer-0 NAME test-tokenizer-0-qwen35            ARGS ${PROJE
 llama_test(test-tokenizer-0 NAME test-tokenizer-0-refact            ARGS ${PROJECT_SOURCE_DIR}/models/ggml-vocab-refact.gguf)
 llama_test(test-tokenizer-0 NAME test-tokenizer-0-starcoder         ARGS ${PROJECT_SOURCE_DIR}/models/ggml-vocab-starcoder.gguf)
 
+# W6-6 / A4-S1: token-prefix cache gate (bit-identity of the spliced token
+# stream vs a full tokenization). lives in tools/server, hence the extra link.
+add_executable(test-token-prefix-cache test-token-prefix-cache.cpp)
+target_include_directories(test-token-prefix-cache PRIVATE ${CMAKE_SOURCE_DIR}/tools/server ${CMAKE_SOURCE_DIR}/tools/mtmd)
+target_link_libraries(test-token-prefix-cache PRIVATE llama llama-common server-context)
+llama_test(test-token-prefix-cache NAME test-token-prefix-cache-qwen35 ARGS ${PROJECT_SOURCE_DIR}/models/ggml-vocab-qwen35.gguf)
+llama_test(test-token-prefix-cache NAME test-token-prefix-cache-gpt2   ARGS ${PROJECT_SOURCE_DIR}/models/ggml-vocab-gpt-2.gguf)
+llama_test(test-token-prefix-cache NAME test-token-prefix-cache-spm    ARGS ${PROJECT_SOURCE_DIR}/models/ggml-vocab-llama-spm.gguf)
+
+# W6-6 / A4-S2: chat-template cache gate (formatted-text differential + parser
+# cache) over the template corpus in models/templates
+llama_build_and_test(test-chat-template-cache.cpp ARGS ${PROJECT_SOURCE_DIR}/models/templates)
+
+# W7-5: per-request pi path census + token bit-identity gate (S3/S4 residuals).
+# not registered with llama_test: needs real pi rounds + a large corpus, run
+# manually with explicit args (see docs/research/wave7/w7p5-report.md).
+add_executable(test-per-request-path test-per-request-path.cpp
+               ${CMAKE_SOURCE_DIR}/examples/gguf-hash/deps/sha256/sha256.c)
+target_include_directories(test-per-request-path PRIVATE
+        ${CMAKE_SOURCE_DIR}/tools/server ${CMAKE_SOURCE_DIR}/tools/mtmd
+        ${CMAKE_SOURCE_DIR}/examples/gguf-hash/deps)
+target_link_libraries(test-per-request-path PRIVATE llama llama-common server-context)
+
 if (NOT WIN32)
     llama_test_cmd(
         ${CMAKE_CURRENT_SOURCE_DIR}/test-tokenizers-repo.sh
@@ -243,7 +266,42 @@ endif()
 llama_build_and_test(test-gguf.cpp)
 llama_build_and_test(test-ple-store.cpp)
 llama_build_and_test(test-persist-meta.cpp)
+# W6-5/W6-7 (A3): bit-exactness of the sequence-state IO paths over a tiny
+# in-memory model (save/load file + buffer, restore determinism, format
+# stability) - CPU only
+llama_build_and_test(test-state-io-buffer.cpp)
+# W6-5 (A3-4): the kv cell bitset bookkeeping (seq membership, seq_pos
+# counters with duplicate positions, rm/keep/cp/set transitions)
+llama_build_and_test(test-kv-cells.cpp)
+llama_build_and_test(test-park-identity.cpp ../tools/server/llama-park-identity.cpp)
+# T32-b: exercises server_prompt_cache itself, so link the server library
+llama_build_and_test(test-park-library.cpp)
+target_link_libraries(test-park-library PRIVATE server-context)
+# T32-b: the task-switch save redirect (touch/supersede/fallback sequence of
+# two live cache instances) - same linkage as test-park-library
+llama_build_and_test(test-park-redirect.cpp)
+target_link_libraries(test-park-redirect PRIVATE server-context)
+# T32-b: the park candidate in load() (selection + owner routing) - same
+# linkage as test-park-library
+llama_build_and_test(test-park-load.cpp)
+target_link_libraries(test-park-load PRIVATE server-context)
+# W6-8 (A3-5): the park RAM mirror end-to-end on a real tiny model - capture,
+# RAM serve with the bins deleted (byte-identical payload), default-off
+# failure in the same scenario, supersede invalidation
+llama_build_and_test(test-park-mirror.cpp)
+target_link_libraries(test-park-mirror PRIVATE server-context)
 llama_build_and_test(test-ple-dequant-parity.cpp)
+# W6-2 (A1-C1): synthetic mini qwen4exp GGUF writer + decode-graph per-node dump
+# + bit-exact logits/state hashes. Manually invoked (--make-model/--run/--dump);
+# not a ctest because a run only asserts finiteness, while the bit-exact gate is
+# a diff between a baseline and a patched build's outputs.
+llama_build(test-copy-elim.cpp)
+# W6-4 (A6-S2): host-side unit test of the per-buffer unsynced-access tracker.
+# Header-only logic, no Vulkan device needed at build or run time.
+if (GGML_VULKAN)
+    llama_build_and_test(test-vk-sync-tracker.cpp)
+    target_include_directories(test-vk-sync-tracker PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../ggml/src/ggml-vulkan)
+endif()
 llama_build_and_test(test-backend-ops.cpp)
 
 llama_build_and_test(test-model-load-cancel.cpp LABEL "model")
